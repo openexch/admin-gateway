@@ -1,0 +1,29 @@
+# Compiled binary
+admin-gateway
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Go coverage
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# Cloudflare Wrangler
+.wrangler/
+
+# Environment
+.env
+
+# OS
+.DS_Store
+Thumbs.db
