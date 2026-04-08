@@ -30,8 +30,8 @@ func (l *LogService) GetServiceLogs(service string, lines int) map[string]interf
 	switch service {
 	case "market-gateway":
 		logName = "market"
-	case "order-gateway":
-		logName = "order"
+	case "oms", "order-management":
+		logName = "oms"
 	case "admin-gateway":
 		logName = "admin"
 	}

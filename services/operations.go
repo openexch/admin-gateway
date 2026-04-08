@@ -414,9 +414,9 @@ func (o *OperationsService) doRebuildGateway(restart bool) {
 		return
 	}
 
-	// Step 3: Restart gateways (order + market, not admin since we'd kill ourselves)
-	o.progress.Update(3, "Restarting order & market gateways...")
-	for _, svc := range []string{"order", "market"} {
+	// Step 3: Restart gateways (oms + market, not admin since we'd kill ourselves)
+	o.progress.Update(3, "Restarting OMS & market gateways...")
+	for _, svc := range []string{"oms", "market"} {
 		o.restartService(svc)
 	}
 	time.Sleep(3 * time.Second)

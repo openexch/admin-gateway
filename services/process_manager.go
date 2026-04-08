@@ -135,6 +135,12 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 		return cmd
 	}
 
+	omsCmd := func() []string {
+		cmd := make([]string, len(javaBase))
+		copy(cmd, javaBase)
+		return append(cmd, "-jar", cfg.OmsJar)
+	}
+
 	pm := &ProcessManager{
 		cfg:    cfg,
 		logDir: logDir,
@@ -169,18 +175,18 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 				AutoRestart: true, RestartSec: 10, StopTimeout: 5,
 			},
 			{
-				Name: "order", Display: "Order Gateway", Role: RoleGateway, Port: 8080,
-				ExtraPorts: []int{9092}, // Aeron UDP egress port
-				Command: append(gatewayCmd(), "-cp", "match-gateway/target/match-gateway.jar",
-					"com.match.infrastructure.gateway.OrderGatewayMain"),
+				Name: "oms", Display: "Order Management", Role: RoleGateway, Port: 8080,
+				ExtraPorts: []int{9093, 9090}, // Aeron UDP egress + gRPC
+				Command:    omsCmd(),
 				Env: map[string]string{
-					"MATCH_PROJECT_DIR": cfg.ProjectDir,
-					"EGRESS_PORT":       "9092",
-					"GATEWAY_TYPE":      "order",
+					"OMS_HTTP_PORT":     "8080",
+					"OMS_GRPC_PORT":     "9090",
+					"EGRESS_PORT":       "9093",
+					"CLUSTER_ADDRESSES": "127.0.0.1,127.0.0.1,127.0.0.1",
 				},
-				WorkDir: cfg.ProjectDir,
+				WorkDir:   cfg.OmsProjectDir,
 				DependsOn: []string{"node0", "node1", "node2"}, StartOrder: 5,
-				AutoRestart: true, RestartSec: 5, StopTimeout: 5,
+				AutoRestart: true, RestartSec: 5, StopTimeout: 10,
 			},
 			{
 				Name: "market", Display: "Market Gateway", Role: RoleGateway, Port: 8081,

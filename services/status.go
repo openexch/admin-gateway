@@ -251,8 +251,8 @@ func (s *StatusService) fetchStatus() map[string]interface{} {
 			"running": true, // We're always running
 			"port":    8082,
 		},
-		"order": map[string]interface{}{
-			"running": s.isServiceRunning("order"),
+		"oms": map[string]interface{}{
+			"running": s.isServiceRunning("oms"),
 			"port":    8080,
 		},
 	}
@@ -268,7 +268,7 @@ func (s *StatusService) fetchStatus() map[string]interface{} {
 		"gateways": gateways,
 		"backup":   backup,
 		"gateway": map[string]interface{}{ // Legacy field
-			"running": s.isServiceRunning("order"),
+			"running": s.isServiceRunning("oms"),
 			"port":    8080,
 		},
 		"autoSnapshot": s.getAutoSnapshotStatus(),
