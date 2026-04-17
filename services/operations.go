@@ -186,14 +186,21 @@ func (o *OperationsService) doRollingUpdate() {
 		o.clusterStatus.SetNodeStatus(nodeId, "REJOINING", true)
 		ingressPort := 9000 + (nodeId * 100) + 2 // 9002, 9102, 9202
 		if o.waitForPort("127.0.0.1", ingressPort, 60*time.Second) {
+			// Wait for the node to catch up to the leader's commit position before moving on.
+			// Otherwise we may stop the next node while this one is still replaying the log,
+			// transiently dropping the cluster below quorum (2/3).
+			o.progress.Update(step, nodeLabel+": Waiting for log catch-up...")
+			if o.waitForFollowerCatchUp(nodeId, leader, 60*time.Second) {
+				o.progress.Update(step, nodeLabel+" caught up, marking as follower")
+			} else {
+				o.progress.Update(step, nodeLabel+" catch-up timeout — continuing (cluster may have transient quorum risk)")
+			}
 			o.clusterStatus.SetNodeStatus(nodeId, "FOLLOWER", true)
-			o.progress.Update(step, nodeLabel+" rejoined as follower")
 		} else {
 			o.progress.Update(step, nodeLabel+" rejoin timeout — continuing")
 			o.clusterStatus.SetNodeStatus(nodeId, "FOLLOWER", true)
 		}
 		step++
-		time.Sleep(2 * time.Second) // Brief stabilization
 	}
 
 	// Step 9: Stop old leader
@@ -252,12 +259,17 @@ func (o *OperationsService) doRollingUpdate() {
 	o.clusterStatus.SetNodeStatus(leader, "STARTING", false)
 	o.startService(fmt.Sprintf("node%d", leader))
 
-	// Wait for old leader to rejoin
+	// Wait for old leader to rejoin AND catch up to new leader's commit position.
 	o.clusterStatus.SetNodeStatus(leader, "REJOINING", true)
 	ingressPort := 9000 + (leader * 100) + 2
+	newLeader := o.cluster.DetectLeader()
 	if o.waitForPort("127.0.0.1", ingressPort, 60*time.Second) {
+		if newLeader >= 0 && o.waitForFollowerCatchUp(leader, newLeader, 60*time.Second) {
+			o.progress.Update(11, fmt.Sprintf("Node %d rejoined and caught up", leader))
+		} else {
+			o.progress.Update(11, fmt.Sprintf("Node %d rejoined but catch-up not confirmed", leader))
+		}
 		o.clusterStatus.SetNodeStatus(leader, "FOLLOWER", true)
-		o.progress.Update(11, fmt.Sprintf("Node %d rejoined as follower", leader))
 	} else {
 		o.clusterStatus.SetNodeStatus(leader, "FOLLOWER", true)
 		o.progress.Update(11, fmt.Sprintf("Node %d rejoin timeout — may still be catching up", leader))
@@ -1120,6 +1132,40 @@ func (o *OperationsService) cleanNodeMediaDriver(nodeId int) {
 		os.RemoveAll(driverDir)
 		fmt.Printf("Cleaned stale MediaDriver: %s\n", driverDir)
 	}
+}
+
+// waitForFollowerCatchUp blocks until the follower's cluster commit position is within
+// catchUpLagBytes of the leader's commit position, OR the timeout elapses. Returns true if
+// caught up, false on timeout. Uses the CnC counters (no JVM spawn) so it's cheap to poll.
+//
+// Why this matters: rolling update used to advance to the next node as soon as the previous
+// follower's ingress port was open. The node was up but might still be replaying the log or
+// loading a snapshot. Restarting the next node before catch-up risks losing quorum.
+func (o *OperationsService) waitForFollowerCatchUp(followerId, leaderId int, timeout time.Duration) bool {
+	const catchUpLagBytes int64 = 1 * 1024 * 1024 // 1 MB lag is fine; term buffer is 16 MB
+	counters := NewAeronCounters()
+	deadline := time.Now().Add(timeout)
+	var lastFollowerPos int64 = -1
+	for time.Now().Before(deadline) {
+		time.Sleep(500 * time.Millisecond)
+		leader, lerr := counters.GetNodeCounters(leaderId)
+		follower, ferr := counters.GetNodeCounters(followerId)
+		if lerr != nil || ferr != nil || leader.CommitPosition < 0 || follower.CommitPosition < 0 {
+			continue // CnC not yet ready; keep polling
+		}
+		lag := leader.CommitPosition - follower.CommitPosition
+		if lag <= catchUpLagBytes {
+			fmt.Printf("Node %d caught up to leader (lag=%d bytes)\n", followerId, lag)
+			return true
+		}
+		if follower.CommitPosition <= lastFollowerPos && follower.CommitPosition > 0 {
+			// Position not advancing — log but keep waiting until timeout.
+			fmt.Printf("Node %d catch-up stalled at pos=%d (lag=%d)\n",
+				followerId, follower.CommitPosition, lag)
+		}
+		lastFollowerPos = follower.CommitPosition
+	}
+	return false
 }
 
 func contains(s, substr string) bool {

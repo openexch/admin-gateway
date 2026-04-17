@@ -135,9 +135,18 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 		return cmd
 	}
 
-	omsCmd := func() []string {
-		cmd := make([]string, len(javaBase))
-		copy(cmd, javaBase)
+	// Pinned variants for OMS and market gateway. Cluster nodes occupy cores 0-11
+	// (4 each on a 13700K). Pin client processes to disjoint cores so their busy/spin
+	// polling threads don't compete with the cluster's BusySpinIdleStrategy threads.
+	pinnedGatewayCmd := func(cpuSet string) []string {
+		cmd := []string{"/usr/bin/taskset", "-c", cpuSet}
+		cmd = append(cmd, javaBase...)
+		return cmd
+	}
+
+	omsCmd := func(cpuSet string) []string {
+		cmd := []string{"/usr/bin/taskset", "-c", cpuSet}
+		cmd = append(cmd, javaBase...)
 		return append(cmd, "-jar", cfg.OmsJar)
 	}
 
@@ -177,7 +186,7 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 			{
 				Name: "oms", Display: "Order Management", Role: RoleGateway, Port: 8080,
 				ExtraPorts: []int{9093, 9090}, // Aeron UDP egress + gRPC
-				Command:    omsCmd(),
+				Command:    omsCmd("12-15"),    // pinned: cores 12-15 (cluster uses 0-11)
 				Env: map[string]string{
 					"OMS_HTTP_PORT":     "8080",
 					"OMS_GRPC_PORT":     "9090",
@@ -191,7 +200,7 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 			{
 				Name: "market", Display: "Market Gateway", Role: RoleGateway, Port: 8081,
 				ExtraPorts: []int{9091}, // Aeron UDP egress port
-				Command: append(gatewayCmd(), "-cp", "match-gateway/target/match-gateway.jar",
+				Command: append(pinnedGatewayCmd("16-19"), "-cp", "match-gateway/target/match-gateway.jar",
 					"com.match.infrastructure.gateway.MarketGatewayMain"),
 				Env: map[string]string{
 					"MATCH_PROJECT_DIR": cfg.ProjectDir,
