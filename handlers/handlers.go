@@ -131,7 +131,7 @@ func (h *Handlers) handleProgress(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) handleHealth(w http.ResponseWriter, r *http.Request) {
-	jsonResponse(w, http.StatusOK, map[string]string{"status": "healthy"})
+	jsonResponse(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // Node operations

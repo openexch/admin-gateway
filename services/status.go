@@ -1,6 +1,7 @@
 package services
 
 import (
+	"net/http"
 	"sync"
 	"time"
 
@@ -241,19 +242,22 @@ func (s *StatusService) fetchStatus() map[string]interface{} {
 		nodes[i] = node
 	}
 
-	// Build gateways status
+	// Build gateways status (PID + HTTP health probe)
 	gateways := map[string]interface{}{
 		"market": map[string]interface{}{
 			"running": s.isServiceRunning("market"),
 			"port":    8081,
+			"healthy": probeHealth("http://localhost:8081/health"),
 		},
 		"admin": map[string]interface{}{
 			"running": true, // We're always running
 			"port":    8082,
+			"healthy": true,
 		},
 		"oms": map[string]interface{}{
 			"running": s.isServiceRunning("oms"),
 			"port":    8080,
+			"healthy": probeHealth("http://localhost:8080/api/v1/health"),
 		},
 	}
 
@@ -285,3 +289,15 @@ func (s *StatusService) getAutoSnapshotStatus() map[string]interface{} {
 		"intervalMinutes": int64(0),
 	}
 }
+
+// probeHealth makes a quick HTTP GET to a health endpoint and returns true if it responds 200.
+func probeHealth(url string) bool {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+

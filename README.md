@@ -4,11 +4,12 @@ HTTP API for managing the Open Exchange Aeron Cluster. Handles process lifecycle
 
 ## Features
 
-- Process management for all cluster services (nodes, gateways, backup)
+- Process management for all cluster services (nodes, gateways, backup, OMS)
 - Zero-downtime rolling updates
 - Automatic and manual snapshot creation
 - Archive compaction and cleanup
 - Per-node log retrieval
+- HTTP health probing of managed services (OMS :8080, market gateway :8081)
 - Self-update capability
 - Dependency-ordered startup and shutdown
 
