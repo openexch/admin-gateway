@@ -3,6 +3,7 @@ package services
 import (
 	"fmt"
 	"os/exec"
+	"os/user"
 	"regexp"
 	"strconv"
 	"strings"
@@ -205,6 +206,33 @@ func (c *Cluster) ArchiveToolCompact(nodeId int) (string, error) {
 			c.cfg.JarPath, archiveDir))
 	output, err := cmd.CombinedOutput()
 	return string(output), err
+}
+
+// ArchiveHousekeeping reclaims archive disk on a LIVE node (no downtime):
+// purges log segments below the latest snapshot position and prunes
+// superseded snapshot recordings (keeping 2). This is the operation that
+// actually shrinks the archive — snapshots alone only ADD recordings, and
+// ArchiveTool compact never touches the (always-referenced) log recording.
+func (c *Cluster) ArchiveHousekeeping(nodeId int) (string, error) {
+	clusterDir := fmt.Sprintf("%s/node%d/cluster", c.cfg.ClusterDir, nodeId)
+	aeronDir := fmt.Sprintf("/dev/shm/aeron-%s-%d-driver", currentUsername(), nodeId)
+	cmd := exec.Command("java",
+		"--add-opens", "java.base/jdk.internal.misc=ALL-UNNAMED",
+		"-cp", c.cfg.JarPath,
+		"com.match.infrastructure.persistence.ArchiveHousekeeping",
+		clusterDir, aeronDir, "2")
+
+	output, err := cmd.CombinedOutput()
+	return string(output), err
+}
+
+// currentUsername returns the OS user, matching Aeron's default
+// CommonContext directory naming (/dev/shm/aeron-<user>-<node>-driver).
+func currentUsername() string {
+	if u, err := user.Current(); err == nil {
+		return u.Username
+	}
+	return "unknown"
 }
 
 // ArchiveToolDeleteOrphanedSegments removes orphaned segment files

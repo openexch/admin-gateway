@@ -69,6 +69,8 @@ func (h *Handlers) RegisterRoutes(r chi.Router) {
 	r.Post("/api/admin/compact", h.handleCompact)
 	r.Post("/api/admin/compact-archive", h.handleCompactArchive)
 	r.Post("/api/admin/rolling-cleanup", h.handleRollingCleanup)
+	// Live archive reclamation: purge log segments below latest snapshot + prune old snapshots
+	r.Post("/api/admin/housekeeping", h.handleHousekeeping)
 
 	// Auto-snapshot (GET/POST/DELETE)
 	r.Get("/api/admin/auto-snapshot", h.handleAutoSnapshotGet)
@@ -292,6 +294,16 @@ func (h *Handlers) handleRebuildCluster(w http.ResponseWriter, r *http.Request) 
 	}
 	jsonResponse(w, http.StatusAccepted, map[string]string{
 		"message": "Cluster rebuild initiated (builds to staging, use rolling-update to deploy)",
+	})
+}
+
+func (h *Handlers) handleHousekeeping(w http.ResponseWriter, r *http.Request) {
+	if err := h.opsSvc.Housekeeping(); err != nil {
+		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusAccepted, map[string]string{
+		"message": "Archive housekeeping initiated",
 	})
 }
 

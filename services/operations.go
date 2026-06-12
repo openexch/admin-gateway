@@ -352,7 +352,7 @@ func (o *OperationsService) Snapshot() error {
 }
 
 func (o *OperationsService) doSnapshot() {
-	o.progress.Start("snapshot", 4)
+	o.progress.Start("snapshot", 7)
 
 	// Step 1: Find leader
 	o.progress.Update(1, "Finding cluster leader...")
@@ -383,7 +383,59 @@ func (o *OperationsService) doSnapshot() {
 		return
 	}
 
-	o.progress.Finish(true, fmt.Sprintf("Snapshot created at position %d", pos))
+	// Steps 5-7: Reclaim archive disk on each node. The snapshot makes the log
+	// below its position unnecessary, but Aeron never reclaims automatically —
+	// purge log segments and superseded snapshots while the cluster runs.
+	housekeepingFailures := 0
+	for i := 0; i < 3; i++ {
+		o.progress.Update(5+i, fmt.Sprintf("Reclaiming archive on Node %d...", i))
+		hkOutput, hkErr := o.cluster.ArchiveHousekeeping(i)
+		fmt.Printf("[SNAPSHOT] Node %d housekeeping:\n%s\n", i, hkOutput)
+		if hkErr != nil {
+			housekeepingFailures++
+			fmt.Printf("[SNAPSHOT] WARNING: housekeeping failed on node %d: %v\n", i, hkErr)
+		}
+	}
+
+	if housekeepingFailures > 0 {
+		o.progress.Finish(true, fmt.Sprintf(
+			"Snapshot created at position %d, but archive reclamation failed on %d node(s) — check logs",
+			pos, housekeepingFailures))
+		return
+	}
+	o.progress.Finish(true, fmt.Sprintf("Snapshot created at position %d, archives reclaimed", pos))
+}
+
+// Housekeeping reclaims archive disk on all nodes without taking a snapshot
+// (uses the latest existing snapshot as the purge boundary).
+func (o *OperationsService) Housekeeping() error {
+	if o.progress.IsRunning() {
+		return fmt.Errorf("another operation in progress")
+	}
+
+	go o.doHousekeeping()
+	return nil
+}
+
+func (o *OperationsService) doHousekeeping() {
+	o.progress.Start("housekeeping", 3)
+
+	failures := 0
+	for i := 0; i < 3; i++ {
+		o.progress.Update(1+i, fmt.Sprintf("Reclaiming archive on Node %d...", i))
+		output, err := o.cluster.ArchiveHousekeeping(i)
+		fmt.Printf("[HOUSEKEEPING] Node %d:\n%s\n", i, output)
+		if err != nil {
+			failures++
+			fmt.Printf("[HOUSEKEEPING] WARNING: failed on node %d: %v\n", i, err)
+		}
+	}
+
+	if failures > 0 {
+		o.progress.Finish(false, fmt.Sprintf("Archive reclamation failed on %d node(s) — check logs", failures))
+		return
+	}
+	o.progress.Finish(true, "Archives reclaimed on all nodes")
 }
 
 // RebuildGateway builds the gateway module and optionally restarts gateways.
