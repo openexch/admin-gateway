@@ -65,11 +65,9 @@ func (h *Handlers) RegisterRoutes(r chi.Router) {
 	r.Post("/api/admin/rebuild-gateway", h.handleRebuildGateway)
 	r.Post("/api/admin/rebuild-cluster", h.handleRebuildCluster)
 
-	// Archive compaction operations
-	r.Post("/api/admin/compact", h.handleCompact)
-	r.Post("/api/admin/compact-archive", h.handleCompactArchive)
-	r.Post("/api/admin/rolling-cleanup", h.handleRollingCleanup)
-	// Live archive reclamation: purge log segments below latest snapshot + prune old snapshots
+	// Live archive reclamation: purge log segments below latest snapshot.
+	// (Aeron offline ArchiveTool compaction was removed — running it against a
+	// live node corrupts snapshot recordings and breaks recover-from-snapshot.)
 	r.Post("/api/admin/housekeeping", h.handleHousekeeping)
 
 	// Auto-snapshot (GET/POST/DELETE)
@@ -304,39 +302,6 @@ func (h *Handlers) handleHousekeeping(w http.ResponseWriter, r *http.Request) {
 	}
 	jsonResponse(w, http.StatusAccepted, map[string]string{
 		"message": "Archive housekeeping initiated",
-	})
-}
-
-// Compact operations
-func (h *Handlers) handleCompact(w http.ResponseWriter, r *http.Request) {
-	if err := h.opsSvc.Compact(); err != nil {
-		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
-		return
-	}
-	jsonResponse(w, http.StatusAccepted, map[string]string{
-		"message": "Archive compaction initiated",
-	})
-}
-
-func (h *Handlers) handleCompactArchive(w http.ResponseWriter, r *http.Request) {
-	if err := h.opsSvc.CompactArchive(); err != nil {
-		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
-		return
-	}
-	jsonResponse(w, http.StatusAccepted, map[string]interface{}{
-		"message": "Full archive compaction initiated",
-		"warning": "This operation requires brief cluster downtime",
-	})
-}
-
-func (h *Handlers) handleRollingCleanup(w http.ResponseWriter, r *http.Request) {
-	if err := h.opsSvc.RollingArchiveCleanup(); err != nil {
-		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
-		return
-	}
-	jsonResponse(w, http.StatusAccepted, map[string]interface{}{
-		"message": "Rolling archive cleanup initiated",
-		"info":    "Cluster remains operational throughout",
 	})
 }
 
