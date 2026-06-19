@@ -92,8 +92,14 @@ func (a *AutoSnapshot) GetLastPosition() int64 {
 	return a.lastSnapshotPos
 }
 
-// runSnapshotCycle takes a snapshot and then runs compaction.
-// Every 6th cycle (~30 min at 5-min interval), runs RollingArchiveCleanup instead of Compact.
+// runSnapshotCycle takes a snapshot. The snapshot path itself reclaims archive
+// disk via the live-safe ArchiveHousekeeping (purges log segments below the
+// snapshot position) on each node, so no separate compaction step is needed.
+//
+// Aeron's offline ArchiveTool compaction is deliberately NOT run here: running
+// it against a live node corrupts the latest snapshot recording and breaks
+// recover-from-snapshot (nodes crash on restart with "unknown recording id"
+// and the cluster comes up unable to serve ingress).
 func (a *AutoSnapshot) runSnapshotCycle() {
 	if a.opsSvc.progress.IsRunning() {
 		log.Println("Auto-snapshot skipped: another operation in progress")
@@ -107,28 +113,13 @@ func (a *AutoSnapshot) runSnapshotCycle() {
 	}
 
 	if !a.waitForOperation(5 * time.Minute) {
-		log.Println("Auto-snapshot: snapshot did not complete in time, skipping compaction")
+		log.Println("Auto-snapshot: snapshot did not complete in time")
 		return
 	}
 
 	a.mu.Lock()
 	a.snapshotCount++
-	count := a.snapshotCount
 	a.mu.Unlock()
-
-	// Every 6th snapshot (~30 min): full rolling archive cleanup (truncates consensus log)
-	// Otherwise: lightweight compact (cleans orphaned segments, no downtime)
-	if count%6 == 0 {
-		log.Println("Auto-snapshot: triggering rolling archive cleanup (every 6th cycle)...")
-		if err := a.opsSvc.RollingArchiveCleanup(); err != nil {
-			log.Printf("Auto-snapshot: failed to start rolling cleanup: %v", err)
-		}
-	} else {
-		log.Println("Auto-snapshot: triggering compact...")
-		if err := a.opsSvc.Compact(); err != nil {
-			log.Printf("Auto-snapshot: failed to start compact: %v", err)
-		}
-	}
 }
 
 // waitForOperation polls until the current operation finishes or timeout is reached.

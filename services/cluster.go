@@ -28,7 +28,7 @@ func (c *Cluster) clusterTool(nodeId int, command string) (string, error) {
 		"-cp", c.cfg.JarPath,
 		"io.aeron.cluster.ClusterTool",
 		clusterDir, command)
-	
+
 	output, err := cmd.CombinedOutput()
 	return string(output), err
 }
@@ -41,7 +41,7 @@ func (c *Cluster) archiveTool(nodeId int, command string) (string, error) {
 		"-cp", c.cfg.JarPath,
 		"io.aeron.archive.ArchiveTool",
 		archiveDir, command)
-	
+
 	output, err := cmd.CombinedOutput()
 	return string(output), err
 }
@@ -74,7 +74,6 @@ func (c *Cluster) TakeSnapshot(leaderNode int) (string, error) {
 	return c.clusterTool(leaderNode, "snapshot")
 }
 
-// GetLogPosition extracts the highest log position from recording-log output
 // GetLogAndSnapshotPositions returns both log position and snapshot position
 // with a single JVM invocation (recording-log command).
 func (c *Cluster) GetLogAndSnapshotPositions(nodeId int) (logPos int64, snapPos int64) {
@@ -119,10 +118,10 @@ func (c *Cluster) GetLogPosition(nodeId int) int64 {
 	if err != nil {
 		return -1
 	}
-	
+
 	re := regexp.MustCompile(`logPosition=(\d+)`)
 	matches := re.FindAllStringSubmatch(output, -1)
-	
+
 	var maxPos int64 = -1
 	for _, match := range matches {
 		if len(match) > 1 {
@@ -141,7 +140,7 @@ func (c *Cluster) GetSnapshotPosition(nodeId int) int64 {
 	if err != nil {
 		return -1
 	}
-	
+
 	// Find SNAPSHOT entries and get their logPosition
 	var latestPos int64 = -1
 	entries := strings.Split(output, "Entry{")
@@ -198,21 +197,11 @@ func (c *Cluster) SeedRecordingLogFromSnapshot(nodeId int) (string, error) {
 	return c.clusterTool(nodeId, "seed-recording-log-from-snapshot")
 }
 
-// ArchiveToolCompact runs ArchiveTool compact on a node's archive
-func (c *Cluster) ArchiveToolCompact(nodeId int) (string, error) {
-	archiveDir := fmt.Sprintf("%s/node%d/archive", c.cfg.ClusterDir, nodeId)
-	cmd := exec.Command("bash", "-c",
-		fmt.Sprintf("echo 'y' | java --add-opens java.base/jdk.internal.misc=ALL-UNNAMED -cp %s io.aeron.archive.ArchiveTool %s compact",
-			c.cfg.JarPath, archiveDir))
-	output, err := cmd.CombinedOutput()
-	return string(output), err
-}
-
 // ArchiveHousekeeping reclaims archive disk on a LIVE node (no downtime):
-// purges log segments below the latest snapshot position and prunes
-// superseded snapshot recordings (keeping 2). This is the operation that
-// actually shrinks the archive — snapshots alone only ADD recordings, and
-// ArchiveTool compact never touches the (always-referenced) log recording.
+// it purges whole log segment files below the latest snapshot position. This
+// is the ONLY safe in-place reclaimer — it never runs Aeron's offline
+// ArchiveTool against a running node (doing so corrupts snapshot recordings
+// and breaks recover-from-snapshot). Invoked automatically after every snapshot.
 func (c *Cluster) ArchiveHousekeeping(nodeId int) (string, error) {
 	clusterDir := fmt.Sprintf("%s/node%d/cluster", c.cfg.ClusterDir, nodeId)
 	aeronDir := fmt.Sprintf("/dev/shm/aeron-%s-%d-driver", currentUsername(), nodeId)
@@ -233,28 +222,6 @@ func currentUsername() string {
 		return u.Username
 	}
 	return "unknown"
-}
-
-// ArchiveToolDeleteOrphanedSegments removes orphaned segment files
-func (c *Cluster) ArchiveToolDeleteOrphanedSegments(nodeId int) (string, error) {
-	archiveDir := fmt.Sprintf("%s/node%d/archive", c.cfg.ClusterDir, nodeId)
-	cmd := exec.Command("bash", "-c",
-		fmt.Sprintf("echo 'y' | java --add-opens java.base/jdk.internal.misc=ALL-UNNAMED -cp %s io.aeron.archive.ArchiveTool %s delete-orphaned-segments",
-			c.cfg.JarPath, archiveDir))
-	output, err := cmd.CombinedOutput()
-	return string(output), err
-}
-
-// ArchiveToolMarkInvalid marks a recording as INVALID in the archive catalog
-func (c *Cluster) ArchiveToolMarkInvalid(nodeId int, recordingId int64) (string, error) {
-	archiveDir := fmt.Sprintf("%s/node%d/archive", c.cfg.ClusterDir, nodeId)
-	cmd := exec.Command("java",
-		"--add-opens", "java.base/jdk.internal.misc=ALL-UNNAMED",
-		"-cp", c.cfg.JarPath,
-		"io.aeron.archive.ArchiveTool",
-		archiveDir, "mark-invalid", strconv.FormatInt(recordingId, 10))
-	output, err := cmd.CombinedOutput()
-	return string(output), err
 }
 
 // ArchiveToolDescribe describes the archive catalog for a node
