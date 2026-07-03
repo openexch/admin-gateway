@@ -41,6 +41,10 @@ type ServiceDef struct {
 	AutoRestart bool              `json:"-"` // restart on crash
 	RestartSec  int               `json:"-"` // seconds between restart attempts
 	StopTimeout int               `json:"-"` // seconds to wait for graceful stop before SIGKILL
+	WaitForFile string            `json:"-"` // block start until this file exists (e.g. media driver cnc.dat)
+	// Services to force-stop when this one crashes and to start again after it restarts.
+	// Used for media driver → node coupling: a node cannot outlive its external driver.
+	RestartCascades []string `json:"-"`
 }
 
 // ProcessInfo is the live state of a managed service
@@ -106,6 +110,36 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 		"-Xmx2g", "-Xms2g",
 	}
 
+	// External media driver mode (default): one standalone driver process per node,
+	// engine JVMs connect over shared-memory IPC only (kernel-bypass-ready; see
+	// match/docs/kernel-bypass.md). ENGINE_DRIVER_MODE=embedded reverts to the old
+	// in-JVM ClusteredMediaDriver (no driver services, no extra env).
+	engineDriverMode := os.Getenv("ENGINE_DRIVER_MODE")
+	externalDriver := engineDriverMode != "embedded"
+
+	// dev profile (default): SHARED driver threads + backoff idles — three DEDICATED
+	// busy-spin drivers do not fit a single 13700K next to three engine nodes.
+	// prod: set ENGINE_DRIVER_PROFILE=prod plus SENDER/RECEIVER/CONDUCTOR_CORE in the
+	// admin gateway's environment (one node per host, isolated cores).
+	driverProfile := os.Getenv("ENGINE_DRIVER_PROFILE")
+	if driverProfile == "" {
+		driverProfile = "dev"
+	}
+
+	username := currentUsername()
+	driverDir := func(nodeId int) string {
+		return fmt.Sprintf("/dev/shm/aeron-%s-%d-driver", username, nodeId)
+	}
+
+	// Driver shares its node's core quad: SHARED-mode threads coexist with the engine
+	// in dev; the prod layout instead pins driver threads via launch-driver.sh core vars.
+	driverCmd := func(nodeId int, cpuSet string) []string {
+		return []string{"/usr/bin/taskset", "-c", cpuSet,
+			"/usr/bin/bash", filepath.Join(cfg.ProjectDir, "deploy/media-driver/launch-driver.sh"),
+			"--instance", fmt.Sprintf("node%d", nodeId),
+			"--profile", driverProfile}
+	}
+
 	// Node command with taskset for CPU pinning
 	nodeCmd := func(cpuSet string) []string {
 		cmd := []string{"/usr/bin/taskset", "-c", cpuSet}
@@ -115,12 +149,17 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 	}
 
 	nodeEnv := func(nodeId int) map[string]string {
-		return map[string]string{
+		env := map[string]string{
 			"CLUSTER_ADDRESSES":  "127.0.0.1,127.0.0.1,127.0.0.1",
 			"CLUSTER_NODE":       strconv.Itoa(nodeId),
 			"CLUSTER_PORT_BASE":  "9000",
 			"BASE_DIR":           fmt.Sprintf("/dev/shm/aeron-cluster/node%d", nodeId),
 		}
+		if externalDriver {
+			env["TRANSPORT_DRIVER_MODE"] = "external"
+			env["AERON_DIR"] = driverDir(nodeId)
+		}
+		return env
 	}
 
 	nodePreStart := func(nodeId int) [][]string {
@@ -150,37 +189,48 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 		return append(cmd, "-jar", cfg.OmsJar)
 	}
 
-	pm := &ProcessManager{
-		cfg:    cfg,
-		logDir: logDir,
-		pidDir: pidDir,
-		procs:  make(map[string]*managedProcess),
-		services: []ServiceDef{
-			{
-				Name: "node0", Display: "Cluster Node 0", Role: RoleClusterNode,
-				Command: nodeCmd("0-3"), Env: nodeEnv(0), WorkDir: cfg.ProjectDir,
-				PreStart: nodePreStart(0), StartOrder: 1,
-				AutoRestart: true, RestartSec: 10, StopTimeout: 5,
-			},
-			{
-				Name: "node1", Display: "Cluster Node 1", Role: RoleClusterNode,
-				Command: nodeCmd("4-7"), Env: nodeEnv(1), WorkDir: cfg.ProjectDir,
-				PreStart: nodePreStart(1), StartOrder: 2,
-				AutoRestart: true, RestartSec: 10, StopTimeout: 5,
-			},
-			{
-				Name: "node2", Display: "Cluster Node 2", Role: RoleClusterNode,
-				Command: nodeCmd("8-11"), Env: nodeEnv(2), WorkDir: cfg.ProjectDir,
-				PreStart: nodePreStart(2), StartOrder: 3,
-				AutoRestart: true, RestartSec: 10, StopTimeout: 5,
-			},
+	// Cluster node core quads on the 13700K (see comment on pinnedGatewayCmd below)
+	nodeCpuSets := []string{"0-3", "4-7", "8-11"}
+
+	nodeDef := func(nodeId int) ServiceDef {
+		def := ServiceDef{
+			Name: fmt.Sprintf("node%d", nodeId), Display: fmt.Sprintf("Cluster Node %d", nodeId),
+			Role: RoleClusterNode,
+			Command: nodeCmd(nodeCpuSets[nodeId]), Env: nodeEnv(nodeId), WorkDir: cfg.ProjectDir,
+			PreStart: nodePreStart(nodeId),
+			AutoRestart: true, RestartSec: 10, StopTimeout: 5,
+		}
+		if externalDriver {
+			def.DependsOn = []string{fmt.Sprintf("driver%d", nodeId)}
+			def.WaitForFile = filepath.Join(driverDir(nodeId), "cnc.dat")
+		}
+		return def
+	}
+
+	services := []ServiceDef{}
+	if externalDriver {
+		for i := range nodeCpuSets {
+			services = append(services, ServiceDef{
+				Name: fmt.Sprintf("driver%d", i), Display: fmt.Sprintf("Media Driver %d", i),
+				Role:    RoleInfra,
+				Command: driverCmd(i, nodeCpuSets[i]), WorkDir: cfg.ProjectDir,
+				AutoRestart: true, RestartSec: 3, StopTimeout: 5,
+				// A node cannot outlive its driver's shared-memory files: on driver
+				// crash, stop the node first, restart the driver, then the node.
+				RestartCascades: []string{fmt.Sprintf("node%d", i)},
+			})
+		}
+	}
+	services = append(services, nodeDef(0), nodeDef(1), nodeDef(2))
+	services = append(services,
+		[]ServiceDef{
 			{
 				Name: "backup", Display: "Backup Node", Role: RoleClusterNode,
 				Command: append(gatewayCmd(), "-cp", "match-cluster/target/match-cluster.jar",
 					"com.match.infrastructure.persistence.ClusterBackupApp"),
 				WorkDir: cfg.ProjectDir,
 				PreStart: [][]string{{"mkdir", "-p", "/dev/shm/aeron-cluster/backup"}},
-				DependsOn: []string{"node0", "node1", "node2"}, StartOrder: 4,
+				DependsOn: []string{"node0", "node1", "node2"},
 				AutoRestart: true, RestartSec: 10, StopTimeout: 5,
 			},
 			{
@@ -194,7 +244,7 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 					"CLUSTER_ADDRESSES": "127.0.0.1,127.0.0.1,127.0.0.1",
 				},
 				WorkDir:   cfg.OmsProjectDir,
-				DependsOn: []string{"node0", "node1", "node2"}, StartOrder: 5,
+				DependsOn: []string{"node0", "node1", "node2"},
 				AutoRestart: true, RestartSec: 5, StopTimeout: 10,
 			},
 			{
@@ -208,16 +258,33 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 					"GATEWAY_TYPE":      "market",
 				},
 				WorkDir: cfg.ProjectDir,
-				DependsOn: []string{"node0", "node1", "node2"}, StartOrder: 6,
+				DependsOn: []string{"node0", "node1", "node2"},
 				AutoRestart: true, RestartSec: 5, StopTimeout: 5,
 			},
 			{
 				Name: "admin", Display: "Admin Gateway", Role: RoleGateway, Port: 8082,
 				// Admin is self — we don't manage ourselves, just report status
-				StartOrder: 7,
 			},
 			// Trading UI lives in separate repo (trading-ui)
-		},
+		}...)
+
+	// Slice order IS the boot order; StartOrder mirrors it for display/debugging
+	for i := range services {
+		services[i].StartOrder = i + 1
+	}
+
+	if externalDriver {
+		fmt.Printf("[PM] Engine driver mode: external (profile=%s) — media drivers managed as driver0-2\n", driverProfile)
+	} else {
+		fmt.Printf("[PM] Engine driver mode: embedded (ENGINE_DRIVER_MODE=embedded)\n")
+	}
+
+	pm := &ProcessManager{
+		cfg:      cfg,
+		logDir:   logDir,
+		pidDir:   pidDir,
+		procs:    make(map[string]*managedProcess),
+		services: services,
 		stopChan: make(chan struct{}),
 	}
 
@@ -607,6 +674,14 @@ func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) err
 		}
 	}
 
+	// Wait for a required file (e.g. the external media driver's cnc.dat). Warn and
+	// continue on timeout — the Java side re-waits with its own actionable error.
+	if startErr == nil && def.WaitForFile != "" {
+		if err := waitForFile(def.WaitForFile, 15*time.Second); err != nil {
+			fmt.Printf("[PM] Warning: %s for %s: %v — starting anyway\n", def.WaitForFile, def.Name, err)
+		}
+	}
+
 	// If pre-start failed, mark as failed and return
 	if startErr != nil {
 		proc.mu.Lock()
@@ -835,6 +910,16 @@ func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
 
 	// Auto-restart if enabled (with crash-loop detection)
 	if def.AutoRestart {
+		// Crash cascade (media driver → node): the node's shared-memory IPC died with
+		// the driver, so stop it BEFORE restarting the driver. It is started again
+		// below once the driver is back, giving deterministic driver-then-node order.
+		for _, target := range def.RestartCascades {
+			fmt.Printf("[PM] %s crashed — force-stopping dependent %s\n", def.Name, target)
+			if err := pm.stopProcess(target, true); err != nil {
+				fmt.Printf("[PM] Failed to stop %s during %s cascade: %v\n", target, def.Name, err)
+			}
+		}
+
 		restartSec := def.RestartSec
 		if restartSec <= 0 {
 			restartSec = 5
@@ -893,6 +978,19 @@ func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
 			proc.mu.Lock()
 			proc.status = "failed"
 			proc.mu.Unlock()
+		} else {
+			// Bring cascade-stopped dependents back now that we are up again
+			// (their start waits for our WaitForFile/cnc.dat readiness signal)
+			for _, target := range def.RestartCascades {
+				tdef := pm.findDef(target)
+				if tdef == nil {
+					continue
+				}
+				fmt.Printf("[PM] Restarting %s after %s recovery\n", target, def.Name)
+				if err := pm.startProcessNoRotate(*tdef); err != nil {
+					fmt.Printf("[PM] Failed to restart %s after %s recovery: %v\n", target, def.Name, err)
+				}
+			}
 		}
 	} else {
 		proc.mu.Lock()
@@ -994,11 +1092,21 @@ func (pm *ProcessManager) cleanStaleAeronState(name string) {
 	// Map service name to node ID for media driver cleanup
 	nodeIds := map[string]int{"node0": 0, "node1": 1, "node2": 2}
 	if nodeId, ok := nodeIds[name]; ok {
-		// Clean stale MediaDriver directory
-		driverDir := fmt.Sprintf("/dev/shm/aeron-emre-%d-driver", nodeId)
-		if _, err := os.Stat(driverDir); err == nil {
-			os.RemoveAll(driverDir)
-			fmt.Printf("[PM] Cleaned stale MediaDriver: %s\n", driverDir)
+		// Clean stale MediaDriver directory — but NEVER while an external driver
+		// process owns it (external mode shares this dir between driverN and nodeN;
+		// deleting it under a live driver corrupts the IPC files).
+		driverRunning := false
+		if dproc, ok := pm.procs[fmt.Sprintf("driver%d", nodeId)]; ok {
+			dproc.mu.Lock()
+			driverRunning = dproc.running
+			dproc.mu.Unlock()
+		}
+		driverDir := fmt.Sprintf("/dev/shm/aeron-%s-%d-driver", currentUsername(), nodeId)
+		if !driverRunning {
+			if _, err := os.Stat(driverDir); err == nil {
+				os.RemoveAll(driverDir)
+				fmt.Printf("[PM] Cleaned stale MediaDriver: %s\n", driverDir)
+			}
 		}
 
 		// Clean stale mark files and locks
@@ -1032,6 +1140,18 @@ func (pm *ProcessManager) cleanStaleAeronState(name string) {
 			}
 		}
 	}
+}
+
+// waitForFile polls until the file exists or the timeout elapses.
+func waitForFile(path string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return fmt.Errorf("not present after %s", timeout)
 }
 
 // isPortInUse checks both TCP and UDP for a port being in use.
