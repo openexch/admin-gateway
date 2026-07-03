@@ -571,6 +571,18 @@ func (o *OperationsService) Cleanup(opts CleanupOptions) map[string]interface{} 
 		}
 	}
 
+	// External media drivers own /dev/shm/aeron-<user>-N-driver, which the wipe below
+	// deletes — they must be stopped too or their IPC files are pulled out from under them
+	if o.procMgr != nil {
+		for i := 0; i < 3; i++ {
+			if info := o.procMgr.Get(fmt.Sprintf("driver%d", i)); info != nil && info.Running {
+				result["success"] = false
+				result["error"] = fmt.Sprintf("Media driver %d is still running. Stop all drivers before cleanup.", i)
+				return result
+			}
+		}
+	}
+
 	// Dry-run mode: report what would be cleaned
 	if opts.DryRun {
 		wouldClean := []string{
@@ -877,9 +889,16 @@ func (o *OperationsService) waitForNodeStopped(nodeId int, timeout time.Duration
 	}
 }
 
-// cleanNodeMediaDriver removes stale Aeron MediaDriver directories for a node
+// cleanNodeMediaDriver removes stale Aeron MediaDriver directories for a node.
+// Never touches the dir while an external media driver (driverN) owns it — in external
+// mode the driver process survives node restarts and deleting its dir corrupts the IPC.
 func (o *OperationsService) cleanNodeMediaDriver(nodeId int) {
-	driverDir := fmt.Sprintf("/dev/shm/aeron-emre-%d-driver", nodeId)
+	if o.procMgr != nil {
+		if info := o.procMgr.Get(fmt.Sprintf("driver%d", nodeId)); info != nil && info.Running {
+			return
+		}
+	}
+	driverDir := fmt.Sprintf("/dev/shm/aeron-%s-%d-driver", currentUsername(), nodeId)
 	if _, err := os.Stat(driverDir); err == nil {
 		os.RemoveAll(driverDir)
 		fmt.Printf("Cleaned stale MediaDriver: %s\n", driverDir)
