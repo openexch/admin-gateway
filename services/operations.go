@@ -295,7 +295,9 @@ func (o *OperationsService) RebuildAdmin() error {
 func (o *OperationsService) doRebuildAdmin() {
 	o.progress.Start("rebuild-admin", 4)
 
-	adminDir := filepath.Join(o.cfg.ProjectDir, "admin-gateway")
+	// AdminDir, not ProjectDir/admin-gateway: this repo split out of match, so the
+	// old path builds a checkout that no longer exists.
+	adminDir := o.cfg.AdminDir
 	liveBinary := filepath.Join(adminDir, "admin-gateway")
 	stagingBinary := filepath.Join(adminDir, "admin-gateway.staging")
 
