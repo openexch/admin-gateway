@@ -71,6 +71,14 @@ type StatusService struct {
 	// Background poller
 	pollInterval time.Duration
 	stopChan     chan struct{}
+
+	// Counter-freshness state across polls (issue #13: CnC counters survive
+	// process death, so health needs liveness + advancement, not raw values).
+	// Guarded by freshMu: fetchStatus can run from the poller and from the
+	// GetStatus cache-miss fallback concurrently.
+	freshMu     sync.Mutex
+	prevCommit  [3]int64
+	frozenPolls [3]int
 }
 
 func NewStatusService(cfg *config.Config, cluster *Cluster, status *ClusterStatus) *StatusService {
@@ -178,6 +186,53 @@ func (s *StatusService) fetchStatus() map[string]interface{} {
 		leader = s.clusterStatus.GetLeaderId()
 	}
 
+	// Read all nodes' counters and derive health up front: freshness ("is MY
+	// commit position frozen while OTHERS advance?") needs the cross-node view
+	// before any per-node health can be derived, and the freshness state must
+	// not stay locked across the expensive JVM-spawning calls below.
+	var cnc [3]*CounterData
+	var cncOK [3]bool
+	var advanced [3]bool
+	var isActiveArr [3]bool
+	var pidArr [3]int
+	var pidAliveArr [3]bool
+	var trackedArr [3]string
+	var transitionalArr [3]bool
+	var healthArr [3]string
+	var runningArr [3]bool
+
+	s.freshMu.Lock()
+	for i := 0; i < 3; i++ {
+		data, err := s.counters.GetNodeCounters(i)
+		if err == nil && data.CommitPosition >= 0 {
+			cnc[i] = data
+			cncOK[i] = true
+			advanced[i] = data.CommitPosition != s.prevCommit[i]
+			s.prevCommit[i] = data.CommitPosition
+		}
+
+		serviceName := "node" + string(rune('0'+i))
+		isActiveArr[i] = s.isServiceRunning(serviceName)
+		pidArr[i] = s.getServicePID(serviceName)
+		pidAliveArr[i] = isActiveArr[i] && isProcessAlive(pidArr[i])
+		trackedArr[i] = s.clusterStatus.GetNodeStatus(i)
+		transitionalArr[i] = trackedArr[i] == "STOPPING" || trackedArr[i] == "STARTING" ||
+			trackedArr[i] == "REJOINING" || trackedArr[i] == "ELECTION"
+	}
+	for i := 0; i < 3; i++ {
+		othersAdvanced := advanced[(i+1)%3] || advanced[(i+2)%3]
+		s.frozenPolls[i] = UpdateFrozenPolls(s.frozenPolls[i], advanced[i], othersAdvanced,
+			transitionalArr[i] || !isActiveArr[i])
+		healthArr[i], runningArr[i] = DeriveNodeHealth(NodeObservation{
+			PmRunning:    isActiveArr[i],
+			PidAlive:     pidAliveArr[i],
+			CncOK:        cncOK[i],
+			FrozenPolls:  s.frozenPolls[i],
+			Transitional: transitionalArr[i],
+		})
+	}
+	s.freshMu.Unlock()
+
 	// Build nodes status
 	nodes := make([]map[string]interface{}, 3)
 	for i := 0; i < 3; i++ {
@@ -185,17 +240,24 @@ func (s *StatusService) fetchStatus() map[string]interface{} {
 			"id": i,
 		}
 
-		serviceName := "node" + string(rune('0'+i))
-		isActive := s.isServiceRunning(serviceName)
+		pid := pidArr[i]
+		transitional := transitionalArr[i]
+		tracked := trackedArr[i]
+		health, running := healthArr[i], runningArr[i]
 
-		if isActive {
+		node["health"] = health
+		node["pidAlive"] = pidAliveArr[i]
+		node["commitAdvancing"] = advanced[i]
+		if cncOK[i] && cnc[i].NodeRole >= 0 {
+			node["cncRole"] = cncRoleString(cnc[i].NodeRole)
+		}
+
+		if running {
 			node["running"] = true
-			node["pid"] = s.getServicePID(serviceName)
-			
+			node["pid"] = pid
+
 			// Check tracked status for transitional states
-			tracked := s.clusterStatus.GetNodeStatus(i)
-			if tracked == "STOPPING" || tracked == "STARTING" || 
-			   tracked == "REJOINING" || tracked == "ELECTION" {
+			if transitional {
 				node["role"] = tracked
 			} else if i == leader {
 				node["role"] = "LEADER"
@@ -204,7 +266,12 @@ func (s *StatusService) fetchStatus() map[string]interface{} {
 			}
 		} else {
 			node["running"] = false
-			node["role"] = "OFFLINE"
+			if health == HealthDead {
+				node["role"] = "DEAD"
+				node["pid"] = pid
+			} else {
+				node["role"] = "OFFLINE"
+			}
 		}
 
 		// Archive and log info
@@ -223,19 +290,17 @@ func (s *StatusService) fetchStatus() map[string]interface{} {
 			node["snapshotPosition"] = snapPos
 		}
 
-		// Real-time counters from Aeron shared memory (no JVM spawn)
-		if counterData, err := s.counters.GetNodeCounters(i); err == nil {
-			if counterData.CommitPosition >= 0 {
-				node["commitPosition"] = counterData.CommitPosition
-				// Calculate delta from last snapshot
-				if snapPos >= 0 {
-					node["logDelta"] = counterData.CommitPosition - snapPos
-				} else {
-					node["logDelta"] = counterData.CommitPosition
-				}
+		// Real-time counters from Aeron shared memory (pre-read above)
+		if cncOK[i] {
+			node["commitPosition"] = cnc[i].CommitPosition
+			// Calculate delta from last snapshot
+			if snapPos >= 0 {
+				node["logDelta"] = cnc[i].CommitPosition - snapPos
+			} else {
+				node["logDelta"] = cnc[i].CommitPosition
 			}
-			if counterData.SnapshotCount >= 0 {
-				node["snapshotCount"] = counterData.SnapshotCount
+			if cnc[i].SnapshotCount >= 0 {
+				node["snapshotCount"] = cnc[i].SnapshotCount
 			}
 		}
 
@@ -266,11 +331,15 @@ func (s *StatusService) fetchStatus() map[string]interface{} {
 		"running": s.isServiceRunning("backup"),
 	}
 
+	allNodesHealthy := healthArr[0] == HealthHealthy &&
+		healthArr[1] == HealthHealthy && healthArr[2] == HealthHealthy
+
 	return map[string]interface{}{
-		"leader":   leader,
-		"nodes":    nodes,
-		"gateways": gateways,
-		"backup":   backup,
+		"leader":          leader,
+		"nodes":           nodes,
+		"allNodesHealthy": allNodesHealthy,
+		"gateways":        gateways,
+		"backup":          backup,
 		"gateway": map[string]interface{}{ // Legacy field
 			"running": s.isServiceRunning("oms"),
 			"port":    8080,
