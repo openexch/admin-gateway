@@ -1,8 +1,7 @@
 package main
 
 import (
-	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -13,12 +12,14 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/match/admin-gateway/config"
 	"github.com/match/admin-gateway/handlers"
+	"github.com/match/admin-gateway/logging"
 	"github.com/match/admin-gateway/services"
 )
 
 func main() {
 	// Load configuration
 	cfg := config.Load()
+	logging.Setup(cfg.LogFormat)
 
 	// Initialize services
 	systemd := services.NewSystemd()   // only used by OperationsService for admin gateway self-restart
@@ -42,7 +43,8 @@ func main() {
 
 	// Setup router
 	r := chi.NewRouter()
-	r.Use(middleware.Logger)
+	r.Use(middleware.RequestID)
+	r.Use(logging.RequestLogger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RealIP)
 	r.Use(handlers.AuthMiddleware(cfg.AuthToken))
@@ -54,17 +56,17 @@ func main() {
 	// so refuse to start in that combination.
 	if cfg.AuthToken == "" {
 		if ip := net.ParseIP(cfg.BindAddr); ip == nil || !ip.IsLoopback() {
-			log.Fatalf("Refusing to bind %s without an auth token: set ADMIN_AUTH_TOKEN(_FILE) "+
-				"or bind loopback (ADMIN_BIND=127.0.0.1)", cfg.BindAddr)
+			slog.Error("refusing to bind without an auth token: set ADMIN_AUTH_TOKEN(_FILE) or bind loopback (ADMIN_BIND=127.0.0.1)",
+				"bind", cfg.BindAddr)
+			os.Exit(1)
 		}
-		log.Printf("⚠️  AUTH: no admin token configured — loopback-only dev mode")
+		slog.Warn("no admin token configured, loopback-only dev mode")
 	}
 
 	// Start server
 	addr := cfg.BindAddr + ":" + cfg.Port
-	log.Printf("🚀 Admin Gateway starting on %s", addr)
-	log.Printf("   Project: %s", cfg.ProjectDir)
-	log.Printf("   JAR: %s", cfg.JarPath)
+	slog.Info("admin gateway starting",
+		"addr", addr, "project", cfg.ProjectDir, "jar", cfg.JarPath)
 
 	// Graceful shutdown
 	server := &http.Server{
@@ -76,7 +78,7 @@ func main() {
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 		<-sigChan
-		log.Println("Shutting down...")
+		slog.Info("shutting down")
 		autoSnapshot.Stop()
 		procMgr.Shutdown()
 		statusSvc.Stop()
@@ -84,7 +86,7 @@ func main() {
 	}()
 
 	if err := server.ListenAndServe(); err != http.ErrServerClosed {
-		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
+		slog.Error("server error", "err", err)
 		os.Exit(1)
 	}
 }

@@ -18,6 +18,7 @@ type Config struct {
 	OmsJar        string // OMS uber JAR
 	LogDir        string
 	ClusterDir    string
+	LogFormat     string // "json" (default) or "text" (ADMIN_LOG_FORMAT)
 }
 
 func Load() *Config {
@@ -57,6 +58,7 @@ func Load() *Config {
 		OmsJar:        filepath.Join(omsProjectDir, "oms-app/target/oms-app.jar"),
 		LogDir:        filepath.Join(homeDir, ".local/log/cluster"),
 		ClusterDir:    "/dev/shm/aeron-cluster",
+		LogFormat:     getEnvOrDefault("ADMIN_LOG_FORMAT", "json"),
 	}
 }
 

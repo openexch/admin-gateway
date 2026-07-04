@@ -3,12 +3,15 @@ package services
 import (
 	"sync"
 	"time"
+
+	"github.com/match/admin-gateway/logging"
 )
 
 // Progress tracks long-running operation status
 type Progress struct {
 	mu            sync.RWMutex
 	Operation     string    `json:"operation,omitempty"`
+	OperationID   string    `json:"opId,omitempty"` // correlation id, matches op_id in the logs
 	CurrentStep   int       `json:"currentStep"`
 	TotalSteps    int       `json:"totalSteps"`
 	Status        string    `json:"status,omitempty"`
@@ -37,6 +40,7 @@ func (p *Progress) TryStart(operation string, totalSteps int) bool {
 		return false
 	}
 	p.Operation = operation
+	p.OperationID = logging.NewOpID(operation)
 	p.TotalSteps = totalSteps
 	p.CurrentStep = 0
 	p.Status = ""
@@ -44,6 +48,15 @@ func (p *Progress) TryStart(operation string, totalSteps int) bool {
 	p.Error = false
 	p.StartTime = time.Now()
 	return true
+}
+
+// CurrentOpID returns the correlation id minted by the last successful
+// TryStart. The claimer reads it right after claiming the slot; no other
+// operation can start until this one completes, so the value is stable.
+func (p *Progress) CurrentOpID() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.OperationID
 }
 
 func (p *Progress) Update(step int, status string) {
@@ -69,6 +82,7 @@ func (p *Progress) Reset() {
 	defer p.mu.Unlock()
 	
 	p.Operation = ""
+	p.OperationID = ""
 	p.CurrentStep = 0
 	p.TotalSteps = 0
 	p.Status = ""
@@ -95,6 +109,9 @@ func (p *Progress) ToMap() map[string]interface{} {
 	
 	if p.Operation != "" {
 		result["operation"] = p.Operation
+	}
+	if p.OperationID != "" {
+		result["opId"] = p.OperationID
 	}
 	if p.Status != "" {
 		result["status"] = p.Status

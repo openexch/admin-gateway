@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/match/admin-gateway/config"
+	"github.com/match/admin-gateway/logging"
 )
 
 // OperationsService handles complex cluster operations
@@ -24,6 +26,7 @@ type OperationsService struct {
 	clusterStatus *ClusterStatus
 	procMgr       *ProcessManager
 	statusSvc     *StatusService
+	log           *slog.Logger
 }
 
 func NewOperationsService(cfg *config.Config, systemd *Systemd, cluster *Cluster, progress *Progress, status *ClusterStatus) *OperationsService {
@@ -33,6 +36,7 @@ func NewOperationsService(cfg *config.Config, systemd *Systemd, cluster *Cluster
 		cluster:       cluster,
 		progress:      progress,
 		clusterStatus: status,
+		log:           logging.Component("ops"),
 	}
 }
 
@@ -85,33 +89,33 @@ func (o *OperationsService) isNodeRunning(nodeId int) bool {
 // startService starts a service via process manager
 func (o *OperationsService) startService(name string) {
 	if o.procMgr == nil {
-		fmt.Printf("[ops] ERROR: ProcessManager not initialized, cannot start %s\n", name)
+		o.log.Error("process manager not initialized, cannot start service", "service", name)
 		return
 	}
 	if err := o.procMgr.startByName(name); err != nil {
-		fmt.Printf("[ops] PM start %s failed: %v\n", name, err)
+		o.log.Error("start service failed", "service", name, "err", err)
 	}
 }
 
 // stopService stops a service via process manager
 func (o *OperationsService) stopService(name string) {
 	if o.procMgr == nil {
-		fmt.Printf("[ops] ERROR: ProcessManager not initialized, cannot stop %s\n", name)
+		o.log.Error("process manager not initialized, cannot stop service", "service", name)
 		return
 	}
 	if err := o.procMgr.stopProcess(name, true); err != nil {
-		fmt.Printf("[ops] PM stop %s failed: %v\n", name, err)
+		o.log.Error("stop service failed", "service", name, "err", err)
 	}
 }
 
 // restartService restarts a service via process manager
 func (o *OperationsService) restartService(name string) {
 	if o.procMgr == nil {
-		fmt.Printf("[ops] ERROR: ProcessManager not initialized, cannot restart %s\n", name)
+		o.log.Error("process manager not initialized, cannot restart service", "service", name)
 		return
 	}
 	if err := o.procMgr.Restart(name); err != nil {
-		fmt.Printf("[ops] PM restart %s failed: %v\n", name, err)
+		o.log.Error("restart service failed", "service", name, "err", err)
 	}
 }
 
@@ -160,6 +164,7 @@ func (o *OperationsService) stageClusterJar(tempBuildDir, stagingDir, stagingJar
 }
 
 func (o *OperationsService) doRollingUpdate() {
+	log := o.log.With("op", "rolling-update", "op_id", o.progress.CurrentOpID())
 	jarPath := o.cfg.JarPath
 	stagingDir := filepath.Join(o.cfg.ProjectDir, "match-cluster/target/staging")
 	stagingJar := filepath.Join(stagingDir, "match-cluster.jar")
@@ -212,7 +217,7 @@ func (o *OperationsService) doRollingUpdate() {
 		o.progress.Update(step, "Stopping "+nodeLabel+"...")
 		o.clusterStatus.SetNodeStatus(nodeId, "STOPPING", false)
 		o.stopService(fmt.Sprintf("node%d", nodeId))
-		o.waitForNodeStopped(nodeId, 15*time.Second)
+		o.waitForNodeStopped(log, nodeId, 15*time.Second)
 		o.clusterStatus.SetNodeStatus(nodeId, "OFFLINE", false)
 		step++
 
@@ -225,7 +230,7 @@ func (o *OperationsService) doRollingUpdate() {
 		}
 
 		// Clean stale MediaDriver directory for this node
-		o.cleanNodeMediaDriver(nodeId)
+		o.cleanNodeMediaDriver(log, nodeId)
 
 		// Start follower with new code
 		o.progress.Update(step, "Starting "+nodeLabel+" with new code...")
@@ -252,7 +257,7 @@ func (o *OperationsService) doRollingUpdate() {
 		// Otherwise we may stop the next node while this one is still replaying the log,
 		// transiently dropping the cluster below quorum (2/3).
 		o.progress.Update(step, nodeLabel+": Waiting for log catch-up...")
-		if !o.waitForFollowerCatchUp(nodeId, leader, 60*time.Second) {
+		if !o.waitForFollowerCatchUp(log, nodeId, leader, 60*time.Second) {
 			o.progress.Finish(false, fmt.Sprintf(
 				"%s rejoined but did not catch up to the leader within 60s — ABORTED before "+
 					"touching more nodes; cluster keeps quorum (2/3), investigate node%d then re-run", nodeLabel, nodeId))
@@ -270,11 +275,11 @@ func (o *OperationsService) doRollingUpdate() {
 		o.clusterStatus.SetNodeStatus(nodeId, "ELECTION", true)
 	}
 	o.stopService(fmt.Sprintf("node%d", leader))
-	o.waitForNodeStopped(leader, 15*time.Second)
+	o.waitForNodeStopped(log, leader, 15*time.Second)
 	o.clusterStatus.SetNodeStatus(leader, "OFFLINE", false)
 
 	// Clean stale MediaDriver directory for old leader
-	o.cleanNodeMediaDriver(leader)
+	o.cleanNodeMediaDriver(log, leader)
 
 	// Step 10: Wait for new leader election — verify by checking ingress ports
 	o.progress.Update(10, "Waiting for leader election...")
@@ -333,7 +338,7 @@ func (o *OperationsService) doRollingUpdate() {
 				"cluster running at 2/3, investigate node%d", leader, leader))
 		return
 	}
-	if newLeader < 0 || !o.waitForFollowerCatchUp(leader, newLeader, 60*time.Second) {
+	if newLeader < 0 || !o.waitForFollowerCatchUp(log, leader, newLeader, 60*time.Second) {
 		o.clusterStatus.SetNodeStatus(leader, "FOLLOWER", true)
 		exec.Command("rm", "-rf", stagingDir).Run()
 		o.progress.Finish(false, fmt.Sprintf(
@@ -429,6 +434,7 @@ func (o *OperationsService) Snapshot(force bool) error {
 }
 
 func (o *OperationsService) doSnapshot() {
+	log := o.log.With("op", "snapshot", "op_id", o.progress.CurrentOpID())
 	// Step 1: Find leader
 	o.progress.Update(1, "Finding cluster leader...")
 	leader := o.cluster.DetectLeader()
@@ -465,10 +471,10 @@ func (o *OperationsService) doSnapshot() {
 	for i := 0; i < 3; i++ {
 		o.progress.Update(5+i, fmt.Sprintf("Reclaiming archive on Node %d...", i))
 		hkOutput, hkErr := o.cluster.ArchiveHousekeeping(i)
-		fmt.Printf("[SNAPSHOT] Node %d housekeeping:\n%s\n", i, hkOutput)
+		log.Info("node housekeeping output", "node", i, "output", hkOutput)
 		if hkErr != nil {
 			housekeepingFailures++
-			fmt.Printf("[SNAPSHOT] WARNING: housekeeping failed on node %d: %v\n", i, hkErr)
+			log.Warn("housekeeping failed on node", "node", i, "err", hkErr)
 		}
 	}
 
@@ -499,14 +505,15 @@ func (o *OperationsService) Housekeeping(force bool) error {
 }
 
 func (o *OperationsService) doHousekeeping() {
+	log := o.log.With("op", "housekeeping", "op_id", o.progress.CurrentOpID())
 	failures := 0
 	for i := 0; i < 3; i++ {
 		o.progress.Update(1+i, fmt.Sprintf("Reclaiming archive on Node %d...", i))
 		output, err := o.cluster.ArchiveHousekeeping(i)
-		fmt.Printf("[HOUSEKEEPING] Node %d:\n%s\n", i, output)
+		log.Info("node housekeeping output", "node", i, "output", output)
 		if err != nil {
 			failures++
-			fmt.Printf("[HOUSEKEEPING] WARNING: failed on node %d: %v\n", i, err)
+			log.Warn("housekeeping failed on node", "node", i, "err", err)
 		}
 	}
 
@@ -1051,7 +1058,7 @@ func (o *OperationsService) isPortOpen(host string, port int) bool {
 }
 
 // waitForNodeStopped waits until a node's process is no longer running
-func (o *OperationsService) waitForNodeStopped(nodeId int, timeout time.Duration) {
+func (o *OperationsService) waitForNodeStopped(log *slog.Logger, nodeId int, timeout time.Duration) {
 	service := fmt.Sprintf("node%d", nodeId)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -1061,7 +1068,7 @@ func (o *OperationsService) waitForNodeStopped(nodeId int, timeout time.Duration
 		time.Sleep(1 * time.Second)
 	}
 	// Force kill if still running
-	fmt.Printf("Node %d still running after timeout, force killing\n", nodeId)
+	log.Warn("node still running after stop timeout, force killing", "node", nodeId)
 	if o.procMgr != nil {
 		info := o.procMgr.Get(service)
 		if info != nil && info.PID > 0 {
@@ -1074,7 +1081,7 @@ func (o *OperationsService) waitForNodeStopped(nodeId int, timeout time.Duration
 // cleanNodeMediaDriver removes stale Aeron MediaDriver directories for a node.
 // Never touches the dir while an external media driver (driverN) owns it — in external
 // mode the driver process survives node restarts and deleting its dir corrupts the IPC.
-func (o *OperationsService) cleanNodeMediaDriver(nodeId int) {
+func (o *OperationsService) cleanNodeMediaDriver(log *slog.Logger, nodeId int) {
 	if o.procMgr != nil {
 		if info := o.procMgr.Get(fmt.Sprintf("driver%d", nodeId)); info != nil && info.Running {
 			return
@@ -1083,7 +1090,7 @@ func (o *OperationsService) cleanNodeMediaDriver(nodeId int) {
 	driverDir := fmt.Sprintf("/dev/shm/aeron-%s-%d-driver", currentUsername(), nodeId)
 	if _, err := os.Stat(driverDir); err == nil {
 		os.RemoveAll(driverDir)
-		fmt.Printf("Cleaned stale MediaDriver: %s\n", driverDir)
+		log.Info("cleaned stale media driver dir", "dir", driverDir)
 	}
 }
 
@@ -1094,7 +1101,7 @@ func (o *OperationsService) cleanNodeMediaDriver(nodeId int) {
 // Why this matters: rolling update used to advance to the next node as soon as the previous
 // follower's ingress port was open. The node was up but might still be replaying the log or
 // loading a snapshot. Restarting the next node before catch-up risks losing quorum.
-func (o *OperationsService) waitForFollowerCatchUp(followerId, leaderId int, timeout time.Duration) bool {
+func (o *OperationsService) waitForFollowerCatchUp(log *slog.Logger, followerId, leaderId int, timeout time.Duration) bool {
 	const catchUpLagBytes int64 = 1 * 1024 * 1024 // 1 MB lag is fine; term buffer is 16 MB
 	counters := NewAeronCounters()
 	deadline := time.Now().Add(timeout)
@@ -1108,13 +1115,12 @@ func (o *OperationsService) waitForFollowerCatchUp(followerId, leaderId int, tim
 		}
 		lag := leader.CommitPosition - follower.CommitPosition
 		if lag <= catchUpLagBytes {
-			fmt.Printf("Node %d caught up to leader (lag=%d bytes)\n", followerId, lag)
+			log.Info("node caught up to leader", "node", followerId, "lag_bytes", lag)
 			return true
 		}
 		if follower.CommitPosition <= lastFollowerPos && follower.CommitPosition > 0 {
 			// Position not advancing — log but keep waiting until timeout.
-			fmt.Printf("Node %d catch-up stalled at pos=%d (lag=%d)\n",
-				followerId, follower.CommitPosition, lag)
+			log.Warn("node catch-up stalled", "node", followerId, "pos", follower.CommitPosition, "lag_bytes", lag)
 		}
 		lastFollowerPos = follower.CommitPosition
 	}

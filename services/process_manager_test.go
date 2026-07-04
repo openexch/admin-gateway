@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/match/admin-gateway/logging"
 )
 
 // gateFixture builds a minimal ProcessManager with a driver0 proc and a node0
@@ -15,6 +17,7 @@ func gateFixture(t *testing.T) (*ProcessManager, *managedProcess, ServiceDef) {
 	t.Helper()
 	driver := &managedProcess{status: "stopped"}
 	pm := &ProcessManager{
+		log: logging.Component("pm"),
 		procs: map[string]*managedProcess{
 			"driver0": driver,
 			"node0":   {status: "stopped"},
@@ -121,6 +124,7 @@ func TestAdoptedProcessCrashDetected(t *testing.T) {
 	dir := t.TempDir()
 	proc := &managedProcess{running: true, pid: deadPid, status: "running"} // adopted: cmd == nil
 	pm := &ProcessManager{
+		log:    logging.Component("pm"),
 		pidDir: dir,
 		logDir: dir,
 		procs:  map[string]*managedProcess{"market": proc},
