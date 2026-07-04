@@ -8,14 +8,16 @@ import (
 
 // AuthMiddleware enforces the admin API bearer token (admin-gateway#11).
 //
-// With a token configured, every route except /health requires
+// With a token configured, every route except /health and /metrics requires
 // "Authorization: Bearer <token>" (or "X-Admin-Token: <token>"); mismatches
 // get 401. With no token configured it passes everything through — main only
-// permits that combination on a loopback bind.
+// permits that combination on a loopback bind. /metrics is exempt for the
+// local Prometheus scraper, matching the OMS convention (read-only, no
+// secrets; deployments exposing the admin port must firewall it anyway).
 func AuthMiddleware(token string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if token == "" || r.URL.Path == "/health" {
+			if token == "" || r.URL.Path == "/health" || r.URL.Path == "/metrics" {
 				next.ServeHTTP(w, r)
 				return
 			}

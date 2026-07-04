@@ -39,8 +39,9 @@ go build -o admin-gateway .
 |----------|---------|-------------|
 | `ADMIN_PORT` | `8082` | HTTP server port |
 | `ADMIN_BIND` | `127.0.0.1` | Listen address (loopback by default) |
-| `ADMIN_AUTH_TOKEN` | _(empty)_ | Bearer token required on every route except `/health` |
+| `ADMIN_AUTH_TOKEN` | _(empty)_ | Bearer token required on every route except `/health` and `/metrics` |
 | `ADMIN_AUTH_TOKEN_FILE` | _(empty)_ | File to read the token from (whitespace trimmed) |
+| `ADMIN_LOG_FORMAT` | `json` | Structured log format: `json` or `text` |
 | `MATCH_PROJECT_DIR` | (auto-detected) | Path to the match engine project |
 
 ### Authentication
@@ -63,6 +64,7 @@ logged).
 | `GET` | `/api/admin/progress` | Operation progress |
 | `GET` | `/api/admin/logs?node=0&lines=100` | Service logs |
 | `GET` | `/health` | Health check |
+| `GET` | `/metrics` | Prometheus metrics (auth-exempt, for the local scraper) |
 
 ### Node Operations
 

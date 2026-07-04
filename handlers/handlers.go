@@ -19,6 +19,7 @@ type Handlers struct {
 	autoSnapshot *services.AutoSnapshot
 	logSvc       *services.LogService
 	procMgr      *services.ProcessManager
+	metrics      *services.MetricsService
 }
 
 func New(
@@ -30,6 +31,7 @@ func New(
 	autoSnapshot *services.AutoSnapshot,
 	logSvc *services.LogService,
 	procMgr *services.ProcessManager,
+	metrics *services.MetricsService,
 ) *Handlers {
 	return &Handlers{
 		statusSvc:    statusSvc,
@@ -40,6 +42,7 @@ func New(
 		autoSnapshot: autoSnapshot,
 		logSvc:       logSvc,
 		procMgr:      procMgr,
+		metrics:      metrics,
 	}
 }
 
@@ -101,6 +104,9 @@ func (h *Handlers) RegisterRoutes(r chi.Router) {
 
 	// Health check
 	r.Get("/health", h.handleHealth)
+
+	// Prometheus metrics (auth-exempt, like /health — local scraper)
+	r.Get("/metrics", h.metrics.Handler)
 }
 
 func corsMiddleware(next http.Handler) http.Handler {
