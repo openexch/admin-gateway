@@ -27,3 +27,9 @@ admin-gateway
 # OS
 .DS_Store
 Thumbs.db
+
+# Self-update artifacts (rebuild-admin)
+admin-gateway.prev
+admin-gateway.staging
+rebuild-pending.json
+rebuild-result.json
