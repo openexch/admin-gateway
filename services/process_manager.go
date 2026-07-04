@@ -248,8 +248,19 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 				Name: "backup", Display: "Backup Node", Role: RoleClusterNode,
 				Command: append(gatewayCmd(), "-cp", "match-cluster/target/match-cluster.jar",
 					"com.match.infrastructure.persistence.ClusterBackupApp"),
+				// The env is LOAD-BEARING (match#36): without CLUSTER_ADDRESSES the app
+				// defaults to a SINGLE consensus endpoint (node0's), and Aeron's
+				// ClusterBackup wedges in an infinite nextCursor() loop the moment the
+				// leader is any other node (single-endpoint PublicationGroup + exclusion).
+				// BASE_DIR pins backup data to durable DISK, never tmpfs — it is the
+				// power-loss recovery source (#9).
+				Env: map[string]string{
+					"CLUSTER_ADDRESSES":     "127.0.0.1,127.0.0.1,127.0.0.1",
+					"BASE_DIR":              filepath.Join(cfg.ProjectDir, "backup"),
+					"BACKUP_STALL_EXIT_SEC": "300",
+				},
 				WorkDir: cfg.ProjectDir,
-				PreStart: [][]string{{"mkdir", "-p", "/dev/shm/aeron-cluster/backup"}},
+				PreStart: [][]string{{"mkdir", "-p", filepath.Join(cfg.ProjectDir, "backup")}},
 				DependsOn: []string{"node0", "node1", "node2"},
 				AutoRestart: true, RestartSec: 10, StopTimeout: 5,
 			},
@@ -1194,9 +1205,10 @@ func (pm *ProcessManager) cleanStaleAeronState(name string) {
 		}
 	}
 
-	// Backup node
+	// Backup node — its state lives on DISK under ProjectDir/backup (match#36/#9),
+	// NOT the old /dev/shm/aeron-cluster/backup (that dir was never used by the app)
 	if name == "backup" {
-		backupDir := "/dev/shm/aeron-cluster/backup"
+		backupDir := filepath.Join(pm.cfg.ProjectDir, "backup")
 		patterns := []string{
 			backupDir + "/cluster/cluster-mark*.dat",
 			backupDir + "/cluster/*.lck",
