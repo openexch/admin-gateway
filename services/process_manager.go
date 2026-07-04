@@ -45,7 +45,21 @@ type ServiceDef struct {
 	// Services to force-stop when this one crashes and to start again after it restarts.
 	// Used for media driver → node coupling: a node cannot outlive its external driver.
 	RestartCascades []string `json:"-"`
+	// Service that must be running AND stable before this one may start (see
+	// waitForGate). Used for driver → node gating: starting a node against an
+	// absent or flapping driver lets it write a partial archive and die
+	// mid-write — the 2026-07-03 corruption engine (#17, match#35, match#48).
+	GatedBy string `json:"-"`
 }
+
+// Restart-loop cap + driver gate tuning (#17). Vars, not consts, so tests can
+// shrink the timings; production code never mutates them.
+var (
+	rapidCrashMax    = 5               // crashes within rapidCrashWindow before auto-restart disarms
+	rapidCrashWindow = 2 * time.Minute
+	gateStableFor    = 5 * time.Second  // gating service must be up this long (outlives launcher validation crashes)
+	gateTimeout      = 25 * time.Second // total wait for the gate to become stable
+)
 
 // ProcessInfo is the live state of a managed service
 type ProcessInfo struct {
@@ -62,6 +76,9 @@ type ProcessInfo struct {
 	RestartCount int         `json:"restartCount"`
 	Enabled      bool        `json:"enabled"`
 	Status       string      `json:"status"` // "running", "stopped", "starting", "stopping", "failed", "crashed"
+	// Why the service is failed/crashed (start error, crash exit + log tail,
+	// or crash-loop disarm). Empty while healthy.
+	LastError string `json:"lastError,omitempty"`
 }
 
 // managedProcess tracks a running process
@@ -76,6 +93,8 @@ type managedProcess struct {
 	status       string // "running", "stopped", "starting", "stopping", "failed", "crashed"
 	stopChan     chan struct{}
 	logFile      *os.File
+	lastError    string      // why the last start failed / last crash happened (see ProcessInfo.LastError)
+	crashTimes   []time.Time // recent crash timestamps; drives the rapid-restart cap (#17)
 }
 
 // ProcessManager directly manages processes (no systemd for managed services)
@@ -203,6 +222,7 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 		if externalDriver {
 			def.DependsOn = []string{fmt.Sprintf("driver%d", nodeId)}
 			def.WaitForFile = filepath.Join(driverDir(nodeId), "cnc.dat")
+			def.GatedBy = fmt.Sprintf("driver%d", nodeId)
 		}
 		return def
 	}
@@ -385,6 +405,7 @@ func (pm *ProcessManager) Start(name string) error {
 		}
 	}
 
+	pm.rearm(name) // explicit start re-arms the crash-loop cap
 	return pm.startProcess(*def)
 }
 
@@ -459,6 +480,7 @@ func (pm *ProcessManager) Restart(name string) error {
 		}
 	}
 
+	pm.rearm(name) // explicit restart re-arms the crash-loop cap
 	return pm.startProcess(*def)
 }
 
@@ -482,6 +504,7 @@ func (pm *ProcessManager) StartAll() []ActionResult {
 			continue
 		}
 
+		pm.rearm(def.Name) // start-all is explicit intent
 		err := pm.startProcess(def)
 		result := ActionResult{Service: def.Name, Action: "start", Success: err == nil}
 		if err != nil {
@@ -543,6 +566,7 @@ func (pm *ProcessManager) Summary() map[string]interface{} {
 	running := 0
 	stopped := 0
 	failed := 0
+	failedServices := map[string]string{}
 	var totalMem int64
 
 	for _, def := range pm.services {
@@ -556,6 +580,7 @@ func (pm *ProcessManager) Summary() map[string]interface{} {
 			}
 		case proc.status == "failed" || proc.status == "crashed":
 			failed++
+			failedServices[def.Name] = proc.lastError
 		default:
 			stopped++
 		}
@@ -565,13 +590,17 @@ func (pm *ProcessManager) Summary() map[string]interface{} {
 	// Count admin as running (we're always running)
 	// Already counted above if adopted
 
-	return map[string]interface{}{
+	summary := map[string]interface{}{
 		"total":         total,
 		"running":       running,
 		"stopped":       stopped,
 		"failed":        failed,
 		"totalMemoryMB": totalMem / (1024 * 1024),
 	}
+	if len(failedServices) > 0 {
+		summary["failedServices"] = failedServices // name → lastError (why it failed)
+	}
+	return summary
 }
 
 type ActionResult struct {
@@ -592,6 +621,7 @@ func (pm *ProcessManager) startByName(name string) error {
 	if len(def.Command) == 0 {
 		return fmt.Errorf("service %s has no command configured", name)
 	}
+	pm.rearm(name) // internal callers (operations) are explicit intent too
 	return pm.startProcess(*def)
 }
 
@@ -623,6 +653,21 @@ func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) err
 	// Phase 2: Pre-start work WITHOUT holding the lock (port wait, cleanup, etc.)
 	// This allows status queries and stop commands to proceed during preparation.
 	var startErr error
+
+	// Driver gate FIRST, before any cleanup touches node state on disk: a gated
+	// service must not start (or mutate its archive dirs) unless its driver is
+	// running, stable, and has published cnc.dat (#17).
+	if def.GatedBy != "" {
+		if err := pm.waitForGate(def); err != nil {
+			proc.mu.Lock()
+			proc.status = "failed"
+			proc.lastError = err.Error()
+			proc.starting = false
+			proc.mu.Unlock()
+			fmt.Printf("[PM] REFUSED start of %s: %v\n", def.Name, err)
+			return err
+		}
+	}
 
 	// Clean stale Aeron state for cluster nodes
 	if def.Role == RoleClusterNode {
@@ -676,7 +721,8 @@ func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) err
 
 	// Wait for a required file (e.g. the external media driver's cnc.dat). Warn and
 	// continue on timeout — the Java side re-waits with its own actionable error.
-	if startErr == nil && def.WaitForFile != "" {
+	// Gated services skip this: waitForGate already required the file strictly.
+	if startErr == nil && def.WaitForFile != "" && def.GatedBy == "" {
 		if err := waitForFile(def.WaitForFile, 15*time.Second); err != nil {
 			fmt.Printf("[PM] Warning: %s for %s: %v — starting anyway\n", def.WaitForFile, def.Name, err)
 		}
@@ -686,6 +732,7 @@ func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) err
 	if startErr != nil {
 		proc.mu.Lock()
 		proc.status = "failed"
+		proc.lastError = startErr.Error()
 		proc.starting = false
 		proc.mu.Unlock()
 		return startErr
@@ -713,6 +760,7 @@ func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) err
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		proc.status = "failed"
+		proc.lastError = fmt.Sprintf("failed to open log file %s: %v", logPath, err)
 		return fmt.Errorf("failed to open log file %s: %w", logPath, err)
 	}
 
@@ -738,6 +786,7 @@ func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) err
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
 		proc.status = "failed"
+		proc.lastError = fmt.Sprintf("failed to start: %v", err)
 		return fmt.Errorf("failed to start %s: %w", def.Name, err)
 	}
 
@@ -746,6 +795,7 @@ func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) err
 	proc.running = true
 	proc.startedAt = time.Now()
 	proc.status = "running"
+	proc.lastError = ""
 	proc.logFile = logFile
 	proc.stopChan = make(chan struct{})
 
@@ -900,15 +950,34 @@ func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
 	default:
 	}
 
+	exitMsg := "unknown"
+	if err != nil {
+		exitMsg = err.Error()
+	}
+	crashCause := fmt.Sprintf("crashed (exit: %s)", exitMsg)
+	if tail := tailLogSnippet(filepath.Join(pm.logDir, def.Name+".log")); tail != "" {
+		crashCause += " — log: " + tail
+	}
 	if wasRunning {
-		exitMsg := "unknown"
-		if err != nil {
-			exitMsg = err.Error()
-		}
-		fmt.Printf("[PM] %s crashed (PID %d, exit: %s)\n", def.Name, oldPid, exitMsg)
+		fmt.Printf("[PM] %s %s (PID %d)\n", def.Name, crashCause, oldPid)
 	}
 
-	// Auto-restart if enabled (with crash-loop detection)
+	// Record the crash for the rapid-loop cap (#17): count crashes inside the
+	// sliding window, not lifetime restarts.
+	now := time.Now()
+	proc.mu.Lock()
+	kept := proc.crashTimes[:0]
+	for _, t := range proc.crashTimes {
+		if now.Sub(t) < rapidCrashWindow {
+			kept = append(kept, t)
+		}
+	}
+	proc.crashTimes = append(kept, now)
+	rapidCrashes := len(proc.crashTimes)
+	proc.lastError = crashCause
+	proc.mu.Unlock()
+
+	// Auto-restart if enabled (with crash-loop cap)
 	if def.AutoRestart {
 		// Crash cascade (media driver → node): the node's shared-memory IPC died with
 		// the driver, so stop it BEFORE restarting the driver. It is started again
@@ -920,25 +989,24 @@ func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
 			}
 		}
 
+		// Rapid-loop cap: after rapidCrashMax crashes inside rapidCrashWindow,
+		// STOP retrying and require an explicit start to re-arm. An unattended
+		// restart loop against a broken environment is what let nodes write a
+		// little archive and die mid-write for hours on 2026-07-03 (#17).
+		if rapidCrashes >= rapidCrashMax {
+			msg := fmt.Sprintf("crash-looped %d times within %s; auto-restart disarmed — fix the cause, then start explicitly. Last crash: %s",
+				rapidCrashes, rapidCrashWindow, crashCause)
+			proc.mu.Lock()
+			proc.status = "failed"
+			proc.lastError = msg
+			proc.mu.Unlock()
+			fmt.Printf("[PM] %s FAILED: %s\n", def.Name, msg)
+			return
+		}
+
 		restartSec := def.RestartSec
 		if restartSec <= 0 {
 			restartSec = 5
-		}
-
-		// Crash-loop detection: if restarted 5+ times, apply exponential backoff
-		proc.mu.Lock()
-		rapidRestarts := proc.restartCount
-		proc.mu.Unlock()
-
-		const maxRapidRestarts = 5
-		if rapidRestarts >= maxRapidRestarts {
-			// Exponential backoff: 30s, 60s, 120s, 240s... up to 5min
-			backoffSec := 30 * (1 << (rapidRestarts - maxRapidRestarts))
-			if backoffSec > 300 {
-				backoffSec = 300
-			}
-			restartSec = backoffSec
-			fmt.Printf("[PM] %s in crash loop (%d restarts), backing off to %ds\n", def.Name, rapidRestarts, restartSec)
 		}
 
 		proc.mu.Lock()
@@ -977,6 +1045,7 @@ func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
 			fmt.Printf("[PM] Failed to restart %s: %v\n", def.Name, err)
 			proc.mu.Lock()
 			proc.status = "failed"
+			proc.lastError = fmt.Sprintf("auto-restart failed: %v", err)
 			proc.mu.Unlock()
 		} else {
 			// Bring cascade-stopped dependents back now that we are up again
@@ -1140,6 +1209,104 @@ func (pm *ProcessManager) cleanStaleAeronState(name string) {
 			}
 		}
 	}
+}
+
+// waitForGate blocks until def.GatedBy (the node's media driver) is running,
+// has been up for gateStableFor, and def.WaitForFile (cnc.dat) exists. It
+// fails fast when the driver is stopped/failed and is not coming back; a
+// driver that is starting/restarting gets until gateTimeout to stabilize. A
+// crash-looping driver never stays up gateStableFor, so the gate refuses the
+// node instead of letting it write archive state against a flapping driver.
+func (pm *ProcessManager) waitForGate(def ServiceDef) error {
+	gproc, ok := pm.procs[def.GatedBy]
+	if !ok {
+		return fmt.Errorf("refusing to start %s: gating service %q is unknown", def.Name, def.GatedBy)
+	}
+	deadline := time.Now().Add(gateTimeout)
+	for {
+		gproc.mu.Lock()
+		running := gproc.running
+		startedAt := gproc.startedAt
+		status := gproc.status
+		lastErr := gproc.lastError
+		gproc.mu.Unlock()
+
+		if !running && status != "starting" && status != "restarting" {
+			reason := fmt.Sprintf("refusing to start %s: %s is not running (status=%s)", def.Name, def.GatedBy, status)
+			if lastErr != "" {
+				reason += " — " + lastErr
+			}
+			return fmt.Errorf("%s", reason)
+		}
+
+		if running && !startedAt.IsZero() && time.Since(startedAt) >= gateStableFor {
+			if def.WaitForFile == "" {
+				return nil
+			}
+			if _, err := os.Stat(def.WaitForFile); err == nil {
+				return nil
+			}
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("refusing to start %s: %s did not become stable within %s (must be up %s with %s present) — driver flapping or misconfigured? check its log and lastError",
+				def.Name, def.GatedBy, gateTimeout, gateStableFor, def.WaitForFile)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+// tailLogSnippet returns the last few non-empty lines of a log file as a
+// single truncated line, for surfacing crash causes in lastError.
+func tailLogSnippet(logPath string) string {
+	f, err := os.Open(logPath)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() == 0 {
+		return ""
+	}
+	const window = 4096
+	off := st.Size() - window
+	if off < 0 {
+		off = 0
+	}
+	buf := make([]byte, st.Size()-off)
+	if _, err := f.ReadAt(buf, off); err != nil && err != io.EOF {
+		return ""
+	}
+	lines := strings.Split(strings.TrimSpace(string(buf)), "\n")
+	start := len(lines) - 3
+	if start < 0 {
+		start = 0
+	}
+	var parts []string
+	for _, l := range lines[start:] {
+		if l = strings.TrimSpace(l); l != "" {
+			parts = append(parts, l)
+		}
+	}
+	snippet := strings.Join(parts, " | ")
+	if len(snippet) > 300 {
+		snippet = "…" + snippet[len(snippet)-300:]
+	}
+	return snippet
+}
+
+// rearm clears the crash-loop window and lastError before an EXPLICIT start,
+// so a service disarmed by the rapid-restart cap can be brought back once the
+// underlying cause is fixed. Auto-restarts never re-arm (the cap would be moot).
+func (pm *ProcessManager) rearm(name string) {
+	proc, ok := pm.procs[name]
+	if !ok {
+		return
+	}
+	proc.mu.Lock()
+	proc.crashTimes = nil
+	proc.lastError = ""
+	proc.mu.Unlock()
 }
 
 // waitForFile polls until the file exists or the timeout elapses.
@@ -1361,6 +1528,7 @@ func (pm *ProcessManager) getInfo(def ServiceDef) ProcessInfo {
 		RestartCount: proc.restartCount,
 		Enabled:      true,
 		Status:       proc.status,
+		LastError:    proc.lastError,
 	}
 
 	if proc.running && proc.pid > 0 {
