@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 package services
 
 // Node health derivation for /api/admin/status truthfulness (issue #13 item 1).
