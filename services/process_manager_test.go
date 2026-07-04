@@ -2,6 +2,7 @@ package services
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -107,6 +108,49 @@ func TestRearmClearsCrashWindow(t *testing.T) {
 		t.Fatalf("rearm should clear crashTimes+lastError, got %d crashes, lastError=%q",
 			len(driver.crashTimes), driver.lastError)
 	}
+}
+
+func TestAdoptedProcessCrashDetected(t *testing.T) {
+	// A dead-but-reaped PID: run a real process to completion
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatal(err)
+	}
+	deadPid := cmd.Process.Pid
+
+	dir := t.TempDir()
+	proc := &managedProcess{running: true, pid: deadPid, status: "running"} // adopted: cmd == nil
+	pm := &ProcessManager{
+		pidDir: dir,
+		logDir: dir,
+		procs:  map[string]*managedProcess{"market": proc},
+		services: []ServiceDef{
+			{Name: "market", AutoRestart: false}, // no restart: end state is "crashed"
+		},
+	}
+
+	pm.refreshAdoptedProcesses()
+
+	// handleCrash runs on a goroutine; wait for the verdict
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		proc.mu.Lock()
+		status, lastErr, running := proc.status, proc.lastError, proc.running
+		proc.mu.Unlock()
+		if status == "crashed" {
+			if running {
+				t.Fatal("crashed process must not be marked running")
+			}
+			if !strings.Contains(lastErr, "adopted process died") {
+				t.Fatalf("lastError should carry the adopted-crash cause, got %q", lastErr)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	proc.mu.Lock()
+	defer proc.mu.Unlock()
+	t.Fatalf("adopted crash not detected: status=%q running=%v", proc.status, proc.running)
 }
 
 func TestTailLogSnippet(t *testing.T) {
