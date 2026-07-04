@@ -21,6 +21,114 @@ func writeHeartbeat(t *testing.T, dir string, ageSec int64, state string) {
 	}
 }
 
+// cleanupFixture builds a fake /dev/shm + /tmp layout with driver/client IPC
+// dirs, mark/lock files, and cluster archives.
+func cleanupFixture(t *testing.T) (shm, tmp string) {
+	t.Helper()
+	shm, tmp = t.TempDir(), t.TempDir()
+	mk := func(path string) {
+		t.Helper()
+		full := filepath.Join(shm, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("aeron-emre-0-driver/cnc.dat")
+	mk("aeron-market-1234/cnc.dat")
+	mk("aeron-cluster/node0/cluster/cluster-mark.dat")
+	mk("aeron-cluster/node0/cluster/election.lck")
+	mk("aeron-cluster/node0/archive/archive-mark.dat")
+	mk("aeron-cluster/node0/archive/0-0.rec")
+	mk("aeron-cluster/node0/archive/archive.catalog")
+	mk("aeron-cluster/node1/archive/5-0.rec")
+	mk("aeron-cluster/node1/cluster/recording.log")
+	if err := os.MkdirAll(filepath.Join(tmp, "aeron-gw-99"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	return shm, tmp
+}
+
+func exists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// #10 exit criterion: /cleanup provably preserves archives.
+func TestCleanupSweepPreservesArchives(t *testing.T) {
+	shm, tmp := cleanupFixture(t)
+
+	_, preserved, errs := cleanupSweep(shm, tmp, false, true)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	// IPC dirs, mark files, locks: gone
+	for _, gone := range []string{
+		"aeron-emre-0-driver", "aeron-market-1234",
+		"aeron-cluster/node0/cluster/cluster-mark.dat",
+		"aeron-cluster/node0/cluster/election.lck",
+		"aeron-cluster/node0/archive/archive-mark.dat",
+	} {
+		if exists(filepath.Join(shm, gone)) {
+			t.Fatalf("%s should have been cleaned", gone)
+		}
+	}
+	if exists(filepath.Join(tmp, "aeron-gw-99")) {
+		t.Fatal("tmp aeron dir should have been cleaned")
+	}
+
+	// Archives and cluster recovery state: PRESERVED
+	for _, kept := range []string{
+		"aeron-cluster/node0/archive/0-0.rec",
+		"aeron-cluster/node0/archive/archive.catalog",
+		"aeron-cluster/node1/archive/5-0.rec",
+		"aeron-cluster/node1/cluster/recording.log",
+	} {
+		if !exists(filepath.Join(shm, kept)) {
+			t.Fatalf("%s must be preserved by default cleanup", kept)
+		}
+	}
+	if len(preserved) == 0 || !strings.Contains(preserved[0], "2 archive recording(s)") {
+		t.Fatalf("preserved notice missing/wrong: %v", preserved)
+	}
+}
+
+func TestCleanupSweepIncludeArchiveWipes(t *testing.T) {
+	shm, tmp := cleanupFixture(t)
+
+	_, preserved, errs := cleanupSweep(shm, tmp, true, true)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if exists(filepath.Join(shm, "aeron-cluster")) {
+		t.Fatal("includeArchive should wipe the whole cluster state dir")
+	}
+	if len(preserved) != 0 {
+		t.Fatalf("nothing should be reported preserved on a full wipe: %v", preserved)
+	}
+}
+
+func TestCleanupSweepDryRunTouchesNothing(t *testing.T) {
+	shm, tmp := cleanupFixture(t)
+
+	wouldClean, _, _ := cleanupSweep(shm, tmp, false, false)
+	if len(wouldClean) == 0 {
+		t.Fatal("dry run should report targets")
+	}
+	for _, kept := range []string{
+		"aeron-emre-0-driver/cnc.dat",
+		"aeron-cluster/node0/archive/0-0.rec",
+		"aeron-cluster/node0/cluster/cluster-mark.dat",
+	} {
+		if !exists(filepath.Join(shm, kept)) {
+			t.Fatalf("dry run must not delete %s", kept)
+		}
+	}
+}
+
 func TestBackupFreshness(t *testing.T) {
 	dir := t.TempDir()
 

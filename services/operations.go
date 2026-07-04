@@ -215,25 +215,33 @@ func (o *OperationsService) doRollingUpdate() {
 		o.startService(fmt.Sprintf("node%d", nodeId))
 		step++
 
-		// Wait for the node to actually rejoin — verify via ingress port
+		// Wait for the node to actually rejoin — verify via ingress port.
+		// HARD-FAIL on timeout (#10): proceeding to stop the NEXT node while
+		// this one is down or still replaying drops the cluster below quorum
+		// and can wedge the election. Aborting here leaves 2/3 quorum intact
+		// for the operator to investigate.
 		o.progress.Update(step, nodeLabel+": Waiting to rejoin cluster...")
 		o.clusterStatus.SetNodeStatus(nodeId, "REJOINING", true)
 		ingressPort := 9000 + (nodeId * 100) + 2 // 9002, 9102, 9202
-		if o.waitForPort("127.0.0.1", ingressPort, 60*time.Second) {
-			// Wait for the node to catch up to the leader's commit position before moving on.
-			// Otherwise we may stop the next node while this one is still replaying the log,
-			// transiently dropping the cluster below quorum (2/3).
-			o.progress.Update(step, nodeLabel+": Waiting for log catch-up...")
-			if o.waitForFollowerCatchUp(nodeId, leader, 60*time.Second) {
-				o.progress.Update(step, nodeLabel+" caught up, marking as follower")
-			} else {
-				o.progress.Update(step, nodeLabel+" catch-up timeout — continuing (cluster may have transient quorum risk)")
-			}
-			o.clusterStatus.SetNodeStatus(nodeId, "FOLLOWER", true)
-		} else {
-			o.progress.Update(step, nodeLabel+" rejoin timeout — continuing")
-			o.clusterStatus.SetNodeStatus(nodeId, "FOLLOWER", true)
+		if !o.waitForPort("127.0.0.1", ingressPort, 60*time.Second) {
+			o.clusterStatus.SetNodeStatus(nodeId, "OFFLINE", false)
+			o.progress.Finish(false, fmt.Sprintf(
+				"%s did not rejoin within 60s — ABORTED before touching more nodes; "+
+					"cluster keeps quorum (2/3), investigate node%d then re-run rolling-update", nodeLabel, nodeId))
+			return
 		}
+		// Wait for the node to catch up to the leader's commit position before moving on.
+		// Otherwise we may stop the next node while this one is still replaying the log,
+		// transiently dropping the cluster below quorum (2/3).
+		o.progress.Update(step, nodeLabel+": Waiting for log catch-up...")
+		if !o.waitForFollowerCatchUp(nodeId, leader, 60*time.Second) {
+			o.progress.Finish(false, fmt.Sprintf(
+				"%s rejoined but did not catch up to the leader within 60s — ABORTED before "+
+					"touching more nodes; cluster keeps quorum (2/3), investigate node%d then re-run", nodeLabel, nodeId))
+			return
+		}
+		o.progress.Update(step, nodeLabel+" caught up, marking as follower")
+		o.clusterStatus.SetNodeStatus(nodeId, "FOLLOWER", true)
 		step++
 	}
 
@@ -294,20 +302,29 @@ func (o *OperationsService) doRollingUpdate() {
 	o.startService(fmt.Sprintf("node%d", leader))
 
 	// Wait for old leader to rejoin AND catch up to new leader's commit position.
+	// HARD-FAIL if it doesn't (#10): the update deployed, but reporting success
+	// with a member down/lagging hides a degraded cluster from the operator.
 	o.clusterStatus.SetNodeStatus(leader, "REJOINING", true)
 	ingressPort := 9000 + (leader * 100) + 2
 	newLeader := o.cluster.DetectLeader()
-	if o.waitForPort("127.0.0.1", ingressPort, 60*time.Second) {
-		if newLeader >= 0 && o.waitForFollowerCatchUp(leader, newLeader, 60*time.Second) {
-			o.progress.Update(11, fmt.Sprintf("Node %d rejoined and caught up", leader))
-		} else {
-			o.progress.Update(11, fmt.Sprintf("Node %d rejoined but catch-up not confirmed", leader))
-		}
-		o.clusterStatus.SetNodeStatus(leader, "FOLLOWER", true)
-	} else {
-		o.clusterStatus.SetNodeStatus(leader, "FOLLOWER", true)
-		o.progress.Update(11, fmt.Sprintf("Node %d rejoin timeout — may still be catching up", leader))
+	if !o.waitForPort("127.0.0.1", ingressPort, 60*time.Second) {
+		o.clusterStatus.SetNodeStatus(leader, "OFFLINE", false)
+		exec.Command("rm", "-rf", stagingDir).Run()
+		o.progress.Finish(false, fmt.Sprintf(
+			"New code deployed on all nodes, but node%d (old leader) did not rejoin within 60s — "+
+				"cluster running at 2/3, investigate node%d", leader, leader))
+		return
 	}
+	if newLeader < 0 || !o.waitForFollowerCatchUp(leader, newLeader, 60*time.Second) {
+		o.clusterStatus.SetNodeStatus(leader, "FOLLOWER", true)
+		exec.Command("rm", "-rf", stagingDir).Run()
+		o.progress.Finish(false, fmt.Sprintf(
+			"New code deployed on all nodes, but node%d (old leader) rejoined without confirmed "+
+				"catch-up within 60s — verify commit positions before further operations", leader))
+		return
+	}
+	o.progress.Update(11, fmt.Sprintf("Node %d rejoined and caught up", leader))
+	o.clusterStatus.SetNodeStatus(leader, "FOLLOWER", true)
 
 	// Cleanup staging
 	exec.Command("rm", "-rf", stagingDir).Run()
@@ -595,11 +612,103 @@ type CleanupOptions struct {
 	Force  bool `json:"force"`
 	DryRun bool `json:"dryRun"`
 	Backup bool `json:"backup"`
+	// Archives are PRESERVED by default (#10). Wiping them additionally
+	// requires ConfirmArchiveLoss to spell out the exact phrase below.
+	IncludeArchive     bool   `json:"includeArchive"`
+	ConfirmArchiveLoss string `json:"confirmArchiveLoss"`
+}
+
+// The second confirmation required to wipe cluster archives via /cleanup.
+const archiveLossConfirmation = "DELETE-CLUSTER-STATE"
+
+// cleanupSweep removes Aeron IPC dirs, mark files, and locks under shmDir and
+// tmpDir. Cluster archives (shmDir/aeron-cluster) are PRESERVED unless
+// includeArchive: /cleanup used to run `rm -rf /dev/shm/aeron-*`, and that
+// glob matches aeron-cluster — nuking the very archives P1.3 makes durable
+// (#10). apply=false only reports. Factored out with configurable roots so the
+// preserve guarantee is unit-testable.
+func cleanupSweep(shmDir, tmpDir string, includeArchive, apply bool) (cleaned, preserved, errs []string) {
+	remove := func(path string, all bool) {
+		cleaned = append(cleaned, path)
+		if !apply {
+			return
+		}
+		var err error
+		if all {
+			err = os.RemoveAll(path)
+		} else {
+			err = os.Remove(path)
+		}
+		if err != nil && !os.IsNotExist(err) {
+			errs = append(errs, path+": "+err.Error())
+		}
+	}
+
+	// 1. Aeron IPC dirs (drivers, clients) — everything aeron-* EXCEPT the
+	// cluster state dir, which the old glob wrongly swallowed.
+	entries, _ := filepath.Glob(filepath.Join(shmDir, "aeron-*"))
+	for _, e := range entries {
+		if filepath.Base(e) == "aeron-cluster" {
+			continue
+		}
+		remove(e, true)
+	}
+
+	// 2. Stale mark/lock files inside the cluster state dirs (node*, backup)
+	for _, pattern := range []string{
+		"aeron-cluster/*/cluster/cluster-mark*.dat",
+		"aeron-cluster/*/cluster/*.lck",
+		"aeron-cluster/*/archive/archive-mark.dat",
+	} {
+		matches, _ := filepath.Glob(filepath.Join(shmDir, pattern))
+		for _, m := range matches {
+			remove(m, false)
+		}
+	}
+
+	// 3. The archives themselves: preserved unless explicitly included
+	recordings, _ := filepath.Glob(filepath.Join(shmDir, "aeron-cluster/*/archive/*.rec"))
+	clusterDir := filepath.Join(shmDir, "aeron-cluster")
+	if includeArchive {
+		if _, err := os.Stat(clusterDir); err == nil {
+			cleaned = append(cleaned, fmt.Sprintf("%s (FULL WIPE incl. %d recording(s))", clusterDir, len(recordings)))
+			if apply {
+				if err := os.RemoveAll(clusterDir); err != nil && !os.IsNotExist(err) {
+					errs = append(errs, clusterDir+": "+err.Error())
+				}
+			}
+		}
+	} else if len(recordings) > 0 {
+		preserved = append(preserved, fmt.Sprintf(
+			"%d archive recording(s) under %s preserved — pass includeArchive=true with confirmArchiveLoss=%q to wipe",
+			len(recordings), clusterDir, archiveLossConfirmation))
+	}
+
+	// 4. Gateway/client Aeron dirs under tmp
+	tmpEntries, _ := filepath.Glob(filepath.Join(tmpDir, "aeron-*"))
+	for _, e := range tmpEntries {
+		remove(e, true)
+	}
+
+	return cleaned, preserved, errs
 }
 
 // Cleanup removes stale Aeron files (requires all nodes stopped and force=true)
 func (o *OperationsService) Cleanup(opts CleanupOptions) map[string]interface{} {
 	result := map[string]interface{}{}
+
+	// Dry-run changes nothing: allow it anytime (even with nodes running) so
+	// ops can preview the sweep and the archive-preservation notice.
+	if opts.DryRun {
+		wouldClean, preserved, _ := cleanupSweep("/dev/shm", "/tmp", opts.IncludeArchive, false)
+		result["success"] = true
+		result["dryRun"] = true
+		result["wouldClean"] = wouldClean
+		if len(preserved) > 0 {
+			result["preserved"] = preserved
+		}
+		return result
+	}
 
 	// Require force flag for destructive operation
 	if !opts.Force {
@@ -629,18 +738,13 @@ func (o *OperationsService) Cleanup(opts CleanupOptions) map[string]interface{} 
 		}
 	}
 
-	// Dry-run mode: report what would be cleaned
-	if opts.DryRun {
-		wouldClean := []string{
-			"/dev/shm/aeron-*",
-			"/dev/shm/aeron-cluster/node*/cluster/cluster-mark*.dat",
-			"/dev/shm/aeron-cluster/node*/cluster/*.lck",
-			"/dev/shm/aeron-cluster/node*/archive/archive-mark.dat",
-			"/tmp/aeron-* (gateway files)",
-		}
-		result["success"] = true
-		result["dryRun"] = true
-		result["wouldClean"] = wouldClean
+	// Wiping archives destroys the recovery source (#10): demand an explicit
+	// second confirmation beyond force=true.
+	if opts.IncludeArchive && opts.ConfirmArchiveLoss != archiveLossConfirmation {
+		result["success"] = false
+		result["error"] = fmt.Sprintf(
+			"includeArchive=true wipes ALL cluster archives; set confirmArchiveLoss=%q to confirm",
+			archiveLossConfirmation)
 		return result
 	}
 
@@ -650,41 +754,18 @@ func (o *OperationsService) Cleanup(opts CleanupOptions) map[string]interface{} 
 		result["backupCreated"] = backupPath
 	}
 
-	var cleaned []string
-	var errors []string
-
-	// Clean shared memory aeron files
-	if err := exec.Command("bash", "-c", "rm -rf /dev/shm/aeron-* 2>/dev/null || true").Run(); err != nil {
-		errors = append(errors, "Failed to clean /dev/shm: "+err.Error())
-	} else {
-		cleaned = append(cleaned, "/dev/shm/aeron-*")
-	}
-
-	// Clean cluster mark files and lock files
-	for i := 0; i < 3; i++ {
-		nodeDir := fmt.Sprintf("/dev/shm/aeron-cluster/node%d", i)
-		exec.Command("bash", "-c", fmt.Sprintf("rm -rf %s/cluster/cluster-mark*.dat 2>/dev/null || true", nodeDir)).Run()
-		exec.Command("bash", "-c", fmt.Sprintf("rm -rf %s/cluster/*.lck 2>/dev/null || true", nodeDir)).Run()
-		exec.Command("bash", "-c", fmt.Sprintf("rm -rf %s/archive/archive-mark.dat 2>/dev/null || true", nodeDir)).Run()
-		cleaned = append(cleaned, fmt.Sprintf("%s (mark files, locks)", nodeDir))
-	}
-
-	// Clean gateway aeron files
-	if err := exec.Command("bash", "-c", "rm -rf /tmp/aeron-* 2>/dev/null || true").Run(); err != nil {
-		errors = append(errors, "Failed to clean /tmp/aeron-*: "+err.Error())
-	} else {
-		cleaned = append(cleaned, "/tmp/aeron-* (gateway files)")
-	}
+	cleaned, preserved, errors := cleanupSweep("/dev/shm", "/tmp", opts.IncludeArchive, true)
 
 	result["success"] = len(errors) == 0
 	result["cleaned"] = cleaned
+	if len(preserved) > 0 {
+		result["preserved"] = preserved
+	}
 	if len(errors) > 0 {
 		result["errors"] = errors
-	}
-	if len(errors) == 0 {
-		result["message"] = "Cleanup completed successfully. You can now start the cluster."
-	} else {
 		result["message"] = "Cleanup completed with some errors."
+	} else {
+		result["message"] = "Cleanup completed successfully. You can now start the cluster."
 	}
 
 	return result
