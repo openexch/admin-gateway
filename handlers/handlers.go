@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -102,6 +103,7 @@ func (h *Handlers) RegisterRoutes(r chi.Router) {
 	r.Post("/api/admin/cleanup-node", h.handleCleanupNode)
 	r.Get("/api/admin/backup-info", h.handleBackupInfo)
 	r.Post("/api/admin/recover-from-backup", h.handleRecoverFromBackup)
+	r.Post("/api/admin/reseed-node", h.handleReseedNode)
 
 	// Health check
 	r.Get("/health", h.handleHealth)
@@ -537,6 +539,30 @@ func (h *Handlers) handleRebuildAdmin(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusAccepted, map[string]string{
 		"message": "Admin gateway self-update initiated. Service will restart momentarily. " +
 			"Poll GET /api/admin/rebuild-status for post-restart verification.",
+	})
+}
+
+// handleReseedNode launches the stranded-member reseed: copy a healthy
+// follower's state over a corrupt member's (match#35 procedure, automated).
+func (h *Handlers) handleReseedNode(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		NodeId       *int `json:"nodeId"`
+		SourceNodeId *int `json:"sourceNodeId"`
+		Force        bool `json:"force"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.NodeId == nil || req.SourceNodeId == nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]string{
+			"error": "body must be {\"nodeId\": <stranded>, \"sourceNodeId\": <healthy follower>, \"force\": true}",
+		})
+		return
+	}
+	if err := h.opsSvc.ReseedNode(*req.NodeId, *req.SourceNodeId, req.Force); err != nil {
+		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusAccepted, map[string]string{
+		"message": fmt.Sprintf("Reseeding node%d from node%d — the source follower stops during the copy "+
+			"(brief quorum outage). Poll /api/admin/progress.", *req.NodeId, *req.SourceNodeId),
 	})
 }
 
