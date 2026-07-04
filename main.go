@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -44,11 +45,23 @@ func main() {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RealIP)
+	r.Use(handlers.AuthMiddleware(cfg.AuthToken))
 
 	h.RegisterRoutes(r)
 
+	// Secure-by-default (admin-gateway#11): loopback bind unless overridden;
+	// a non-loopback bind without a token would expose every destructive op,
+	// so refuse to start in that combination.
+	if cfg.AuthToken == "" {
+		if ip := net.ParseIP(cfg.BindAddr); ip == nil || !ip.IsLoopback() {
+			log.Fatalf("Refusing to bind %s without an auth token: set ADMIN_AUTH_TOKEN(_FILE) "+
+				"or bind loopback (ADMIN_BIND=127.0.0.1)", cfg.BindAddr)
+		}
+		log.Printf("⚠️  AUTH: no admin token configured — loopback-only dev mode")
+	}
+
 	// Start server
-	addr := ":" + cfg.Port
+	addr := cfg.BindAddr + ":" + cfg.Port
 	log.Printf("🚀 Admin Gateway starting on %s", addr)
 	log.Printf("   Project: %s", cfg.ProjectDir)
 	log.Printf("   JAR: %s", cfg.JarPath)

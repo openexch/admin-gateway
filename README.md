@@ -38,7 +38,20 @@ go build -o admin-gateway .
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ADMIN_PORT` | `8082` | HTTP server port |
+| `ADMIN_BIND` | `127.0.0.1` | Listen address (loopback by default) |
+| `ADMIN_AUTH_TOKEN` | _(empty)_ | Bearer token required on every route except `/health` |
+| `ADMIN_AUTH_TOKEN_FILE` | _(empty)_ | File to read the token from (whitespace trimmed) |
 | `MATCH_PROJECT_DIR` | (auto-detected) | Path to the match engine project |
+
+### Authentication
+
+The admin API drives destructive operations, so it is secure by default:
+it binds loopback unless `ADMIN_BIND` says otherwise, and a non-loopback
+bind **refuses to start** without a token. With a token configured, send
+`Authorization: Bearer <token>` (or `X-Admin-Token`) on every call; only
+`GET /health` stays open for liveness probes. With no token on a loopback
+bind the API is open to local processes (dev mode; a startup warning is
+logged).
 
 ## API Endpoints
 
