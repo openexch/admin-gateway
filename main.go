@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -75,6 +76,24 @@ func main() {
 		Addr:    addr,
 		Handler: r,
 	}
+
+	// If this start is the back half of a rebuild-admin, report the handshake
+	// once we are actually serving (self-probe /health, then promote
+	// rebuild-pending.json to rebuild-result.json).
+	go func() {
+		probe := "http://127.0.0.1:" + cfg.Port + "/health"
+		client := &http.Client{Timeout: 1 * time.Second}
+		for i := 0; i < 30; i++ {
+			if resp, err := client.Get(probe); err == nil {
+				resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					opsSvc.FinalizeRebuildVerification()
+					return
+				}
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+	}()
 
 	go func() {
 		sigChan := make(chan os.Signal, 1)

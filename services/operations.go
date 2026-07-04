@@ -395,18 +395,44 @@ func (o *OperationsService) doRebuildAdmin() {
 		o.progress.Finish(false, "Staged binary suspiciously small, aborting")
 		return
 	}
+	stagedSha, err := fileSha256(stagingBinary)
+	if err != nil {
+		os.Remove(stagingBinary)
+		o.progress.Finish(false, "Cannot hash staged binary: "+err.Error())
+		return
+	}
 
-	// Step 3: Atomic swap — rename staging over live binary
+	// Step 3: Atomic swap — rename staging over live binary. Keep the old
+	// binary as .prev: the manual rollback path when the new one won't boot.
 	o.progress.Update(3, "Swapping binary (atomic rename)...")
+	log := o.log.With("op", "rebuild-admin", "op_id", o.progress.CurrentOpID())
+	if err := copyFile(liveBinary, liveBinary+".prev"); err != nil {
+		log.Warn("could not preserve previous binary as .prev", "err", err)
+	} else {
+		os.Chmod(liveBinary+".prev", 0755) // copyFile does not preserve the exec bit
+	}
 	if err := os.Rename(stagingBinary, liveBinary); err != nil {
 		os.Remove(stagingBinary)
 		o.progress.Finish(false, "Binary swap failed: "+err.Error())
 		return
 	}
 
-	// Step 4: Restart ourselves via systemd (this kills us — systemd brings us back with new binary)
+	// Step 4: Arm the post-restart verification handshake, then restart.
+	// The systemd restart kills THIS process, so completion is reported by
+	// the NEW process (FinalizeRebuildVerification): poll
+	// GET /api/admin/rebuild-status until state=verified.
 	o.progress.Update(4, "Restarting admin service...")
-	o.progress.Finish(true, "Admin gateway rebuilt. Restarting now...")
+	pending := rebuildPending{
+		StartedAt:    time.Now().Format(time.RFC3339),
+		OpID:         o.progress.CurrentOpID(),
+		StagedSha256: stagedSha,
+		OldPid:       os.Getpid(),
+	}
+	if err := writeJSONAtomic(filepath.Join(adminDir, rebuildPendingFile), pending); err != nil {
+		log.Warn("could not write rebuild-pending.json, restart proceeds unverified", "err", err)
+	}
+	o.progress.Finish(true,
+		"Admin gateway rebuilt. Restarting now — poll /api/admin/rebuild-status for post-restart verification")
 
 	// Small delay so the progress response can be read by any polling clients
 	time.Sleep(500 * time.Millisecond)

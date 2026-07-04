@@ -339,7 +339,7 @@ func (s *StatusService) fetchStatus() map[string]interface{} {
 	allNodesHealthy := healthArr[0] == HealthHealthy &&
 		healthArr[1] == HealthHealthy && healthArr[2] == HealthHealthy
 
-	return map[string]interface{}{
+	result := map[string]interface{}{
 		"leader":          leader,
 		"nodes":           nodes,
 		"allNodesHealthy": allNodesHealthy,
@@ -351,6 +351,12 @@ func (s *StatusService) fetchStatus() map[string]interface{} {
 		},
 		"autoSnapshot": s.getAutoSnapshotStatus(),
 	}
+	// Surface an in-flight or completed rebuild-admin handshake (omitted when
+	// no rebuild has happened on this checkout).
+	if rb := ReadRebuildStatus(s.cfg.AdminDir); rb["state"] != "none" {
+		result["lastRebuild"] = rb
+	}
+	return result
 }
 
 // getAutoSnapshotStatus returns auto-snapshot status from the AutoSnapshot service

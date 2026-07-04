@@ -81,8 +81,9 @@ func (h *Handlers) RegisterRoutes(r chi.Router) {
 	// Logs
 	r.Get("/api/admin/logs", h.handleLogs)
 
-	// Self-update (admin gateway)
+	// Self-update (admin gateway) + post-restart verification handshake
 	r.Post("/api/admin/rebuild-admin", h.handleRebuildAdmin)
+	r.Get("/api/admin/rebuild-status", h.handleRebuildStatus)
 
 	// Process manager
 	r.Get("/api/admin/processes", h.handleProcessList)
@@ -534,8 +535,16 @@ func (h *Handlers) handleRebuildAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, http.StatusAccepted, map[string]string{
-		"message": "Admin gateway self-update initiated. Service will restart momentarily.",
+		"message": "Admin gateway self-update initiated. Service will restart momentarily. " +
+			"Poll GET /api/admin/rebuild-status for post-restart verification.",
 	})
+}
+
+// handleRebuildStatus reports the rebuild-admin verification handshake:
+// pending (restart in flight), verified (the new process came up and checked
+// its own binary), or none.
+func (h *Handlers) handleRebuildStatus(w http.ResponseWriter, r *http.Request) {
+	jsonResponse(w, http.StatusOK, h.opsSvc.RebuildStatus())
 }
 
 // Helpers
