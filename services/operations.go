@@ -116,7 +116,7 @@ func (o *OperationsService) restartService(name string) {
 
 // RollingUpdate performs a rolling update of all cluster nodes
 func (o *OperationsService) RollingUpdate() error {
-	if o.progress.IsRunning() {
+	if !o.progress.TryStart("rolling-update", 11) {
 		return fmt.Errorf("another operation in progress")
 	}
 
@@ -125,8 +125,6 @@ func (o *OperationsService) RollingUpdate() error {
 }
 
 func (o *OperationsService) doRollingUpdate() {
-	o.progress.Start("rolling-update", 11)
-
 	jarPath := o.cfg.JarPath
 	stagingDir := filepath.Join(o.cfg.ProjectDir, "match-cluster/target/staging")
 	stagingJar := filepath.Join(stagingDir, "match-cluster.jar")
@@ -335,7 +333,7 @@ func (o *OperationsService) doRollingUpdate() {
 // RebuildAdmin builds the admin gateway binary from source and restarts itself via systemd.
 // The flow: build to staging → swap binary → systemd restart (which kills us gracefully).
 func (o *OperationsService) RebuildAdmin() error {
-	if o.progress.IsRunning() {
+	if !o.progress.TryStart("rebuild-admin", 4) {
 		return fmt.Errorf("another operation in progress")
 	}
 
@@ -344,8 +342,6 @@ func (o *OperationsService) RebuildAdmin() error {
 }
 
 func (o *OperationsService) doRebuildAdmin() {
-	o.progress.Start("rebuild-admin", 4)
-
 	// AdminDir, not ProjectDir/admin-gateway: this repo split out of match, so the
 	// old path builds a checkout that no longer exists.
 	adminDir := o.cfg.AdminDir
@@ -396,7 +392,7 @@ func (o *OperationsService) doRebuildAdmin() {
 
 // Snapshot triggers a cluster snapshot
 func (o *OperationsService) Snapshot(force bool) error {
-	if o.progress.IsRunning() {
+	if !o.progress.TryStart("snapshot", 7) {
 		return fmt.Errorf("another operation in progress")
 	}
 	if !force {
@@ -410,8 +406,6 @@ func (o *OperationsService) Snapshot(force bool) error {
 }
 
 func (o *OperationsService) doSnapshot() {
-	o.progress.Start("snapshot", 7)
-
 	// Step 1: Find leader
 	o.progress.Update(1, "Finding cluster leader...")
 	leader := o.cluster.DetectLeader()
@@ -467,7 +461,7 @@ func (o *OperationsService) doSnapshot() {
 // Housekeeping reclaims archive disk on all nodes without taking a snapshot
 // (uses the latest existing snapshot as the purge boundary).
 func (o *OperationsService) Housekeeping(force bool) error {
-	if o.progress.IsRunning() {
+	if !o.progress.TryStart("housekeeping", 3) {
 		return fmt.Errorf("another operation in progress")
 	}
 	if !force {
@@ -481,8 +475,6 @@ func (o *OperationsService) Housekeeping(force bool) error {
 }
 
 func (o *OperationsService) doHousekeeping() {
-	o.progress.Start("housekeeping", 3)
-
 	failures := 0
 	for i := 0; i < 3; i++ {
 		o.progress.Update(1+i, fmt.Sprintf("Reclaiming archive on Node %d...", i))
@@ -504,7 +496,11 @@ func (o *OperationsService) doHousekeeping() {
 // RebuildGateway builds the gateway module and optionally restarts gateways.
 // This is SAFE while the cluster is running since gateway JAR is separate from cluster JAR.
 func (o *OperationsService) RebuildGateway(restart bool) error {
-	if o.progress.IsRunning() {
+	totalSteps := 2
+	if restart {
+		totalSteps = 3
+	}
+	if !o.progress.TryStart("rebuild-gateway", totalSteps) {
 		return fmt.Errorf("another operation in progress")
 	}
 
@@ -513,12 +509,6 @@ func (o *OperationsService) RebuildGateway(restart bool) error {
 }
 
 func (o *OperationsService) doRebuildGateway(restart bool) {
-	totalSteps := 2
-	if restart {
-		totalSteps = 3
-	}
-	o.progress.Start("rebuild-gateway", totalSteps)
-
 	// Step 1: Build gateway module (safe - separate JAR from cluster)
 	o.progress.Update(1, "Building gateway module...")
 	cmd := exec.Command("bash", "-c",
@@ -555,7 +545,7 @@ func (o *OperationsService) doRebuildGateway(restart bool) {
 // WARNING: The built JAR goes to staging, NOT the live location.
 // Use rolling-update to deploy, or manually swap the JAR.
 func (o *OperationsService) RebuildCluster() error {
-	if o.progress.IsRunning() {
+	if !o.progress.TryStart("rebuild-cluster", 3) {
 		return fmt.Errorf("another operation in progress")
 	}
 
@@ -564,8 +554,6 @@ func (o *OperationsService) RebuildCluster() error {
 }
 
 func (o *OperationsService) doRebuildCluster() {
-	o.progress.Start("rebuild-cluster", 3)
-
 	stagingDir := filepath.Join(o.cfg.ProjectDir, "match-cluster/target/staging")
 	stagingJar := filepath.Join(stagingDir, "match-cluster.jar")
 
