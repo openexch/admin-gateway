@@ -107,8 +107,10 @@ func (a *AutoSnapshot) runSnapshotCycle() {
 	}
 
 	log.Println("Auto-snapshot: triggering snapshot...")
-	if err := a.opsSvc.Snapshot(); err != nil {
-		log.Printf("Auto-snapshot: failed to start snapshot: %v", err)
+	// Never forced: an unhealthy/lagging member makes snapshotting dangerous
+	// (match#35) — skipping a cycle is always safe, stranding a member is not.
+	if err := a.opsSvc.Snapshot(false); err != nil {
+		log.Printf("Auto-snapshot: skipped: %v", err)
 		return
 	}
 

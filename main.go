@@ -30,6 +30,7 @@ func main() {
 	statusSvc.SetProcessManager(procMgr)
 	opsSvc := services.NewOperationsService(cfg, systemd, cluster, progress, clusterStatus)
 	opsSvc.SetProcessManager(procMgr)
+	opsSvc.SetStatusService(statusSvc)
 	autoSnapshot := services.NewAutoSnapshot(opsSvc)
 	statusSvc.SetAutoSnapshot(autoSnapshot)
 	autoSnapshot.Start(5) // Auto-snapshot every 5 minutes to prevent unbounded log growth

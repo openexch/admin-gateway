@@ -256,7 +256,7 @@ func (h *Handlers) handleRollingUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) handleSnapshot(w http.ResponseWriter, r *http.Request) {
-	if err := h.opsSvc.Snapshot(); err != nil {
+	if err := h.opsSvc.Snapshot(parseForce(r)); err != nil {
 		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
@@ -295,8 +295,17 @@ func (h *Handlers) handleRebuildCluster(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// parseForce reads an optional JSON body {"force": true} (match#35 lag-guard override).
+func parseForce(r *http.Request) bool {
+	var body struct {
+		Force bool `json:"force"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	return body.Force
+}
+
 func (h *Handlers) handleHousekeeping(w http.ResponseWriter, r *http.Request) {
-	if err := h.opsSvc.Housekeeping(); err != nil {
+	if err := h.opsSvc.Housekeeping(parseForce(r)); err != nil {
 		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
