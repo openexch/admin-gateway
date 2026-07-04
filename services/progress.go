@@ -22,10 +22,20 @@ func NewProgress() *Progress {
 	return &Progress{}
 }
 
-func (p *Progress) Start(operation string, totalSteps int) {
+// TryStart atomically claims the progress slot for an operation, returning
+// false when another operation is still running. The check and the claim used
+// to be separate (IsRunning() in the caller, Start() inside the spawned
+// goroutine), so two operations could slip past each other and share the slot
+// — found by the #10 chaos soak, where an auto-snapshot ran concurrently with
+// a rolling update (nodes stopping while a snapshot propagates: the match#35
+// hazard) and their statuses cross-attributed.
+func (p *Progress) TryStart(operation string, totalSteps int) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
+	if p.Operation != "" && !p.Complete {
+		return false
+	}
 	p.Operation = operation
 	p.TotalSteps = totalSteps
 	p.CurrentStep = 0
@@ -33,6 +43,7 @@ func (p *Progress) Start(operation string, totalSteps int) {
 	p.Complete = false
 	p.Error = false
 	p.StartTime = time.Now()
+	return true
 }
 
 func (p *Progress) Update(step int, status string) {
