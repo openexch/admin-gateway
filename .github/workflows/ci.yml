@@ -30,3 +30,31 @@ jobs:
 
       - name: Test
         run: go test ./...
+
+  # Dependency CVEs + committed secrets (admin-gateway#12 / P3.2), same job as the
+  # match repo's CI. Trivy covers both on a private repo without GitHub Advanced
+  # Security; triaged findings go in .trivyignore. govulncheck adds call-graph-aware
+  # Go advisories (only flags vulnerable code that is actually reachable).
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Trivy scan (dependencies + secrets)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          ignore-unfixed: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
