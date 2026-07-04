@@ -965,13 +965,26 @@ func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
 	if err != nil {
 		exitMsg = err.Error()
 	}
+	if !wasRunning {
+		exitMsg += " (was not marked running)"
+	}
+	pm.handleCrash(def, proc, oldPid, exitMsg, stopChan)
+}
+
+// handleCrash runs the shared post-crash protocol: lastError capture, rapid
+// crash-loop cap (#17), driver→node cascades, and the auto-restart. Called by
+// monitor() for processes we spawned and by the adopted-process watchdog (#13)
+// for processes re-attached after an admin restart (stopChan nil there — a nil
+// channel never fires in a select, and the pre-restart status re-check covers
+// cancellation for adopted processes).
+func (pm *ProcessManager) handleCrash(
+	def ServiceDef, proc *managedProcess, oldPid int, exitMsg string, stopChan chan struct{}) {
+
 	crashCause := fmt.Sprintf("crashed (exit: %s)", exitMsg)
 	if tail := tailLogSnippet(filepath.Join(pm.logDir, def.Name+".log")); tail != "" {
 		crashCause += " — log: " + tail
 	}
-	if wasRunning {
-		fmt.Printf("[PM] %s %s (PID %d)\n", def.Name, crashCause, oldPid)
-	}
+	fmt.Printf("[PM] %s %s (PID %d)\n", def.Name, crashCause, oldPid)
 
 	// Record the crash for the rapid-loop cap (#17): count crashes inside the
 	// sliding window, not lifetime restarts.
@@ -1034,17 +1047,19 @@ func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
 			return
 		}
 
-		// Check if someone else is already starting this service
+		// Check if someone else started it meanwhile, or an explicit stop
+		// cancelled the restart (status left "restarting" — the only stopChan
+		// equivalent adopted processes have).
 		proc.mu.Lock()
-		if proc.starting || proc.running {
+		if proc.starting || proc.running || proc.status != "restarting" {
+			state := proc.status
+			if proc.running {
+				state = "running"
+			} else if proc.starting {
+				state = "starting"
+			}
 			proc.mu.Unlock()
-			fmt.Printf("[PM] Skipping auto-restart of %s — already %s\n",
-				def.Name, func() string {
-					if proc.running {
-						return "running"
-					}
-					return "starting"
-				}())
+			fmt.Printf("[PM] Skipping auto-restart of %s — now %s\n", def.Name, state)
 			return
 		}
 		proc.restartCount++
@@ -1500,7 +1515,12 @@ func (pm *ProcessManager) backgroundPoller() {
 	}
 }
 
-// refreshAdoptedProcesses checks if adopted processes are still alive
+// refreshAdoptedProcesses is the watchdog for processes re-attached after an
+// admin restart (#13): adoptExisting() has no cmd handle, so monitor() cannot
+// wait on them — without this, crashes of adopted processes were never
+// detected (no auto-restart, no lastError, and the driver→node RestartCascades
+// silently disabled — an incident amplifier on 2026-07-02). Death of an
+// adopted process now runs the same crash protocol as monitored ones.
 func (pm *ProcessManager) refreshAdoptedProcesses() {
 	for _, def := range pm.services {
 		if def.Name == "admin" {
@@ -1509,17 +1529,29 @@ func (pm *ProcessManager) refreshAdoptedProcesses() {
 
 		proc := pm.procs[def.Name]
 		proc.mu.Lock()
-		if proc.running && proc.pid > 0 && proc.cmd == nil {
-			// Adopted process — check if still alive
-			if !isProcessAlive(proc.pid) {
-				proc.running = false
-				proc.pid = 0
-				proc.status = "stopped"
-				pm.removePID(def.Name)
-				fmt.Printf("[PM] Adopted process %s is no longer running\n", def.Name)
-			}
-		}
+		adopted := proc.running && proc.pid > 0 && proc.cmd == nil && proc.status == "running"
+		pid := proc.pid
 		proc.mu.Unlock()
+
+		if !adopted || isProcessAlive(pid) {
+			continue
+		}
+
+		// Re-check under the lock: an explicit stop/restart may have raced us.
+		proc.mu.Lock()
+		if !proc.running || proc.pid != pid || proc.cmd != nil {
+			proc.mu.Unlock()
+			continue
+		}
+		proc.running = false
+		proc.pid = 0
+		proc.mu.Unlock()
+		pm.removePID(def.Name)
+
+		def := def // capture per-iteration copy for the goroutine
+		// Run the crash protocol off the poller goroutine — it sleeps
+		// RestartSec (and cascades) before restarting.
+		go pm.handleCrash(def, proc, pid, "adopted process died (no exit status available)", nil)
 	}
 }
 
