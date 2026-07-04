@@ -273,6 +273,10 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 					"OMS_GRPC_PORT":     "9090",
 					"EGRESS_PORT":       "9093",
 					"CLUSTER_ADDRESSES": "127.0.0.1,127.0.0.1,127.0.0.1",
+					// Dev box only: OMS defaults to secure auth (api-key with no
+					// keys = reject everything, oms#36); the demo UI and load
+					// harness need the dev provider.
+					"OMS_AUTH_MODE": "dev",
 				},
 				WorkDir:   cfg.OmsProjectDir,
 				DependsOn: []string{"node0", "node1", "node2"},
