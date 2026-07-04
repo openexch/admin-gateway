@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/match/admin-gateway/config"
+	"github.com/match/admin-gateway/logging"
 )
 
 // ServiceRole defines the category of a managed service
@@ -107,9 +109,11 @@ type ProcessManager struct {
 	pidDir   string
 	logDir   string
 	stopChan chan struct{}
+	log      *slog.Logger
 }
 
 func NewProcessManager(cfg *config.Config) *ProcessManager {
+	logger := logging.Component("pm")
 	homeDir, _ := os.UserHomeDir()
 	logDir := filepath.Join(homeDir, ".local/log/cluster")
 	pidDir := filepath.Join(homeDir, ".local/run/match")
@@ -309,9 +313,9 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 	}
 
 	if externalDriver {
-		fmt.Printf("[PM] Engine driver mode: external (profile=%s) — media drivers managed as driver0-2\n", driverProfile)
+		logger.Info("engine driver mode: external, media drivers managed as driver0-2", "profile", driverProfile)
 	} else {
-		fmt.Printf("[PM] Engine driver mode: embedded (ENGINE_DRIVER_MODE=embedded)\n")
+		logger.Info("engine driver mode: embedded")
 	}
 
 	pm := &ProcessManager{
@@ -321,6 +325,7 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 		procs:    make(map[string]*managedProcess),
 		services: services,
 		stopChan: make(chan struct{}),
+		log:      logger,
 	}
 
 	// Initialize process state for each service
@@ -487,7 +492,7 @@ func (pm *ProcessManager) Restart(name string) error {
 		// Wait for port release if the service binds a port
 		if def.Port > 0 {
 			if err := pm.waitForPortFree(def.Port, 20*time.Second); err != nil {
-				fmt.Printf("[PM] Warning: port %d not free after stop, proceeding anyway: %v\n", def.Port, err)
+				pm.log.Warn("port not free after stop, proceeding anyway", "port", def.Port, "err", err)
 			}
 		} else {
 			// Brief pause for non-port services (Aeron cleanup)
@@ -679,7 +684,7 @@ func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) err
 			proc.lastError = err.Error()
 			proc.starting = false
 			proc.mu.Unlock()
-			fmt.Printf("[PM] REFUSED start of %s: %v\n", def.Name, err)
+			pm.log.Warn("refused start", "service", def.Name, "err", err)
 			return err
 		}
 	}
@@ -739,7 +744,7 @@ func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) err
 	// Gated services skip this: waitForGate already required the file strictly.
 	if startErr == nil && def.WaitForFile != "" && def.GatedBy == "" {
 		if err := waitForFile(def.WaitForFile, 15*time.Second); err != nil {
-			fmt.Printf("[PM] Warning: %s for %s: %v — starting anyway\n", def.WaitForFile, def.Name, err)
+			pm.log.Warn("wait-for-file failed, starting anyway", "file", def.WaitForFile, "service", def.Name, "err", err)
 		}
 	}
 
@@ -817,7 +822,7 @@ func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) err
 	// Write PID file
 	pm.writePID(def.Name, proc.pid)
 
-	fmt.Printf("[PM] Started %s (PID %d)\n", def.Name, proc.pid)
+	pm.log.Info("started service", "service", def.Name, "pid", proc.pid)
 
 	// Monitor process in background (handles crash + auto-restart)
 	go pm.monitor(def, proc)
@@ -857,7 +862,7 @@ func (pm *ProcessManager) stopProcess(name string, force bool) error {
 			proc.status = "stopped"
 			proc.mu.Unlock()
 			pm.removePID(name)
-			fmt.Printf("[PM] Stopped %s (adopted process)\n", name)
+			pm.log.Info("stopped adopted process", "service", name)
 			return nil
 		}
 		proc.status = "stopped"
@@ -889,7 +894,7 @@ func (pm *ProcessManager) stopProcess(name string, force bool) error {
 
 	// Force kill if still alive
 	if isProcessAlive(pid) {
-		fmt.Printf("[PM] Force killing %s (PID %d)\n", name, pid)
+		pm.log.Warn("force killing service", "service", name, "pid", pid)
 		syscall.Kill(-pid, syscall.SIGKILL)
 		// Wait for the process to actually die (up to 5s after SIGKILL)
 		killDeadline := time.Now().Add(5 * time.Second)
@@ -900,7 +905,7 @@ func (pm *ProcessManager) stopProcess(name string, force bool) error {
 			time.Sleep(100 * time.Millisecond)
 		}
 		if isProcessAlive(pid) {
-			fmt.Printf("[PM] WARNING: %s (PID %d) still alive after SIGKILL + 5s\n", name, pid)
+			pm.log.Warn("still alive after sigkill and 5s wait", "service", name, "pid", pid)
 		}
 	}
 
@@ -915,7 +920,7 @@ func (pm *ProcessManager) stopProcess(name string, force bool) error {
 	proc.mu.Unlock()
 
 	pm.removePID(name)
-	fmt.Printf("[PM] Stopped %s\n", name)
+	pm.log.Info("stopped service", "service", name)
 
 	return nil
 }
@@ -950,7 +955,7 @@ func (pm *ProcessManager) monitor(def ServiceDef, proc *managedProcess) {
 		proc.mu.Lock()
 		proc.status = "stopped"
 		proc.mu.Unlock()
-		fmt.Printf("[PM] %s stopped intentionally (was PID %d)\n", def.Name, oldPid)
+		pm.log.Info("service stopped intentionally", "service", def.Name, "pid", oldPid)
 		return
 	default:
 	}
@@ -988,7 +993,7 @@ func (pm *ProcessManager) handleCrash(
 	if tail := tailLogSnippet(filepath.Join(pm.logDir, def.Name+".log")); tail != "" {
 		crashCause += " — log: " + tail
 	}
-	fmt.Printf("[PM] %s %s (PID %d)\n", def.Name, crashCause, oldPid)
+	pm.log.Error("service crashed", "service", def.Name, "pid", oldPid, "cause", crashCause)
 
 	// Record the crash for the rapid-loop cap (#17): count crashes inside the
 	// sliding window, not lifetime restarts.
@@ -1011,9 +1016,9 @@ func (pm *ProcessManager) handleCrash(
 		// the driver, so stop it BEFORE restarting the driver. It is started again
 		// below once the driver is back, giving deterministic driver-then-node order.
 		for _, target := range def.RestartCascades {
-			fmt.Printf("[PM] %s crashed — force-stopping dependent %s\n", def.Name, target)
+			pm.log.Warn("force-stopping dependent after crash", "service", def.Name, "dependent", target)
 			if err := pm.stopProcess(target, true); err != nil {
-				fmt.Printf("[PM] Failed to stop %s during %s cascade: %v\n", target, def.Name, err)
+				pm.log.Error("failed to stop dependent during crash cascade", "dependent", target, "service", def.Name, "err", err)
 			}
 		}
 
@@ -1028,7 +1033,7 @@ func (pm *ProcessManager) handleCrash(
 			proc.status = "failed"
 			proc.lastError = msg
 			proc.mu.Unlock()
-			fmt.Printf("[PM] %s FAILED: %s\n", def.Name, msg)
+			pm.log.Error("service failed, auto-restart disarmed", "service", def.Name, "reason", msg)
 			return
 		}
 
@@ -1041,7 +1046,7 @@ func (pm *ProcessManager) handleCrash(
 		proc.status = "restarting"
 		proc.mu.Unlock()
 
-		fmt.Printf("[PM] Will restart %s in %ds\n", def.Name, restartSec)
+		pm.log.Warn("will restart service", "service", def.Name, "delay_sec", restartSec)
 
 		select {
 		case <-time.After(time.Duration(restartSec) * time.Second):
@@ -1063,16 +1068,16 @@ func (pm *ProcessManager) handleCrash(
 				state = "starting"
 			}
 			proc.mu.Unlock()
-			fmt.Printf("[PM] Skipping auto-restart of %s — now %s\n", def.Name, state)
+			pm.log.Info("skipping auto-restart", "service", def.Name, "state", state)
 			return
 		}
 		proc.restartCount++
 		proc.mu.Unlock()
 
-		fmt.Printf("[PM] Auto-restarting %s (attempt %d)\n", def.Name, proc.restartCount)
+		pm.log.Warn("auto-restarting service", "service", def.Name, "attempt", proc.restartCount)
 		// Use startProcessNoRotate to preserve crash logs
 		if err := pm.startProcessNoRotate(def); err != nil {
-			fmt.Printf("[PM] Failed to restart %s: %v\n", def.Name, err)
+			pm.log.Error("failed to restart service", "service", def.Name, "err", err)
 			proc.mu.Lock()
 			proc.status = "failed"
 			proc.lastError = fmt.Sprintf("auto-restart failed: %v", err)
@@ -1085,9 +1090,9 @@ func (pm *ProcessManager) handleCrash(
 				if tdef == nil {
 					continue
 				}
-				fmt.Printf("[PM] Restarting %s after %s recovery\n", target, def.Name)
+				pm.log.Info("restarting dependent after recovery", "dependent", target, "service", def.Name)
 				if err := pm.startProcessNoRotate(*tdef); err != nil {
-					fmt.Printf("[PM] Failed to restart %s after %s recovery: %v\n", target, def.Name, err)
+					pm.log.Error("failed to restart dependent after recovery", "dependent", target, "service", def.Name, "err", err)
 				}
 			}
 		}
@@ -1127,7 +1132,7 @@ func (pm *ProcessManager) adoptExisting() {
 			proc.status = "running"
 			proc.startedAt = getProcessStartTime(pid)
 			proc.mu.Unlock()
-			fmt.Printf("[PM] Adopted %s (PID %d)\n", def.Name, pid)
+			pm.log.Info("adopted service", "service", def.Name, "pid", pid)
 		} else {
 			// Stale PID file
 			pm.removePID(def.Name)
@@ -1204,7 +1209,7 @@ func (pm *ProcessManager) cleanStaleAeronState(name string) {
 		if !driverRunning {
 			if _, err := os.Stat(driverDir); err == nil {
 				os.RemoveAll(driverDir)
-				fmt.Printf("[PM] Cleaned stale MediaDriver: %s\n", driverDir)
+				pm.log.Info("cleaned stale media driver dir", "dir", driverDir)
 			}
 		}
 
@@ -1219,7 +1224,7 @@ func (pm *ProcessManager) cleanStaleAeronState(name string) {
 			matches, _ := filepath.Glob(pattern)
 			for _, m := range matches {
 				os.Remove(m)
-				fmt.Printf("[PM] Cleaned stale file: %s\n", m)
+				pm.log.Info("cleaned stale file", "file", m)
 			}
 		}
 	}
@@ -1376,9 +1381,9 @@ func (pm *ProcessManager) waitForPortFree(port int, timeout time.Duration) error
 		if !logged {
 			holder := pm.findPortHolder(port)
 			if holder != "" {
-				fmt.Printf("[PM] Port %d held by %s, waiting up to %s...\n", port, holder, timeout)
+				pm.log.Info("port held, waiting for release", "port", port, "holder", holder, "timeout", timeout)
 			} else {
-				fmt.Printf("[PM] Port %d still in use, waiting up to %s...\n", port, timeout)
+				pm.log.Info("port still in use, waiting for release", "port", port, "timeout", timeout)
 			}
 			logged = true
 		}
@@ -1449,7 +1454,7 @@ func (pm *ProcessManager) killOrphanedPortHolder(port int, serviceName string) {
 	}
 
 	// It's an orphan — kill it
-	fmt.Printf("[PM] Killing orphaned process PID %d holding port %d (expected by %s)\n", pid, port, serviceName)
+	pm.log.Warn("killing orphaned process holding port", "pid", pid, "port", port, "service", serviceName)
 	syscall.Kill(-pid, syscall.SIGTERM)
 	time.Sleep(2 * time.Second)
 	if isProcessAlive(pid) {
@@ -1462,7 +1467,7 @@ func (pm *ProcessManager) killOrphanedPortHolder(port int, serviceName string) {
 	dirPath := filepath.Join("/dev/shm", prefix)
 	if _, err := os.Stat(dirPath); err == nil {
 		os.RemoveAll(dirPath)
-		fmt.Printf("[PM] Cleaned orphan Aeron dir: %s\n", dirPath)
+		pm.log.Info("cleaned orphan aeron dir", "dir", dirPath)
 	}
 }
 
@@ -1488,7 +1493,7 @@ func (pm *ProcessManager) cleanStaleGatewayAeron(name string) {
 				// Process is dead, clean up
 				dirPath := filepath.Join("/dev/shm", entry.Name())
 				os.RemoveAll(dirPath)
-				fmt.Printf("[PM] Cleaned stale gateway Aeron dir: %s\n", dirPath)
+				pm.log.Info("cleaned stale gateway aeron dir", "dir", dirPath)
 			}
 		}
 	}

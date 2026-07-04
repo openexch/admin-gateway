@@ -1,9 +1,11 @@
 package services
 
 import (
-	"log"
+	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/match/admin-gateway/logging"
 )
 
 // AutoSnapshot manages periodic snapshot scheduling
@@ -15,12 +17,14 @@ type AutoSnapshot struct {
 	snapshotCount     int
 	stopChan          chan struct{}
 	opsSvc            *OperationsService
+	log               *slog.Logger
 }
 
 func NewAutoSnapshot(opsSvc *OperationsService) *AutoSnapshot {
 	return &AutoSnapshot{
 		lastSnapshotPos: -1,
 		opsSvc:          opsSvc,
+		log:             logging.Component("autosnapshot"),
 	}
 }
 
@@ -48,7 +52,7 @@ func (a *AutoSnapshot) Start(intervalMinutes int64) {
 		}
 	}()
 
-	log.Printf("Auto-snapshot enabled: every %d minutes", intervalMinutes)
+	a.log.Info("auto-snapshot enabled", "interval_minutes", intervalMinutes)
 }
 
 // Stop disables periodic snapshots
@@ -102,20 +106,20 @@ func (a *AutoSnapshot) GetLastPosition() int64 {
 // and the cluster comes up unable to serve ingress).
 func (a *AutoSnapshot) runSnapshotCycle() {
 	if a.opsSvc.progress.IsRunning() {
-		log.Println("Auto-snapshot skipped: another operation in progress")
+		a.log.Warn("cycle skipped: another operation in progress")
 		return
 	}
 
-	log.Println("Auto-snapshot: triggering snapshot...")
+	a.log.Info("triggering snapshot")
 	// Never forced: an unhealthy/lagging member makes snapshotting dangerous
 	// (match#35) — skipping a cycle is always safe, stranding a member is not.
 	if err := a.opsSvc.Snapshot(false); err != nil {
-		log.Printf("Auto-snapshot: skipped: %v", err)
+		a.log.Warn("snapshot skipped", "err", err)
 		return
 	}
 
 	if !a.waitForOperation(5 * time.Minute) {
-		log.Println("Auto-snapshot: snapshot did not complete in time")
+		a.log.Warn("snapshot did not complete in time")
 		return
 	}
 
