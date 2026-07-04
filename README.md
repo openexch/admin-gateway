@@ -4,18 +4,22 @@ HTTP API for managing the Open Exchange Aeron Cluster. Handles process lifecycle
 
 ## Features
 
-- Process management for all cluster services (nodes, gateways, backup, OMS)
+- Process management for all cluster services (nodes, drivers, gateways, backup, OMS)
 - Zero-downtime rolling updates
-- Automatic and manual snapshot creation
-- Archive compaction and cleanup
+- Automatic and manual snapshot creation + live archive housekeeping
+- Stranded-member reseed and disk-backup recovery
 - Per-node log retrieval
 - HTTP health probing of managed services (OMS :8080, market gateway :8081)
-- Self-update capability
+- Self-update with post-restart verification
 - Dependency-ordered startup and shutdown
+- Structured JSON logs with request/operation correlation ids
+- Prometheus `/metrics`
+
+Operational procedures live in [docs/RUNBOOKS.md](docs/RUNBOOKS.md).
 
 ## Tech Stack
 
-- **Go 1.22**
+- **Go 1.23**
 - **chi** — HTTP routing
 - Runs as a systemd user service
 
@@ -81,11 +85,9 @@ logged).
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/api/admin/rolling-update` | Zero-downtime rolling update |
-| `POST` | `/api/admin/snapshot` | Create cluster snapshot |
-| `POST` | `/api/admin/compact` | Archive compaction |
-| `POST` | `/api/admin/compact-archive` | Full archive compaction |
-| `POST` | `/api/admin/rolling-cleanup` | Rolling archive cleanup |
-| `POST` | `/api/admin/cleanup` | Full cleanup |
+| `POST` | `/api/admin/snapshot` | Create cluster snapshot (+ live archive housekeeping) |
+| `POST` | `/api/admin/housekeeping` | Reclaim archive disk on the live cluster |
+| `POST` | `/api/admin/cleanup` | IPC/mark cleanup; archives preserved unless explicitly confirmed |
 | `POST` | `/api/admin/cleanup-node` | Per-node cleanup |
 
 ### Process Manager
@@ -98,8 +100,11 @@ logged).
 | `POST` | `/api/admin/processes/{name}/start` | Start process |
 | `POST` | `/api/admin/processes/{name}/stop` | Stop process |
 | `POST` | `/api/admin/processes/{name}/restart` | Restart process |
+| `POST` | `/api/admin/processes/{name}/restart` | Restart process |
+| `POST` | `/api/admin/processes/{name}/force-stop` | SIGKILL process |
 | `POST` | `/api/admin/processes/start-all` | Start all (dependency order) |
 | `POST` | `/api/admin/processes/stop-all` | Stop all (reverse order) |
+| `POST` | `/api/admin/processes/restart-all` | Restart all (dependency order) |
 
 ### Auto-Snapshot
 
