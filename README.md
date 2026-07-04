@@ -119,6 +119,7 @@ logged).
 | `POST` | `/api/admin/rebuild-gateway` | Rebuild gateway module |
 | `GET` | `/api/admin/backup-info` | Backup information |
 | `POST` | `/api/admin/recover-from-backup` | Restore from backup |
+| `POST` | `/api/admin/reseed-node` | Reseed a stranded member from a healthy follower (brief quorum outage; `force` required) |
 
 ## License
 
