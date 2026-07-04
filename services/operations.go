@@ -21,6 +21,7 @@ type OperationsService struct {
 	progress      *Progress
 	clusterStatus *ClusterStatus
 	procMgr       *ProcessManager
+	statusSvc     *StatusService
 }
 
 func NewOperationsService(cfg *config.Config, systemd *Systemd, cluster *Cluster, progress *Progress, status *ClusterStatus) *OperationsService {
@@ -36,6 +37,38 @@ func NewOperationsService(cfg *config.Config, systemd *Systemd, cluster *Cluster
 // SetProcessManager injects the process manager (avoids circular init)
 func (o *OperationsService) SetProcessManager(pm *ProcessManager) {
 	o.procMgr = pm
+}
+
+// SetStatusService injects the status service for the archive-op lag guard.
+func (o *OperationsService) SetStatusService(s *StatusService) {
+	o.statusSvc = s
+}
+
+// archiveOpBlockReason returns a non-empty reason when snapshot/housekeeping
+// would risk stranding a member (match#35): housekeeping purges log segments
+// below the latest snapshot, so running either while any node is down,
+// wedged, or lagging permanently strands that node (2026-07-02 incident).
+// Judged with the truthful per-node health from #16.
+func (o *OperationsService) archiveOpBlockReason() string {
+	if o.statusSvc == nil {
+		return ""
+	}
+	s := o.statusSvc.GetStatus()
+	if all, ok := s["allNodesHealthy"].(bool); ok && all {
+		return ""
+	}
+	detail := ""
+	if nodes, ok := s["nodes"].([]map[string]interface{}); ok {
+		for _, n := range nodes {
+			if h, _ := n["health"].(string); h != "" && h != "HEALTHY" {
+				detail += fmt.Sprintf(" node%v=%s", n["id"], h)
+			}
+		}
+	}
+	if detail == "" {
+		detail = " (health fields unavailable)"
+	}
+	return "cluster not fully healthy:" + detail
 }
 
 // isNodeRunning checks if a node is running via ProcessManager
@@ -344,9 +377,14 @@ func (o *OperationsService) doRebuildAdmin() {
 }
 
 // Snapshot triggers a cluster snapshot
-func (o *OperationsService) Snapshot() error {
+func (o *OperationsService) Snapshot(force bool) error {
 	if o.progress.IsRunning() {
 		return fmt.Errorf("another operation in progress")
+	}
+	if !force {
+		if reason := o.archiveOpBlockReason(); reason != "" {
+			return fmt.Errorf("refusing snapshot: %s (match#35 lag guard; POST {\"force\":true} to override)", reason)
+		}
 	}
 
 	go o.doSnapshot()
@@ -410,9 +448,14 @@ func (o *OperationsService) doSnapshot() {
 
 // Housekeeping reclaims archive disk on all nodes without taking a snapshot
 // (uses the latest existing snapshot as the purge boundary).
-func (o *OperationsService) Housekeeping() error {
+func (o *OperationsService) Housekeeping(force bool) error {
 	if o.progress.IsRunning() {
 		return fmt.Errorf("another operation in progress")
+	}
+	if !force {
+		if reason := o.archiveOpBlockReason(); reason != "" {
+			return fmt.Errorf("refusing housekeeping: %s (match#35 lag guard; POST {\"force\":true} to override)", reason)
+		}
 	}
 
 	go o.doHousekeeping()
