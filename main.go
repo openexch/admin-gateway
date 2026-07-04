@@ -37,14 +37,16 @@ func main() {
 	statusSvc.SetAutoSnapshot(autoSnapshot)
 	autoSnapshot.Start(5) // Auto-snapshot every 5 minutes to prevent unbounded log growth
 	logSvc := services.NewLogService(cfg)
+	metricsSvc := services.NewMetricsService(statusSvc, opsSvc, procMgr, progress)
 
 	// Initialize handlers
-	h := handlers.New(statusSvc, opsSvc, cluster, progress, clusterStatus, autoSnapshot, logSvc, procMgr)
+	h := handlers.New(statusSvc, opsSvc, cluster, progress, clusterStatus, autoSnapshot, logSvc, procMgr, metricsSvc)
 
 	// Setup router
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(logging.RequestLogger)
+	r.Use(metricsSvc.Middleware)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RealIP)
 	r.Use(handlers.AuthMiddleware(cfg.AuthToken))
