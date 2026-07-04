@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Package logging configures the process-wide structured logger (slog) and
 // provides the two correlation primitives the admin gateway uses:
 //
