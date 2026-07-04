@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -124,6 +125,40 @@ func (o *OperationsService) RollingUpdate() error {
 	return nil
 }
 
+// stageClusterJar builds match-cluster in an isolated copy of the project
+// tree and copies the result into staging. No shell involved: every step is
+// an arg-vector exec or a direct filesystem call (admin-gateway#11). The
+// temp build dir is removed on every exit path.
+func (o *OperationsService) stageClusterJar(tempBuildDir, stagingDir, stagingJar string) error {
+	if err := os.RemoveAll(tempBuildDir); err != nil {
+		return fmt.Errorf("clean temp build dir: %w", err)
+	}
+	if err := os.MkdirAll(tempBuildDir, 0o755); err != nil {
+		return fmt.Errorf("create temp build dir: %w", err)
+	}
+	defer os.RemoveAll(tempBuildDir)
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+		return fmt.Errorf("create staging dir: %w", err)
+	}
+	rsync := exec.Command("rsync", "-a",
+		"--exclude=*/target", "--exclude=.git", "--exclude=admin-gateway",
+		"--exclude=backup", "--exclude=binaries", "--exclude=binance-replay",
+		o.cfg.ProjectDir+"/", tempBuildDir+"/")
+	if output, err := rsync.CombinedOutput(); err != nil {
+		return fmt.Errorf("rsync: %v: %s", err, output)
+	}
+	mvn := exec.Command("mvn", "package", "-pl", "match-cluster", "-am", "-DskipTests", "-q")
+	mvn.Dir = tempBuildDir
+	if output, err := mvn.CombinedOutput(); err != nil {
+		return fmt.Errorf("mvn: %v: %s", err, output)
+	}
+	cp := exec.Command("cp", filepath.Join(tempBuildDir, "match-cluster/target/match-cluster.jar"), stagingJar)
+	if output, err := cp.CombinedOutput(); err != nil {
+		return fmt.Errorf("copy staged jar: %v: %s", err, output)
+	}
+	return nil
+}
+
 func (o *OperationsService) doRollingUpdate() {
 	jarPath := o.cfg.JarPath
 	stagingDir := filepath.Join(o.cfg.ProjectDir, "match-cluster/target/staging")
@@ -135,23 +170,8 @@ func (o *OperationsService) doRollingUpdate() {
 	buildId := fmt.Sprintf("%d", time.Now().UnixMilli())
 	tempBuildDir := "/tmp/match-rolling-build-" + buildId
 
-	buildScript := fmt.Sprintf(`
-		rm -rf %s &&
-		mkdir -p %s &&
-		mkdir -p %s &&
-		rsync -a --exclude='*/target' --exclude='.git' --exclude='admin-gateway' --exclude='backup' --exclude='binaries' --exclude='binance-replay' %s/ %s/ &&
-		cd %s &&
-		mvn package -pl match-cluster -am -DskipTests -q &&
-		cp %s/match-cluster/target/match-cluster.jar %s &&
-		rm -rf %s
-	`, tempBuildDir, tempBuildDir, stagingDir,
-		o.cfg.ProjectDir, tempBuildDir,
-		tempBuildDir,
-		tempBuildDir, stagingJar, tempBuildDir)
-
-	cmd := exec.Command("bash", "-c", buildScript)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		o.progress.Finish(false, "Build failed: "+err.Error()+" output: "+string(output))
+	if err := o.stageClusterJar(tempBuildDir, stagingDir, stagingJar); err != nil {
+		o.progress.Finish(false, "Build failed: "+err.Error())
 		return
 	}
 
@@ -511,8 +531,8 @@ func (o *OperationsService) RebuildGateway(restart bool) error {
 func (o *OperationsService) doRebuildGateway(restart bool) {
 	// Step 1: Build gateway module (safe - separate JAR from cluster)
 	o.progress.Update(1, "Building gateway module...")
-	cmd := exec.Command("bash", "-c",
-		fmt.Sprintf("cd %s && mvn package -pl match-gateway -am -DskipTests -q 2>&1", o.cfg.ProjectDir))
+	cmd := exec.Command("mvn", "package", "-pl", "match-gateway", "-am", "-DskipTests", "-q")
+	cmd.Dir = o.cfg.ProjectDir
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		o.progress.Finish(false, "Gateway build failed: "+err.Error()+" output: "+string(output))
@@ -562,23 +582,8 @@ func (o *OperationsService) doRebuildCluster() {
 	buildId := fmt.Sprintf("%d", time.Now().UnixMilli())
 	tempBuildDir := "/tmp/match-cluster-build-" + buildId
 
-	buildScript := fmt.Sprintf(`
-		rm -rf %s &&
-		mkdir -p %s &&
-		mkdir -p %s &&
-		rsync -a --exclude='*/target' --exclude='.git' --exclude='admin-gateway' --exclude='backup' --exclude='binaries' --exclude='binance-replay' %s/ %s/ &&
-		cd %s &&
-		mvn package -pl match-cluster -am -DskipTests -q &&
-		cp %s/match-cluster/target/match-cluster.jar %s &&
-		rm -rf %s
-	`, tempBuildDir, tempBuildDir, stagingDir,
-		o.cfg.ProjectDir, tempBuildDir,
-		tempBuildDir,
-		tempBuildDir, stagingJar, tempBuildDir)
-
-	cmd := exec.Command("bash", "-c", buildScript)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		o.progress.Finish(false, "Cluster build failed: "+err.Error()+" output: "+string(output))
+	if err := o.stageClusterJar(tempBuildDir, stagingDir, stagingJar); err != nil {
+		o.progress.Finish(false, "Cluster build failed: "+err.Error())
 		return
 	}
 
@@ -795,9 +800,15 @@ func (o *OperationsService) CleanupNode(nodeId int, force, dryRun bool) map[stri
 		return result
 	}
 
-	// Clean files
+	// Clean files — glob in-process, no shell (admin-gateway#11)
 	for _, pattern := range files {
-		exec.Command("bash", "-c", "rm -f "+pattern+" 2>/dev/null").Run()
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		for _, match := range matches {
+			os.Remove(match)
+		}
 	}
 
 	result["success"] = true
@@ -1009,7 +1020,7 @@ func copyFile(src, dst string) error {
 // waitForPort polls until a UDP port is open (bound) on the given host
 func (o *OperationsService) waitForPort(host string, port int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("udp", addr, 500*time.Millisecond)
 		if err == nil {

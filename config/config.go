@@ -3,10 +3,13 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 type Config struct {
 	Port          string
+	BindAddr      string // listen address; loopback by default (admin-gateway#11)
+	AuthToken     string // bearer token for the admin API; empty = loopback-only dev mode
 	ProjectDir    string
 	AdminDir      string // this repo's checkout (admin-gateway source + live binary)
 	OmsProjectDir string
@@ -44,6 +47,8 @@ func Load() *Config {
 
 	return &Config{
 		Port:          getEnvOrDefault("ADMIN_PORT", "8082"),
+		BindAddr:      getEnvOrDefault("ADMIN_BIND", "127.0.0.1"),
+		AuthToken:     loadAuthToken(),
 		ProjectDir:    projectDir,
 		AdminDir:      adminDir,
 		OmsProjectDir: omsProjectDir,
@@ -60,4 +65,21 @@ func getEnvOrDefault(key, defaultVal string) string {
 		return val
 	}
 	return defaultVal
+}
+
+// loadAuthToken reads the admin API bearer token from ADMIN_AUTH_TOKEN, or
+// from the file named by ADMIN_AUTH_TOKEN_FILE (surrounding whitespace trimmed).
+func loadAuthToken() string {
+	if tok := os.Getenv("ADMIN_AUTH_TOKEN"); tok != "" {
+		return tok
+	}
+	if file := os.Getenv("ADMIN_AUTH_TOKEN_FILE"); file != "" {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			// Fail closed: main refuses non-loopback binds without a token.
+			return ""
+		}
+		return strings.TrimSpace(string(data))
+	}
+	return ""
 }
