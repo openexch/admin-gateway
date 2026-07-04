@@ -417,6 +417,9 @@ func (o *OperationsService) Snapshot(force bool) error {
 	}
 	if !force {
 		if reason := o.archiveOpBlockReason(); reason != "" {
+			// Release the claimed slot — a guard refusal that kept it wedged
+			// EVERY subsequent operation until an admin restart.
+			o.progress.Finish(false, "refused: "+reason)
 			return fmt.Errorf("refusing snapshot: %s (match#35 lag guard; POST {\"force\":true} to override)", reason)
 		}
 	}
@@ -486,6 +489,7 @@ func (o *OperationsService) Housekeeping(force bool) error {
 	}
 	if !force {
 		if reason := o.archiveOpBlockReason(); reason != "" {
+			o.progress.Finish(false, "refused: "+reason)
 			return fmt.Errorf("refusing housekeeping: %s (match#35 lag guard; POST {\"force\":true} to override)", reason)
 		}
 	}
