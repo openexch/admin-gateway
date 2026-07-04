@@ -1,6 +1,7 @@
 package services
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -742,21 +743,73 @@ type BackupInfo struct {
 	HasRecordingLog bool   `json:"hasRecordingLog"`
 	HasArchive      bool   `json:"hasArchive"`
 	RecordingCount  int    `json:"recordingCount"`
+	// Freshness (match#36 / #9): is the backup actually tracking the leader?
+	RecordingLogBytes  int64            `json:"recordingLogBytes"`
+	CatalogModifiedAgo int64            `json:"catalogModifiedAgoSec"` // -1 when absent
+	Heartbeat          *BackupHeartbeat `json:"heartbeat,omitempty"`
+	Fresh              bool             `json:"fresh"`
+	FreshReason        string           `json:"freshReason"`
+}
+
+// BackupHeartbeat mirrors backup-progress.json written by ClusterBackupApp's
+// watchdog (match-cluster) every 5s next to the backup data.
+type BackupHeartbeat struct {
+	Pid                 int64  `json:"pid"`
+	StartedEpochMs      int64  `json:"startedEpochMs"`
+	UpdatedEpochMs      int64  `json:"updatedEpochMs"`
+	LastProgressEpochMs int64  `json:"lastProgressEpochMs"`
+	LastQueryEpochMs    int64  `json:"lastQueryEpochMs"`
+	LastResponseEpochMs int64  `json:"lastResponseEpochMs"`
+	LastLiveLogEpochMs  int64  `json:"lastLiveLogEpochMs"`
+	LiveLogPosition     int64  `json:"liveLogPosition"`
+	SnapshotsRetrieved  int64  `json:"snapshotsRetrieved"`
+	StallWarnings       int64  `json:"stallWarnings"`
+	State               string `json:"state"`
+}
+
+// heartbeat must be at most this old to count as live (watchdog writes every 5s)
+const backupHeartbeatMaxAgeSec = 30
+
+// BackupFreshness reads the ClusterBackupApp heartbeat and derives whether the
+// backup is live and tracking the leader. A "running" backup process proves
+// nothing (match#36: the agent wedged silently for days while the process
+// looked healthy) — only a recent heartbeat in state OK does.
+func BackupFreshness(backupDir string) (fresh bool, reason string, hb *BackupHeartbeat) {
+	data, err := os.ReadFile(filepath.Join(backupDir, "backup-progress.json"))
+	if err != nil {
+		return false, "no heartbeat file (backup app not running, or predates the watchdog)", nil
+	}
+	hb = &BackupHeartbeat{}
+	if err := json.Unmarshal(data, hb); err != nil {
+		return false, "unreadable heartbeat: " + err.Error(), nil
+	}
+	ageSec := (time.Now().UnixMilli() - hb.UpdatedEpochMs) / 1000
+	if ageSec > backupHeartbeatMaxAgeSec {
+		return false, fmt.Sprintf("heartbeat stale: last written %ds ago (backup process dead or wedged)", ageSec), hb
+	}
+	if hb.State != "OK" {
+		return false, fmt.Sprintf("backup reports state %s (no progress; watchdog about to restart it)", hb.State), hb
+	}
+	return true, "heartbeat live, backup making progress", hb
 }
 
 // GetBackupInfo returns information about backup data availability
 func (o *OperationsService) GetBackupInfo() BackupInfo {
 	backupDir := filepath.Join(o.cfg.ProjectDir, "backup")
-	info := BackupInfo{BackupDir: backupDir}
+	info := BackupInfo{BackupDir: backupDir, CatalogModifiedAgo: -1}
 
-	if _, err := os.Stat(filepath.Join(backupDir, "cluster/recording.log")); err == nil {
+	if st, err := os.Stat(filepath.Join(backupDir, "cluster/recording.log")); err == nil {
 		info.HasRecordingLog = true
+		info.RecordingLogBytes = st.Size()
 	}
-	if _, err := os.Stat(filepath.Join(backupDir, "archive/archive.catalog")); err == nil {
+	if st, err := os.Stat(filepath.Join(backupDir, "archive/archive.catalog")); err == nil {
 		info.HasArchive = true
+		info.CatalogModifiedAgo = int64(time.Since(st.ModTime()).Seconds())
 	}
 	matches, _ := filepath.Glob(filepath.Join(backupDir, "archive/*.rec"))
 	info.RecordingCount = len(matches)
+
+	info.Fresh, info.FreshReason, info.Heartbeat = BackupFreshness(backupDir)
 
 	return info
 }

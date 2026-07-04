@@ -2,6 +2,7 @@ package services
 
 import (
 	"net/http"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -326,9 +327,13 @@ func (s *StatusService) fetchStatus() map[string]interface{} {
 		},
 	}
 
-	// Check backup
+	// Check backup: "running" alone proves nothing (match#36 — the backup agent
+	// wedged silently for days); freshness comes from the app's heartbeat file.
+	backupFresh, backupReason, _ := BackupFreshness(filepath.Join(s.cfg.ProjectDir, "backup"))
 	backup := map[string]interface{}{
 		"running": s.isServiceRunning("backup"),
+		"fresh":   backupFresh,
+		"reason":  backupReason,
 	}
 
 	allNodesHealthy := healthArr[0] == HealthHealthy &&
