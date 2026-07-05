@@ -87,3 +87,43 @@ func TestRebuildVerificationShaMismatch(t *testing.T) {
 		t.Fatalf("expected verified with ok=false on sha mismatch, got %v", st)
 	}
 }
+
+// A pre-restart failure (build/swap abort) must be persisted and OVERWRITE a
+// previous success — rebuild-status reporting the stale success while the
+// build silently failed is exactly the #36 failure mode.
+func TestRebuildFailureOverwritesPreviousSuccess(t *testing.T) {
+	dir := t.TempDir()
+
+	// Seed a previous SUCCESS result.
+	prev := rebuildResult{
+		StartedAt:  time.Now().Add(-time.Hour).Format(time.RFC3339),
+		VerifiedAt: time.Now().Add(-time.Hour).Format(time.RFC3339),
+		OpID:       "rebuild-admin-old", Ok: true,
+	}
+	if err := writeJSONAtomic(filepath.Join(dir, rebuildResultFile), prev); err != nil {
+		t.Fatal(err)
+	}
+	// And a stale pending, which the failure must also clear.
+	if err := writeJSONAtomic(filepath.Join(dir, rebuildPendingFile),
+		rebuildPending{OpID: "rebuild-admin-old"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := WriteRebuildFailure(dir, "rebuild-admin-new", "Build failed (go): exit 1 output: toolchain not available"); err != nil {
+		t.Fatal(err)
+	}
+
+	st := ReadRebuildStatus(dir)
+	if st["state"] != "failed" || st["ok"] != false {
+		t.Fatalf("expected failed state, got %v", st)
+	}
+	if st["opId"] != "rebuild-admin-new" {
+		t.Fatalf("failure must name the FAILED attempt, got %v", st)
+	}
+	if st["hint"] == nil {
+		t.Fatal("failed state should carry the operator hint")
+	}
+	if _, err := os.Stat(filepath.Join(dir, rebuildPendingFile)); !os.IsNotExist(err) {
+		t.Fatal("failure must clear any stale pending handshake")
+	}
+}

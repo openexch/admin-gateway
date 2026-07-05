@@ -419,13 +419,19 @@ func (o *OperationsService) doRebuildAdmin() {
 	liveBinary := filepath.Join(adminDir, "admin-gateway")
 	stagingBinary := filepath.Join(adminDir, "admin-gateway.staging")
 
-	// Step 1: Build new binary to staging path (never overwrite live binary directly)
+	// Step 1: Build new binary to staging path (never overwrite live binary
+	// directly). Explicit toolchain + GOTOOLCHAIN=local (#36): the systemd
+	// user env can resolve an older apt go whose toolchain download is
+	// disabled, so `go build` must not depend on ambient PATH resolution or
+	// on downloading the go.mod toolchain.
 	o.progress.Update(1, "Building admin gateway from source...")
-	cmd := exec.Command("go", "build", "-o", stagingBinary, ".")
+	cmd := exec.Command(o.cfg.GoBin, "build", "-o", stagingBinary, ".")
 	cmd.Dir = adminDir
+	cmd.Env = append(os.Environ(), "GOTOOLCHAIN=local")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		os.Remove(stagingBinary)
-		o.progress.Finish(false, "Build failed: "+err.Error()+" output: "+string(output))
+		reason := "Build failed (" + o.cfg.GoBin + "): " + err.Error() + " output: " + tailString(string(output), 500)
+		o.failRebuild(reason)
 		return
 	}
 
@@ -433,18 +439,18 @@ func (o *OperationsService) doRebuildAdmin() {
 	o.progress.Update(2, "Verifying staged binary...")
 	info, err := os.Stat(stagingBinary)
 	if err != nil {
-		o.progress.Finish(false, "Staged binary not found after build: "+err.Error())
+		o.failRebuild("Staged binary not found after build: " + err.Error())
 		return
 	}
 	if info.Size() < 1024 {
 		os.Remove(stagingBinary)
-		o.progress.Finish(false, "Staged binary suspiciously small, aborting")
+		o.failRebuild("Staged binary suspiciously small, aborting")
 		return
 	}
 	stagedSha, err := fileSha256(stagingBinary)
 	if err != nil {
 		os.Remove(stagingBinary)
-		o.progress.Finish(false, "Cannot hash staged binary: "+err.Error())
+		o.failRebuild("Cannot hash staged binary: " + err.Error())
 		return
 	}
 
@@ -459,7 +465,7 @@ func (o *OperationsService) doRebuildAdmin() {
 	}
 	if err := os.Rename(stagingBinary, liveBinary); err != nil {
 		os.Remove(stagingBinary)
-		o.progress.Finish(false, "Binary swap failed: "+err.Error())
+		o.failRebuild("Binary swap failed: " + err.Error())
 		return
 	}
 
@@ -485,6 +491,26 @@ func (o *OperationsService) doRebuildAdmin() {
 
 	// This is the kill-switch: systemd restarts us with the new binary
 	o.systemd.Restart("admin")
+}
+
+// failRebuild reports a pre-restart rebuild-admin failure BOTH to the
+// progress slot and durably to rebuild-result.json (#36): the progress
+// message is transient, and before this the last SUCCESSFUL result kept
+// being served by /api/admin/rebuild-status, hiding the failure entirely.
+func (o *OperationsService) failRebuild(reason string) {
+	o.log.Error("rebuild-admin failed", "reason", reason)
+	if err := WriteRebuildFailure(o.cfg.AdminDir, o.progress.CurrentOpID(), reason); err != nil {
+		o.log.Error("could not persist rebuild failure", "err", err)
+	}
+	o.progress.Finish(false, reason)
+}
+
+// tailString returns at most the last n bytes of s (for log/output tails).
+func tailString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return "…" + s[len(s)-n:]
 }
 
 // Snapshot triggers a cluster snapshot

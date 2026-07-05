@@ -3,6 +3,7 @@ package config
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -20,6 +21,7 @@ type Config struct {
 	LogDir        string
 	ClusterDir    string
 	LogFormat     string // "json" (default) or "text" (ADMIN_LOG_FORMAT)
+	GoBin         string // go binary for rebuild-admin (ADMIN_GO_BIN; see resolveGoBin)
 }
 
 func Load() *Config {
@@ -60,7 +62,27 @@ func Load() *Config {
 		LogDir:        filepath.Join(homeDir, ".local/log/cluster"),
 		ClusterDir:    "/dev/shm/aeron-cluster",
 		LogFormat:     getEnvOrDefault("ADMIN_LOG_FORMAT", "json"),
+		GoBin:         resolveGoBin(),
 	}
+}
+
+// resolveGoBin picks the Go toolchain rebuild-admin builds with (#36). The
+// systemd user environment can resolve a different (older) go than an
+// interactive shell — on Ubuntu, /usr/bin/go is the apt toolchain with
+// GOTOOLCHAIN downloads disabled, which fails go.mod's minimum with
+// "toolchain not available" while `go build` works fine in a terminal.
+// Order: ADMIN_GO_BIN > the conventional upstream install > PATH.
+func resolveGoBin() string {
+	if bin := os.Getenv("ADMIN_GO_BIN"); bin != "" {
+		return bin
+	}
+	if _, err := os.Stat("/usr/local/go/bin/go"); err == nil {
+		return "/usr/local/go/bin/go"
+	}
+	if bin, err := exec.LookPath("go"); err == nil {
+		return bin
+	}
+	return "go"
 }
 
 func getEnvOrDefault(key, defaultVal string) string {
