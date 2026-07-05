@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/match/admin-gateway/agent"
 	"github.com/match/admin-gateway/config"
 )
 
@@ -61,9 +62,12 @@ type StatusService struct {
 	cfg           *config.Config
 	cluster       *Cluster
 	clusterStatus *ClusterStatus
-	pm            *ProcessManager
-	counters      *AeronCounters
-	autoSnapshot  *AutoSnapshot
+	pm            agent.ProcessAgent
+	// counters stays service-owned (not routed via the agent): the initial
+	// refreshStatus runs before SetProcessManager, and CnC reads are a
+	// flagged Horizon B seam (docs/AGENT-ARCHITECTURE.md).
+	counters     *AeronCounters
+	autoSnapshot *AutoSnapshot
 
 	// Cached status
 	cacheMu      sync.RWMutex
@@ -102,7 +106,7 @@ func NewStatusService(cfg *config.Config, cluster *Cluster, status *ClusterStatu
 	return s
 }
 
-func (s *StatusService) SetProcessManager(pm *ProcessManager) {
+func (s *StatusService) SetProcessManager(pm agent.ProcessAgent) {
 	s.pm = pm
 }
 
@@ -138,7 +142,7 @@ func (s *StatusService) getServicePID(name string) int {
 func (s *StatusService) backgroundPoller() {
 	ticker := time.NewTicker(s.pollInterval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ticker.C:
@@ -151,7 +155,7 @@ func (s *StatusService) backgroundPoller() {
 
 func (s *StatusService) refreshStatus() {
 	status := s.fetchStatus()
-	
+
 	s.cacheMu.Lock()
 	s.cachedStatus = status
 	s.lastUpdate = time.Now()
@@ -162,19 +166,19 @@ func (s *StatusService) refreshStatus() {
 func (s *StatusService) GetStatus() map[string]interface{} {
 	s.cacheMu.RLock()
 	defer s.cacheMu.RUnlock()
-	
+
 	if s.cachedStatus == nil {
 		// Fallback if cache not ready
 		return s.fetchStatus()
 	}
-	
+
 	// Add cache age info
 	result := make(map[string]interface{})
 	for k, v := range s.cachedStatus {
 		result[k] = v
 	}
 	result["cacheAgeMs"] = time.Since(s.lastUpdate).Milliseconds()
-	
+
 	return result
 }
 
@@ -381,4 +385,3 @@ func probeHealth(url string) bool {
 	resp.Body.Close()
 	return resp.StatusCode == http.StatusOK
 }
-

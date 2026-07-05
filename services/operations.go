@@ -2,6 +2,8 @@
 package services
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/match/admin-gateway/agent"
 	"github.com/match/admin-gateway/config"
 	"github.com/match/admin-gateway/logging"
 )
@@ -25,7 +28,7 @@ type OperationsService struct {
 	cluster       *Cluster
 	progress      *Progress
 	clusterStatus *ClusterStatus
-	procMgr       *ProcessManager
+	procMgr       agent.ProcessAgent
 	statusSvc     *StatusService
 	log           *slog.Logger
 }
@@ -41,8 +44,8 @@ func NewOperationsService(cfg *config.Config, systemd *Systemd, cluster *Cluster
 	}
 }
 
-// SetProcessManager injects the process manager (avoids circular init)
-func (o *OperationsService) SetProcessManager(pm *ProcessManager) {
+// SetProcessManager injects the process agent (avoids circular init)
+func (o *OperationsService) SetProcessManager(pm agent.ProcessAgent) {
 	o.procMgr = pm
 }
 
@@ -93,7 +96,7 @@ func (o *OperationsService) startService(name string) {
 		o.log.Error("process manager not initialized, cannot start service", "service", name)
 		return
 	}
-	if err := o.procMgr.startByName(name); err != nil {
+	if err := o.procMgr.StartUnchecked(name); err != nil {
 		o.log.Error("start service failed", "service", name, "err", err)
 	}
 }
@@ -104,7 +107,7 @@ func (o *OperationsService) stopService(name string) {
 		o.log.Error("process manager not initialized, cannot stop service", "service", name)
 		return
 	}
-	if err := o.procMgr.stopProcess(name, true); err != nil {
+	if err := o.procMgr.ForceStop(name); err != nil {
 		o.log.Error("stop service failed", "service", name, "err", err)
 	}
 }
@@ -118,6 +121,40 @@ func (o *OperationsService) restartService(name string) {
 	if err := o.procMgr.Restart(name); err != nil {
 		o.log.Error("restart service failed", "service", name, "err", err)
 	}
+}
+
+// installStagedJar deploys a staged JAR to its live path through the agent's
+// artifact primitive (sha256-verified, atomic). Removes the staging file on
+// success, preserving the old mv semantics.
+func (o *OperationsService) installStagedJar(stagingJar, jarPath string) error {
+	if o.procMgr == nil {
+		return fmt.Errorf("process agent not initialized")
+	}
+	f, err := os.Open(stagingJar)
+	if err != nil {
+		return err
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		f.Close()
+		return err
+	}
+	spec := agent.ArtifactSpec{
+		DestPath: jarPath,
+		Sha256:   hex.EncodeToString(h.Sum(nil)),
+		Mode:     0644,
+	}
+	err = o.procMgr.InstallArtifact(spec, f)
+	f.Close()
+	if err != nil {
+		return err
+	}
+	os.Remove(stagingJar)
+	return nil
 }
 
 // RollingUpdate performs a rolling update of all cluster nodes
@@ -222,10 +259,18 @@ func (o *OperationsService) doRollingUpdate() {
 		o.clusterStatus.SetNodeStatus(nodeId, "OFFLINE", false)
 		step++
 
-		// Swap JAR after first node is stopped
+		// Swap JAR after first node is stopped (agent artifact primitive:
+		// sha-verified temp-file write + atomic rename — a partial copy is
+		// never visible at jarPath, and this works cross-filesystem where a
+		// bare rename from /tmp staging would not)
 		if !jarSwapped {
 			o.progress.Update(step, "Deploying new JAR...")
-			exec.Command("mv", stagingJar, jarPath).Run()
+			if err := o.installStagedJar(stagingJar, jarPath); err != nil {
+				o.clusterStatus.SetNodeStatus(nodeId, "OFFLINE", false)
+				o.progress.Finish(false, fmt.Sprintf(
+					"JAR deploy failed (%v) — ABORTED with node%d stopped; cluster keeps quorum (2/3)", err, nodeId))
+				return
+			}
 			jarSwapped = true
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -1130,13 +1175,14 @@ func (o *OperationsService) cleanNodeMediaDriver(log *slog.Logger, nodeId int) {
 // loading a snapshot. Restarting the next node before catch-up risks losing quorum.
 func (o *OperationsService) waitForFollowerCatchUp(log *slog.Logger, followerId, leaderId int, timeout time.Duration) bool {
 	const catchUpLagBytes int64 = 1 * 1024 * 1024 // 1 MB lag is fine; term buffer is 16 MB
-	counters := NewAeronCounters()
 	deadline := time.Now().Add(timeout)
 	var lastFollowerPos int64 = -1
 	for time.Now().Before(deadline) {
 		time.Sleep(500 * time.Millisecond)
-		leader, lerr := counters.GetNodeCounters(leaderId)
-		follower, ferr := counters.GetNodeCounters(followerId)
+		// Per-node counter reads go through the agent; the cross-node
+		// comparison stays control-plane-side (docs/AGENT-ARCHITECTURE.md).
+		leader, lerr := o.procMgr.NodeCounters(leaderId)
+		follower, ferr := o.procMgr.NodeCounters(followerId)
 		if lerr != nil || ferr != nil || leader.CommitPosition < 0 || follower.CommitPosition < 0 {
 			continue // CnC not yet ready; keep polling
 		}

@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/match/admin-gateway/agent"
 	"github.com/match/admin-gateway/config"
 	"github.com/match/admin-gateway/handlers"
 	"github.com/match/admin-gateway/logging"
@@ -28,7 +29,10 @@ func main() {
 	cluster := services.NewCluster(cfg)
 	progress := services.NewProgress()
 	clusterStatus := services.NewClusterStatus()
-	procMgr := services.NewProcessManager(cfg)
+	// The in-process LocalAgent. Everything downstream depends only on the
+	// agent contract (docs/AGENT-ARCHITECTURE.md), so a remote agentd client
+	// can slot in per host later.
+	var procMgr agent.ProcessAgent = services.NewProcessManager(cfg)
 
 	statusSvc := services.NewStatusService(cfg, cluster, clusterStatus)
 	statusSvc.SetProcessManager(procMgr)
@@ -102,7 +106,7 @@ func main() {
 		<-sigChan
 		slog.Info("shutting down")
 		autoSnapshot.Stop()
-		procMgr.Shutdown()
+		procMgr.Close()
 		statusSvc.Stop()
 		server.Close()
 	}()

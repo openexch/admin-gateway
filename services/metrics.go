@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/match/admin-gateway/agent"
 )
 
 // MetricsService renders Prometheus text exposition (companion to the match
@@ -22,7 +23,7 @@ import (
 type MetricsService struct {
 	statusSvc *StatusService
 	opsSvc    *OperationsService
-	pm        *ProcessManager
+	pm        agent.ProcessAgent
 	progress  *Progress
 	startTime time.Time
 
@@ -30,7 +31,7 @@ type MetricsService struct {
 	requests map[string]int64 // "method|route|code" -> count
 }
 
-func NewMetricsService(statusSvc *StatusService, opsSvc *OperationsService, pm *ProcessManager, progress *Progress) *MetricsService {
+func NewMetricsService(statusSvc *StatusService, opsSvc *OperationsService, pm agent.ProcessAgent, progress *Progress) *MetricsService {
 	return &MetricsService{
 		statusSvc: statusSvc,
 		opsSvc:    opsSvc,

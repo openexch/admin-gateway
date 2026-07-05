@@ -15,17 +15,21 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/match/admin-gateway/agent"
 	"github.com/match/admin-gateway/config"
 	"github.com/match/admin-gateway/logging"
 )
 
 // ServiceRole defines the category of a managed service
-type ServiceRole string
+// Core process types live in the agent package (the gateway↔agent contract,
+// docs/AGENT-ARCHITECTURE.md); aliases keep the services API and JSON shape
+// byte-identical.
+type ServiceRole = agent.ServiceRole
 
 const (
-	RoleClusterNode ServiceRole = "cluster"
-	RoleGateway     ServiceRole = "gateway"
-	RoleInfra       ServiceRole = "infra"
+	RoleClusterNode = agent.RoleClusterNode
+	RoleGateway     = agent.RoleGateway
+	RoleInfra       = agent.RoleInfra
 )
 
 // ServiceDef defines how to start and manage a process
@@ -58,31 +62,14 @@ type ServiceDef struct {
 // Restart-loop cap + driver gate tuning (#17). Vars, not consts, so tests can
 // shrink the timings; production code never mutates them.
 var (
-	rapidCrashMax    = 5               // crashes within rapidCrashWindow before auto-restart disarms
+	rapidCrashMax    = 5 // crashes within rapidCrashWindow before auto-restart disarms
 	rapidCrashWindow = 2 * time.Minute
 	gateStableFor    = 5 * time.Second  // gating service must be up this long (outlives launcher validation crashes)
 	gateTimeout      = 25 * time.Second // total wait for the gate to become stable
 )
 
-// ProcessInfo is the live state of a managed service
-type ProcessInfo struct {
-	Name         string      `json:"name"`
-	Display      string      `json:"display"`
-	Role         ServiceRole `json:"role"`
-	Port         int         `json:"port,omitempty"`
-	Running      bool        `json:"running"`
-	PID          int         `json:"pid,omitempty"`
-	MemoryBytes  int64       `json:"memoryBytes,omitempty"`
-	CPUPercent   float64     `json:"cpuPercent,omitempty"`
-	UptimeMs     int64       `json:"uptimeMs,omitempty"`
-	StartedAt    string      `json:"startedAt,omitempty"`
-	RestartCount int         `json:"restartCount"`
-	Enabled      bool        `json:"enabled"`
-	Status       string      `json:"status"` // "running", "stopped", "starting", "stopping", "failed", "crashed"
-	// Why the service is failed/crashed (start error, crash exit + log tail,
-	// or crash-loop disarm). Empty while healthy.
-	LastError string `json:"lastError,omitempty"`
-}
+// ProcessInfo is the live state of a managed service (defined in agent).
+type ProcessInfo = agent.ProcessInfo
 
 // managedProcess tracks a running process
 type managedProcess struct {
@@ -111,6 +98,11 @@ type ProcessManager struct {
 	logDir   string
 	stopChan chan struct{}
 	log      *slog.Logger
+
+	// LocalAgent surface (process_manager_agent.go)
+	events       eventHub
+	counters     *AeronCounters
+	countersOnce sync.Once
 }
 
 func NewProcessManager(cfg *config.Config) *ProcessManager {
@@ -174,10 +166,10 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 
 	nodeEnv := func(nodeId int) map[string]string {
 		env := map[string]string{
-			"CLUSTER_ADDRESSES":  "127.0.0.1,127.0.0.1,127.0.0.1",
-			"CLUSTER_NODE":       strconv.Itoa(nodeId),
-			"CLUSTER_PORT_BASE":  "9000",
-			"BASE_DIR":           fmt.Sprintf("/dev/shm/aeron-cluster/node%d", nodeId),
+			"CLUSTER_ADDRESSES": "127.0.0.1,127.0.0.1,127.0.0.1",
+			"CLUSTER_NODE":      strconv.Itoa(nodeId),
+			"CLUSTER_PORT_BASE": "9000",
+			"BASE_DIR":          fmt.Sprintf("/dev/shm/aeron-cluster/node%d", nodeId),
 		}
 		if externalDriver {
 			env["TRANSPORT_DRIVER_MODE"] = "external"
@@ -219,9 +211,9 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 	nodeDef := func(nodeId int) ServiceDef {
 		def := ServiceDef{
 			Name: fmt.Sprintf("node%d", nodeId), Display: fmt.Sprintf("Cluster Node %d", nodeId),
-			Role: RoleClusterNode,
+			Role:    RoleClusterNode,
 			Command: nodeCmd(nodeCpuSets[nodeId]), Env: nodeEnv(nodeId), WorkDir: cfg.ProjectDir,
-			PreStart: nodePreStart(nodeId),
+			PreStart:    nodePreStart(nodeId),
 			AutoRestart: true, RestartSec: 10, StopTimeout: 5,
 		}
 		if externalDriver {
@@ -264,15 +256,15 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 					"BASE_DIR":              filepath.Join(cfg.ProjectDir, "backup"),
 					"BACKUP_STALL_EXIT_SEC": "300",
 				},
-				WorkDir: cfg.ProjectDir,
-				PreStart: [][]string{{"mkdir", "-p", filepath.Join(cfg.ProjectDir, "backup")}},
-				DependsOn: []string{"node0", "node1", "node2"},
+				WorkDir:     cfg.ProjectDir,
+				PreStart:    [][]string{{"mkdir", "-p", filepath.Join(cfg.ProjectDir, "backup")}},
+				DependsOn:   []string{"node0", "node1", "node2"},
 				AutoRestart: true, RestartSec: 10, StopTimeout: 5,
 			},
 			{
 				Name: "oms", Display: "Order Management", Role: RoleGateway, Port: 8080,
 				ExtraPorts: []int{9093, 9090}, // Aeron UDP egress + gRPC
-				Command:    omsCmd("12-15"),    // pinned: cores 12-15 (cluster uses 0-11)
+				Command:    omsCmd("12-15"),   // pinned: cores 12-15 (cluster uses 0-11)
 				Env: map[string]string{
 					"OMS_HTTP_PORT":     "8080",
 					"OMS_GRPC_PORT":     "9090",
@@ -286,8 +278,8 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 					// cross-origin browser client and needs an explicit allowlist.
 					"OMS_CORS_ORIGINS": "https://trade.openexch.io",
 				},
-				WorkDir:   cfg.OmsProjectDir,
-				DependsOn: []string{"node0", "node1", "node2"},
+				WorkDir:     cfg.OmsProjectDir,
+				DependsOn:   []string{"node0", "node1", "node2"},
 				AutoRestart: true, RestartSec: 5, StopTimeout: 10,
 			},
 			{
@@ -300,8 +292,8 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 					"EGRESS_PORT":       "9091",
 					"GATEWAY_TYPE":      "market",
 				},
-				WorkDir: cfg.ProjectDir,
-				DependsOn: []string{"node0", "node1", "node2"},
+				WorkDir:     cfg.ProjectDir,
+				DependsOn:   []string{"node0", "node1", "node2"},
 				AutoRestart: true, RestartSec: 5, StopTimeout: 5,
 			},
 			{
@@ -627,17 +619,14 @@ func (pm *ProcessManager) Summary() map[string]interface{} {
 	return summary
 }
 
-type ActionResult struct {
-	Service string `json:"service"`
-	Action  string `json:"action,omitempty"`
-	Success bool   `json:"success"`
-	Error   string `json:"error,omitempty"`
-}
+// ActionResult is the bulk-operation outcome type (defined in agent).
+type ActionResult = agent.ActionResult
 
 // --- Process Lifecycle ---
 
-// startByName is a convenience for internal callers (e.g. operations service)
-func (pm *ProcessManager) startByName(name string) error {
+// StartUnchecked starts a service without the dependency check — for
+// orchestration callers (operations) that sequence dependencies themselves.
+func (pm *ProcessManager) StartUnchecked(name string) error {
 	def := pm.findDef(name)
 	if def == nil {
 		return fmt.Errorf("unknown service: %s", name)
@@ -827,6 +816,7 @@ func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) err
 	pm.writePID(def.Name, proc.pid)
 
 	pm.log.Info("started service", "service", def.Name, "pid", proc.pid)
+	pm.emitEvent(agent.EventStarted, def.Name, proc.pid, "")
 
 	// Monitor process in background (handles crash + auto-restart)
 	go pm.monitor(def, proc)
@@ -867,6 +857,7 @@ func (pm *ProcessManager) stopProcess(name string, force bool) error {
 			proc.mu.Unlock()
 			pm.removePID(name)
 			pm.log.Info("stopped adopted process", "service", name)
+			pm.emitEvent(agent.EventStopped, name, pid, "adopted process")
 			return nil
 		}
 		proc.status = "stopped"
@@ -925,6 +916,7 @@ func (pm *ProcessManager) stopProcess(name string, force bool) error {
 
 	pm.removePID(name)
 	pm.log.Info("stopped service", "service", name)
+	pm.emitEvent(agent.EventStopped, name, pid, "")
 
 	return nil
 }
@@ -1014,6 +1006,8 @@ func (pm *ProcessManager) handleCrash(
 	proc.lastError = crashCause
 	proc.mu.Unlock()
 
+	pm.emitEvent(agent.EventCrashed, def.Name, oldPid, crashCause)
+
 	// Auto-restart if enabled (with crash-loop cap)
 	if def.AutoRestart {
 		// Crash cascade (media driver → node): the node's shared-memory IPC died with
@@ -1021,6 +1015,7 @@ func (pm *ProcessManager) handleCrash(
 		// below once the driver is back, giving deterministic driver-then-node order.
 		for _, target := range def.RestartCascades {
 			pm.log.Warn("force-stopping dependent after crash", "service", def.Name, "dependent", target)
+			pm.emitEvent(agent.EventCascadeStop, target, 0, "cascade from "+def.Name)
 			if err := pm.stopProcess(target, true); err != nil {
 				pm.log.Error("failed to stop dependent during crash cascade", "dependent", target, "service", def.Name, "err", err)
 			}
@@ -1038,6 +1033,7 @@ func (pm *ProcessManager) handleCrash(
 			proc.lastError = msg
 			proc.mu.Unlock()
 			pm.log.Error("service failed, auto-restart disarmed", "service", def.Name, "reason", msg)
+			pm.emitEvent(agent.EventDisarmed, def.Name, 0, msg)
 			return
 		}
 
@@ -1137,6 +1133,7 @@ func (pm *ProcessManager) adoptExisting() {
 			proc.startedAt = getProcessStartTime(pid)
 			proc.mu.Unlock()
 			pm.log.Info("adopted service", "service", def.Name, "pid", pid)
+			pm.emitEvent(agent.EventAdopted, def.Name, pid, "")
 		} else {
 			// Stale PID file
 			pm.removePID(def.Name)
