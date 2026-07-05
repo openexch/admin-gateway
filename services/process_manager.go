@@ -291,6 +291,14 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 					"MATCH_PROJECT_DIR": cfg.ProjectDir,
 					"EGRESS_PORT":       "9091",
 					"GATEWAY_TYPE":      "market",
+					// Market-data persistence (TimescaleDB): the DB is the source
+					// of truth for candles/trades/ticker; the gateway falls back to
+					// in-memory when it is absent. MARKET_PG_PASSWORD is inherited
+					// from the admin service environment (systemd drop-in
+					// admin.service.d/marketdata-db.conf) — without it the gateway
+					// runs pure in-memory, exactly as before persistence existed.
+					"MARKET_PG_URL":  "jdbc:postgresql://localhost:5432/marketdata",
+					"MARKET_PG_USER": "market",
 				},
 				WorkDir:     cfg.ProjectDir,
 				DependsOn:   []string{"node0", "node1", "node2"},
