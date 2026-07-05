@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/match/admin-gateway/agent"
 	"github.com/match/admin-gateway/logging"
 	"github.com/match/admin-gateway/services"
 )
@@ -20,7 +21,7 @@ type Handlers struct {
 	status       *services.ClusterStatus
 	autoSnapshot *services.AutoSnapshot
 	logSvc       *services.LogService
-	procMgr      *services.ProcessManager
+	procMgr      agent.ProcessAgent
 	metrics      *services.MetricsService
 }
 
@@ -32,7 +33,7 @@ func New(
 	status *services.ClusterStatus,
 	autoSnapshot *services.AutoSnapshot,
 	logSvc *services.LogService,
-	procMgr *services.ProcessManager,
+	procMgr agent.ProcessAgent,
 	metrics *services.MetricsService,
 ) *Handlers {
 	return &Handlers{

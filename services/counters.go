@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 	"sync"
+
+	"github.com/match/admin-gateway/agent"
 )
 
 // AeronCounters reads Aeron counters from the CnC (Command and Control) file
@@ -33,12 +35,9 @@ const (
 	maxLabelLength         = 380
 )
 
-// CounterData holds counter information for a node
-type CounterData struct {
-	CommitPosition int64 // Cluster commit position (real-time)
-	SnapshotCount  int64 // Number of snapshots taken
-	NodeRole       int64 // 0=follower, 1=candidate, 2=leader
-}
+// CounterData holds counter information for a node (defined in agent — it
+// crosses the gateway↔agent contract).
+type CounterData = agent.CounterData
 
 func NewAeronCounters() *AeronCounters {
 	return &AeronCounters{}
