@@ -109,6 +109,8 @@ func (m *MetricsService) render() string {
 		toF(status["leader"], -1), "")
 	gauge("admin_cluster_all_nodes_healthy", "1 when all three nodes are HEALTHY.",
 		boolF(status["allNodesHealthy"]), "")
+	gauge("admin_demo_healthy", "1 when the market simulator's end-to-end demo canary is healthy (orders, fills, market data, CORS incl. public edge).",
+		boolF(status["demoHealthy"]), "")
 
 	if nodes, ok := status["nodes"].([]map[string]interface{}); ok {
 		head("admin_node_healthy", "1 when the node's derived health is HEALTHY.", "gauge")

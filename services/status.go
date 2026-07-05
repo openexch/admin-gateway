@@ -344,12 +344,26 @@ func (s *StatusService) fetchStatus() map[string]interface{} {
 	allNodesHealthy := healthArr[0] == HealthHealthy &&
 		healthArr[1] == HealthHealthy && healthArr[2] == HealthHealthy
 
+	// Demo end-to-end health from the market simulator's canary
+	// (:8090/health returns 200 only when every critical check passes:
+	// order round-trip, fills, market data, CORS incl. the public edge).
+	// This is the signal that catches "the demo is silently broken".
+	simRunning := s.isServiceRunning("sim")
+	demoHealthy := simRunning && probeHealth("http://localhost:8090/health")
+	demo := map[string]interface{}{
+		"running": simRunning,
+		"healthy": demoHealthy,
+		"port":    8090,
+	}
+
 	result := map[string]interface{}{
 		"leader":          leader,
 		"nodes":           nodes,
 		"allNodesHealthy": allNodesHealthy,
 		"gateways":        gateways,
 		"backup":          backup,
+		"demo":            demo,
+		"demoHealthy":     demoHealthy,
 		"gateway": map[string]interface{}{ // Legacy field
 			"running": s.isServiceRunning("oms"),
 			"port":    8080,

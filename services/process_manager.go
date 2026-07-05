@@ -297,6 +297,26 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 				AutoRestart: true, RestartSec: 5, StopTimeout: 5,
 			},
 			{
+				// Market simulator + demo canary (openexch/tools market-sim):
+				// keeps the demo alive AND continuously proves the user path
+				// end-to-end (orders, fills, market data, CORS). Health at
+				// :8090/health. Pinned to the spare E-cores; pause it before
+				// ad-hoc load tests (POST :8090/control {"pause":true}).
+				Name: "sim", Display: "Market Simulator", Role: RoleInfra, Port: 8090,
+				Command: []string{"/usr/bin/taskset", "-c", "20-23", cfg.SimBinary,
+					"-mode=run", "-source=auto", "-global-ops=60"},
+				Env: map[string]string{
+					"OMS_URL":            "http://127.0.0.1:8080",
+					"MARKET_WS_URL":      "ws://127.0.0.1:8081/ws",
+					"SIM_HEALTH_ADDR":    "127.0.0.1:8090",
+					"SIM_CORS_ORIGIN":    "https://trade.openexch.io",
+					"SIM_PUBLIC_OMS_URL": "https://oms.openexch.io",
+				},
+				WorkDir:     filepath.Dir(cfg.SimBinary),
+				DependsOn:   []string{"oms", "market"},
+				AutoRestart: true, RestartSec: 10, StopTimeout: 15, // shutdown cancels sim quotes
+			},
+			{
 				Name: "admin", Display: "Admin Gateway", Role: RoleGateway, Port: 8082,
 				// Admin is self — we don't manage ourselves, just report status
 			},

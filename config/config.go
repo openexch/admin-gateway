@@ -22,6 +22,7 @@ type Config struct {
 	ClusterDir    string
 	LogFormat     string // "json" (default) or "text" (ADMIN_LOG_FORMAT)
 	GoBin         string // go binary for rebuild-admin (ADMIN_GO_BIN; see resolveGoBin)
+	SimBinary     string // market simulator binary (SIM_BINARY; openexch/tools market-sim)
 }
 
 func Load() *Config {
@@ -63,6 +64,10 @@ func Load() *Config {
 		ClusterDir:    "/dev/shm/aeron-cluster",
 		LogFormat:     getEnvOrDefault("ADMIN_LOG_FORMAT", "json"),
 		GoBin:         resolveGoBin(),
+		// tools is a sibling repo of match/order-management; build with
+		// `cd tools/market-sim && go build -o market-sim .`
+		SimBinary: getEnvOrDefault("SIM_BINARY",
+			filepath.Join(filepath.Dir(projectDir), "tools/market-sim/market-sim")),
 	}
 }
 
