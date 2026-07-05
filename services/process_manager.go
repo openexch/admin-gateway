@@ -282,6 +282,9 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 					// keys = reject everything, oms#36); the demo UI and load
 					// harness need the dev provider.
 					"OMS_AUTH_MODE": "dev",
+					// CORS is default-deny since oms#37; the hosted demo UI is a
+					// cross-origin browser client and needs an explicit allowlist.
+					"OMS_CORS_ORIGINS": "https://trade.openexch.io",
 				},
 				WorkDir:   cfg.OmsProjectDir,
 				DependsOn: []string{"node0", "node1", "node2"},
