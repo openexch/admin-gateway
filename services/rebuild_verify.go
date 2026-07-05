@@ -53,6 +53,27 @@ type rebuildResult struct {
 	Pid          int    `json:"pid"`
 	Ok           bool   `json:"ok"`
 	Reason       string `json:"reason,omitempty"`
+	// Stage distinguishes a pre-restart failure ("build-failed": the build or
+	// swap aborted, the OLD binary keeps running) from the post-restart
+	// handshake ("" / "verified"). Added for #36 — before this, failed
+	// attempts were never persisted and rebuild-status kept reporting the
+	// previous success.
+	Stage string `json:"stage,omitempty"`
+}
+
+// WriteRebuildFailure durably records a pre-restart rebuild failure so
+// rebuild-status reflects it (overwriting any previous success) (#36).
+func WriteRebuildFailure(adminDir, opID, reason string) error {
+	result := rebuildResult{
+		StartedAt: time.Now().Format(time.RFC3339),
+		OpID:      opID,
+		Ok:        false,
+		Reason:    reason,
+		Stage:     "build-failed",
+	}
+	// A failed attempt also invalidates any stale pending handshake.
+	os.Remove(filepath.Join(adminDir, rebuildPendingFile))
+	return writeJSONAtomic(filepath.Join(adminDir, rebuildResultFile), result)
 }
 
 func fileSha256(path string) (string, error) {
@@ -153,6 +174,16 @@ func ReadRebuildStatus(adminDir string) map[string]interface{} {
 	if data, err := os.ReadFile(filepath.Join(adminDir, rebuildResultFile)); err == nil {
 		var result rebuildResult
 		if json.Unmarshal(data, &result) == nil {
+			if result.Stage == "build-failed" {
+				return map[string]interface{}{
+					"state":     "failed",
+					"ok":        false,
+					"reason":    result.Reason,
+					"startedAt": result.StartedAt,
+					"opId":      result.OpID,
+					"hint":      "the previous binary is still running; fix the build error and re-run rebuild-admin",
+				}
+			}
 			return map[string]interface{}{
 				"state":        "verified",
 				"ok":           result.Ok,
