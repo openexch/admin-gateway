@@ -74,6 +74,7 @@ var (
 	rapidCrashWindow = 2 * time.Minute
 	gateStableFor    = 5 * time.Second  // gating service must be up this long (outlives launcher validation crashes)
 	gateTimeout      = 25 * time.Second // total wait for the gate to become stable
+	startStagger     = 2 * time.Second  // pause between StartAll service launches
 )
 
 // ProcessInfo is the live state of a managed service (defined in agent).
@@ -97,15 +98,15 @@ type managedProcess struct {
 
 // ProcessManager directly manages processes (no systemd for managed services)
 type ProcessManager struct {
-	cfg      *config.Config
 	services []ServiceDef
 	procs    map[string]*managedProcess // name → process state
 
-	mu       sync.RWMutex
-	pidDir   string
-	logDir   string
-	stopChan chan struct{}
-	log      *slog.Logger
+	mu         sync.RWMutex
+	pidDir     string
+	logDir     string
+	projectDir string // backup-node state root (cleanStaleAeronState); empty = no backup cleanup
+	stopChan   chan struct{}
+	log        *slog.Logger
 
 	// LocalAgent surface (process_manager_agent.go)
 	events       eventHub
@@ -113,14 +114,66 @@ type ProcessManager struct {
 	countersOnce sync.Once
 }
 
-func NewProcessManager(cfg *config.Config) *ProcessManager {
+// ProcessManagerOptions configures a ProcessManager independent of the
+// gateway's env-derived config, so the same manager embeds in the standalone
+// agentd (docs/AGENT-ARCHITECTURE.md Horizon B) and in tests with a fake
+// catalog. The default constructor below builds today's single-box catalog
+// and delegates here.
+type ProcessManagerOptions struct {
+	Services   []ServiceDef // the catalog; empty = manage nothing (agentd M3 default)
+	LogDir     string       // default ~/.local/log/cluster
+	PidDir     string       // default ~/.local/run/match
+	ProjectDir string       // backup-node state root; empty disables backup cleanup
+}
+
+// NewProcessManagerWith builds a ProcessManager from explicit options,
+// adopts already-running processes from PID files, and starts the metrics
+// poller. Behavior is identical to NewProcessManager for the same catalog.
+func NewProcessManagerWith(opts ProcessManagerOptions) *ProcessManager {
 	logger := logging.Component("pm")
 	homeDir, _ := os.UserHomeDir()
-	logDir := filepath.Join(homeDir, ".local/log/cluster")
-	pidDir := filepath.Join(homeDir, ".local/run/match")
-
+	logDir := opts.LogDir
+	if logDir == "" {
+		logDir = filepath.Join(homeDir, ".local/log/cluster")
+	}
+	pidDir := opts.PidDir
+	if pidDir == "" {
+		pidDir = filepath.Join(homeDir, ".local/run/match")
+	}
 	os.MkdirAll(logDir, 0755)
 	os.MkdirAll(pidDir, 0755)
+
+	pm := &ProcessManager{
+		logDir:     logDir,
+		pidDir:     pidDir,
+		projectDir: opts.ProjectDir,
+		procs:      make(map[string]*managedProcess),
+		services:   opts.Services,
+		stopChan:   make(chan struct{}),
+		log:        logger,
+	}
+
+	// Initialize process state for each service
+	for _, def := range pm.services {
+		pm.procs[def.Name] = &managedProcess{
+			status: "stopped",
+		}
+	}
+
+	// Adopt any already-running processes (from PID files)
+	pm.adoptExisting()
+
+	// Start background metrics poller
+	go pm.backgroundPoller()
+
+	return pm
+}
+
+// NewProcessManager builds the single-box catalog (drivers, nodes, backup,
+// gateways, sim) from the gateway config. The catalog construction is the
+// only config-dependent part; everything else lives in NewProcessManagerWith.
+func NewProcessManager(cfg *config.Config) *ProcessManager {
+	logger := logging.Component("pm")
 
 	javaBase := []string{
 		"/usr/bin/java",
@@ -355,30 +408,10 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 		logger.Info("engine driver mode: embedded")
 	}
 
-	pm := &ProcessManager{
-		cfg:      cfg,
-		logDir:   logDir,
-		pidDir:   pidDir,
-		procs:    make(map[string]*managedProcess),
-		services: services,
-		stopChan: make(chan struct{}),
-		log:      logger,
-	}
-
-	// Initialize process state for each service
-	for _, def := range pm.services {
-		pm.procs[def.Name] = &managedProcess{
-			status: "stopped",
-		}
-	}
-
-	// Adopt any already-running processes (from PID files)
-	pm.adoptExisting()
-
-	// Start background metrics poller
-	go pm.backgroundPoller()
-
-	return pm
+	return NewProcessManagerWith(ProcessManagerOptions{
+		Services:   services,
+		ProjectDir: cfg.ProjectDir,
+	})
 }
 
 func (pm *ProcessManager) Shutdown() {
@@ -568,7 +601,7 @@ func (pm *ProcessManager) StartAll() []ActionResult {
 			result.Error = err.Error()
 		}
 		results = append(results, result)
-		time.Sleep(2 * time.Second) // stagger starts
+		time.Sleep(startStagger)
 	}
 
 	return results
@@ -1344,8 +1377,8 @@ func (pm *ProcessManager) cleanStaleAeronState(name string) {
 
 	// Backup node — its state lives on DISK under ProjectDir/backup (match#36/#9),
 	// NOT the old /dev/shm/aeron-cluster/backup (that dir was never used by the app)
-	if name == "backup" {
-		backupDir := filepath.Join(pm.cfg.ProjectDir, "backup")
+	if name == "backup" && pm.projectDir != "" {
+		backupDir := filepath.Join(pm.projectDir, "backup")
 		patterns := []string{
 			backupDir + "/cluster/cluster-mark*.dat",
 			backupDir + "/cluster/*.lck",
