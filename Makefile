@@ -16,7 +16,7 @@ build:
 # Regenerate agentwire/*.pb.go from agentwire/agent.proto. Pure-Go toolchain
 # (buf compiles the proto; no C++ protoc). Generated code is COMMITTED — CI
 # and normal builds never run this.
-PROTOC_GEN_GO_VERSION      := v1.36.6
+PROTOC_GEN_GO_VERSION      := v1.36.10
 PROTOC_GEN_GO_GRPC_VERSION := v1.5.1
 BUF_VERSION                := v1.50.0
 TOOLS_DIR := $(ADMIN_GATEWAY_DIR)/.tools

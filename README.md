@@ -19,7 +19,7 @@ Operational procedures live in [docs/RUNBOOKS.md](docs/RUNBOOKS.md).
 
 ## Tech Stack
 
-- **Go 1.23**
+- **Go 1.25**
 - **chi** — HTTP routing
 - Runs as a systemd user service
 
@@ -27,7 +27,7 @@ Operational procedures live in [docs/RUNBOOKS.md](docs/RUNBOOKS.md).
 
 ### Prerequisites
 
-- Go 1.23+ (pinned in `go.mod`)
+- Go 1.25+ (pinned in `go.mod`)
 - Running Aeron Cluster (match engine)
 
 ### Build & Run
