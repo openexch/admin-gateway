@@ -1,4 +1,4 @@
-.PHONY: build run clean install uninstall reinstall rebuild processes processes-summary help proto
+.PHONY: build build-agentd run clean install uninstall reinstall rebuild processes processes-summary help proto loopback
 
 # ==================== CONFIGURATION ====================
 ADMIN_GATEWAY_DIR := $(shell pwd)
@@ -12,6 +12,14 @@ LOG_ROTATE = /bin/bash -c '"'"'test -f $(LOG_DIR)/$(1).log && mv $(LOG_DIR)/$(1)
 
 build:
 	go build -o admin-gateway .
+
+build-agentd:
+	go build -o agentd-bin ./cmd/agentd
+
+# End-to-end smoke of the REAL agentd binary against a TCP hub (the
+# in-process loopback parity tests run in plain `go test ./...`).
+loopback:
+	go test -tags loopback ./agenthub/ -run TestAgentdBinarySmoke -v
 
 # Regenerate agentwire/*.pb.go from agentwire/agent.proto. Pure-Go toolchain
 # (buf compiles the proto; no C++ protoc). Generated code is COMMITTED — CI

@@ -17,6 +17,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   demand via `GET /api/admin/preflight`. Knobs: `ADMIN_MIN_MEM_MB`,
   `ADMIN_MIN_ROOT_DISK_GB`, `ADMIN_MAX_SHM_USED_PCT`.
 
+### Added (agentd milestone — Horizon B step 3)
+- The gateway↔agentd wire protocol (`agentwire/agent.proto`): control plane
+  as the single gRPC server, agents dial in over one persistent session,
+  correlated command/result envelopes, artifact bytes pulled over a separate
+  stream, static-token auth, versioned handshake.
+- `agenthub` (session registry + `RemoteAgent`) and `agentd`/`cmd/agentd`
+  (the per-host daemon, empty catalog until topology). Loopback parity is
+  tested: the remote pair passes the identical `agent/agenttest` conformance
+  suite as the in-process LocalAgent, plus a real-binary TCP smoke in CI
+  (`make loopback`). Zero behavior change on existing deployments.
+
 ### Added (observability)
 - `GET /api/admin/events`: Server-Sent Events stream of agent lifecycle
   events (started/stopped/crashed/cascade-stop/disarmed/adopted) and

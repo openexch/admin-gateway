@@ -198,11 +198,18 @@ Apache-licensed with the core; the hosted control plane is the paid part.
 
 ## Sequencing
 
-1. (This release) `agent` package + `ProcessManager` implements it +
+1. ✅ (shipped, #38) `agent` package + `ProcessManager` implements it +
    consumers switch to the interface. Behavior-preserving; single box only.
-2. (This release) rebuild-admin #36 fix: failure records persisted, build
+2. ✅ (shipped, #39) rebuild-admin #36 fix: failure records persisted, build
    env pinned.
-3. (Next) `agentd` binary + gRPC protocol + loopback CI mode.
-4. (Next) topology.yaml + host profiles + derived cluster addresses.
+3. ✅ (shipped, 2026-07-06) `agentd` binary + gRPC protocol + loopback CI
+   mode: `agentwire/` (versioned proto, control plane is the server, agents
+   dial in, artifacts pull over a separate stream), `agenthub/` (session
+   registry + RemoteAgent), `agentd/` + `cmd/agentd` (empty catalog until
+   topology). Parity = the LocalAgent's conformance suite over the wire +
+   the real-binary TCP smoke in CI. See docs/AGENTD.md.
+4. (Next) topology.yaml + host profiles + derived cluster addresses; agent
+   catalogs move from the builtin Go catalog to per-host topology; Enroll
+   (join token → embedded-CA client cert) and mTLS-required mode.
 5. (Next) migrate the backup node to a second host as the first real
    multi-host deployment.

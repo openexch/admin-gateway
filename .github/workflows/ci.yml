@@ -31,6 +31,11 @@ jobs:
       - name: Test
         run: go test ./...
 
+      # The shipped agentd binary against a real TCP hub (the in-process
+      # loopback parity suite already ran in `go test ./...` above).
+      - name: Agentd binary smoke
+        run: go test -tags loopback ./agenthub/ -run TestAgentdBinarySmoke
+
   # Dependency CVEs + committed secrets (admin-gateway#12 / P3.2), same job as the
   # match repo's CI. Trivy covers both on a private repo without GitHub Advanced
   # Security; triaged findings go in .trivyignore. govulncheck adds call-graph-aware
