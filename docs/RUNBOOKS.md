@@ -303,3 +303,32 @@ curl $ADMIN/api/admin/rebuild-status
   `systemctl --user restart admin`.
 
 `GET /api/admin/status` also surfaces `lastRebuild` with the same fields.
+
+---
+
+## 8. Rebuilds (cluster / gateway / oms modules)
+
+All module rebuilds run the same pattern: rsync the source tree to an
+isolated `/tmp` build dir (excluding `*/target`), run a **niced**
+module-scoped `mvn package` there, copy the jar to staging, and install it
+over the live jar with a sha256-verified atomic swap. The live tree's
+`target/` directories are never touched by a build.
+
+**Never run `mvn` by hand in the live tree while services are running.**
+`clean` and `-am` rebuild upstream modules in place — that deleted the
+running cluster jar out from under all three nodes on 2026-07-06 (#45) and
+cost a 10-minute full outage when the crash-loop cap disarmed.
+
+| Endpoint | Builds | Installs to | Restarts |
+|---|---|---|---|
+| `POST /api/admin/rebuild-cluster` | `match-cluster` | staging only (deploy via rolling-update) | nothing |
+| `POST /api/admin/rebuild-gateway` `{restart}` | `match-gateway` | live gateway jar | `market` (when `restart:true`) |
+| `POST /api/admin/rebuild-admin` | admin gateway binary | atomic binary swap | `admin` unit (self) |
+
+Rebuilds are pre-flight gated on memory and disk (`{"force":true}`
+overrides). Build niceness is `ADMIN_BUILD_NICE` (default 10).
+
+If a service was restarted while its artifact was missing (rebuild in
+flight/failed), the start is REFUSED with "artifact missing" instead of
+crash-looping into disarm: re-run the rebuild, then start the service
+explicitly.

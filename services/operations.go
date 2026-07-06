@@ -32,10 +32,15 @@ type OperationsService struct {
 	statusSvc     *StatusService
 	preflight     *Preflight
 	log           *slog.Logger
+
+	// execBuild runs one staged-build step (rsync/mvn) and returns its
+	// combined output. Injectable so op-level tests can record the commands
+	// and assert builds never execute in the live tree (#45).
+	execBuild func(dir string, argv ...string) ([]byte, error)
 }
 
 func NewOperationsService(cfg *config.Config, systemd *Systemd, cluster *Cluster, progress *Progress, status *ClusterStatus) *OperationsService {
-	return &OperationsService{
+	o := &OperationsService{
 		cfg:           cfg,
 		systemd:       systemd,
 		cluster:       cluster,
@@ -43,6 +48,10 @@ func NewOperationsService(cfg *config.Config, systemd *Systemd, cluster *Cluster
 		clusterStatus: status,
 		log:           logging.Component("ops"),
 	}
+	o.execBuild = func(dir string, argv ...string) ([]byte, error) {
+		return o.buildCmd(dir, argv...).CombinedOutput()
+	}
+	return o
 }
 
 // SetProcessManager injects the process agent (avoids circular init)
@@ -252,11 +261,14 @@ func summarizeNodeStates(nodes []map[string]interface{}) string {
 		strings.Join(parts, " "), healthy, len(nodes), quorum)
 }
 
-// stageClusterJar builds match-cluster in an isolated copy of the project
-// tree and copies the result into staging. No shell involved: every step is
-// an arg-vector exec or a direct filesystem call (admin-gateway#11). The
-// temp build dir is removed on every exit path.
-func (o *OperationsService) stageClusterJar(tempBuildDir, stagingDir, stagingJar string) error {
+// stageModuleJar builds one maven module in an isolated copy of srcDir and
+// copies the built jar to stagingJar. The live tree is never touched: mvn
+// (whose clean/-am phases rebuild upstream modules too) runs only inside the
+// rsync'd temp tree — running it against the live tree is how rebuild-gateway
+// deleted the running cluster jar out from under the nodes on 2026-07-06
+// (#45). No shell involved: arg-vector execs and direct filesystem calls
+// only (admin-gateway#11). The temp build dir is removed on every exit path.
+func (o *OperationsService) stageModuleJar(srcDir, module, builtJarRel, tempBuildDir, stagingJar string) error {
 	if err := os.RemoveAll(tempBuildDir); err != nil {
 		return fmt.Errorf("clean temp build dir: %w", err)
 	}
@@ -264,25 +276,29 @@ func (o *OperationsService) stageClusterJar(tempBuildDir, stagingDir, stagingJar
 		return fmt.Errorf("create temp build dir: %w", err)
 	}
 	defer os.RemoveAll(tempBuildDir)
-	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(stagingJar), 0o755); err != nil {
 		return fmt.Errorf("create staging dir: %w", err)
 	}
-	rsync := o.buildCmd("", "rsync", "-a",
+	if output, err := o.execBuild("", "rsync", "-a",
 		"--exclude=*/target", "--exclude=.git", "--exclude=admin-gateway",
 		"--exclude=backup", "--exclude=binaries", "--exclude=binance-replay",
-		o.cfg.ProjectDir+"/", tempBuildDir+"/")
-	if output, err := rsync.CombinedOutput(); err != nil {
+		srcDir+"/", tempBuildDir+"/"); err != nil {
 		return fmt.Errorf("rsync: %v: %s", err, output)
 	}
-	mvn := o.buildCmd(tempBuildDir, "mvn", "package", "-pl", "match-cluster", "-am", "-DskipTests", "-q")
-	if output, err := mvn.CombinedOutput(); err != nil {
+	if output, err := o.execBuild(tempBuildDir,
+		"mvn", "package", "-pl", module, "-am", "-DskipTests", "-q"); err != nil {
 		return fmt.Errorf("mvn: %v: %s", err, output)
 	}
-	cp := exec.Command("cp", filepath.Join(tempBuildDir, "match-cluster/target/match-cluster.jar"), stagingJar)
-	if output, err := cp.CombinedOutput(); err != nil {
-		return fmt.Errorf("copy staged jar: %v: %s", err, output)
+	if err := copyFile(filepath.Join(tempBuildDir, builtJarRel), stagingJar); err != nil {
+		return fmt.Errorf("copy staged jar: %w", err)
 	}
 	return nil
+}
+
+// stageClusterJar stages the cluster module (rolling-update, rebuild-cluster).
+func (o *OperationsService) stageClusterJar(tempBuildDir, stagingJar string) error {
+	return o.stageModuleJar(o.cfg.ProjectDir, "match-cluster",
+		"match-cluster/target/match-cluster.jar", tempBuildDir, stagingJar)
 }
 
 func (o *OperationsService) doRollingUpdate() {
@@ -297,7 +313,7 @@ func (o *OperationsService) doRollingUpdate() {
 	buildId := fmt.Sprintf("%d", time.Now().UnixMilli())
 	tempBuildDir := "/tmp/match-rolling-build-" + buildId
 
-	if err := o.stageClusterJar(tempBuildDir, stagingDir, stagingJar); err != nil {
+	if err := o.stageClusterJar(tempBuildDir, stagingJar); err != nil {
 		o.progress.Finish(false, "Build failed: "+err.Error())
 		return
 	}
@@ -709,7 +725,7 @@ func (o *OperationsService) doHousekeeping() {
 
 // RebuildGateway builds the gateway module and optionally restarts gateways.
 // This is SAFE while the cluster is running since gateway JAR is separate from cluster JAR.
-func (o *OperationsService) RebuildGateway(restart bool) error {
+func (o *OperationsService) RebuildGateway(restart, force bool) error {
 	totalSteps := 2
 	if restart {
 		totalSteps = 3
@@ -717,49 +733,61 @@ func (o *OperationsService) RebuildGateway(restart bool) error {
 	if !o.progress.TryStart("rebuild-gateway", totalSteps) {
 		return fmt.Errorf("another operation in progress")
 	}
+	if err := o.gate("rebuild-gateway", force); err != nil {
+		return err
+	}
 
 	go o.doRebuildGateway(restart)
 	return nil
 }
 
 func (o *OperationsService) doRebuildGateway(restart bool) {
-	// Step 1: Build gateway module (safe - separate JAR from cluster)
-	o.progress.Update(1, "Building gateway module...")
-	cmd := o.buildCmd(o.cfg.ProjectDir, "mvn", "package", "-pl", "match-gateway", "-am", "-DskipTests", "-q")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		o.progress.Finish(false, "Gateway build failed: "+err.Error()+" output: "+string(output))
+	stagingJar := filepath.Join(o.cfg.ProjectDir, "match-gateway/target/staging/match-gateway.jar")
+
+	// Step 1: Build in an isolated tree — NEVER mvn against the live tree.
+	// The old in-place build's clean/-am phases rebuilt upstream modules and
+	// deleted match-cluster/target/ out from under the running nodes; the
+	// next restart crash-looped into disarm and took the cluster down for 10
+	// minutes on 2026-07-06 (#45).
+	o.progress.Update(1, "Building gateway module in isolated directory...")
+	tempBuildDir := fmt.Sprintf("/tmp/match-gateway-build-%d", time.Now().UnixMilli())
+	if err := o.stageModuleJar(o.cfg.ProjectDir, "match-gateway",
+		"match-gateway/target/match-gateway.jar", tempBuildDir, stagingJar); err != nil {
+		o.progress.Finish(false, "Gateway build failed: "+err.Error())
 		return
 	}
 
-	// Step 2: Verify JAR exists
-	o.progress.Update(2, "Verifying gateway JAR...")
-	if _, err := os.Stat(o.cfg.GatewayJar); os.IsNotExist(err) {
-		o.progress.Finish(false, "Build succeeded but JAR not found at: "+o.cfg.GatewayJar)
+	// Step 2: Install the staged jar over the live one (sha-verified, atomic).
+	o.progress.Update(2, "Installing gateway JAR...")
+	if err := o.installStagedJar(stagingJar, o.cfg.GatewayJar); err != nil {
+		o.progress.Finish(false, "Gateway JAR install failed: "+err.Error())
 		return
 	}
 
 	if !restart {
-		o.progress.Finish(true, "Gateway JAR rebuilt successfully")
+		o.progress.Finish(true, "Gateway JAR rebuilt and installed")
 		return
 	}
 
-	// Step 3: Restart gateways (oms + market, not admin since we'd kill ourselves)
-	o.progress.Update(3, "Restarting OMS & market gateways...")
-	for _, svc := range []string{"oms", "market"} {
-		o.restartService(svc)
-	}
+	// Step 3: Restart the market gateway — the only service running this jar.
+	// (oms runs oms-app.jar from the OMS repo; restarting it here never picked
+	// up new code and was dropped — use rebuild-oms for that.)
+	o.progress.Update(3, "Restarting market gateway...")
+	o.restartService("market")
 	time.Sleep(3 * time.Second)
 
-	o.progress.Finish(true, "Gateway rebuilt and restarted successfully")
+	o.progress.Finish(true, "Gateway rebuilt, installed and market gateway restarted")
 }
 
 // RebuildCluster builds the cluster module to staging (does NOT deploy).
 // WARNING: The built JAR goes to staging, NOT the live location.
 // Use rolling-update to deploy, or manually swap the JAR.
-func (o *OperationsService) RebuildCluster() error {
+func (o *OperationsService) RebuildCluster(force bool) error {
 	if !o.progress.TryStart("rebuild-cluster", 3) {
 		return fmt.Errorf("another operation in progress")
+	}
+	if err := o.gate("rebuild-cluster", force); err != nil {
+		return err
 	}
 
 	go o.doRebuildCluster()
@@ -775,7 +803,7 @@ func (o *OperationsService) doRebuildCluster() {
 	buildId := fmt.Sprintf("%d", time.Now().UnixMilli())
 	tempBuildDir := "/tmp/match-cluster-build-" + buildId
 
-	if err := o.stageClusterJar(tempBuildDir, stagingDir, stagingJar); err != nil {
+	if err := o.stageClusterJar(tempBuildDir, stagingJar); err != nil {
 		o.progress.Finish(false, "Cluster build failed: "+err.Error())
 		return
 	}
