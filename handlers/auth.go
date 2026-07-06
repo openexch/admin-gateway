@@ -26,6 +26,16 @@ func AuthMiddleware(token string) func(http.Handler) http.Handler {
 				next.ServeHTTP(w, r)
 				return
 			}
+			// The events stream is consumed by browser EventSource, which
+			// cannot set headers; accept ?token= on that path ONLY. The
+			// request logger records r.URL.Path without the query string, so
+			// the token never reaches the logs; production deployments keep
+			// injecting the Authorization header at the reverse proxy.
+			if r.URL.Path == "/api/admin/events" &&
+				subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("token")), []byte(token)) == 1 {
+				next.ServeHTTP(w, r)
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			w.WriteHeader(http.StatusUnauthorized)

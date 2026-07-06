@@ -71,6 +71,7 @@ logged).
 | `GET` | `/api/admin/status` | Cluster status (includes pre-flight invariants) |
 | `GET` | `/api/admin/progress` | Operation progress |
 | `GET` | `/api/admin/preflight` | Run all pre-flight invariant checks (report only, never a gate) |
+| `GET` | `/api/admin/events` | SSE: process lifecycle events + operation progress (browser `EventSource` may pass `?token=`) |
 | `GET` | `/api/admin/logs?node=0&lines=100` | Service logs |
 | `GET` | `/health` | Health check |
 | `GET` | `/metrics` | Prometheus metrics (auth-exempt, for the local scraper) |
