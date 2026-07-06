@@ -2,6 +2,7 @@
 package main
 
 import (
+	"net"
 	"strings"
 	"testing"
 
@@ -9,22 +10,25 @@ import (
 )
 
 func TestStartAgentHubLoopbackNoTokenAllowed(t *testing.T) {
-	srv, err := startAgentHub(&config.Config{AgentListen: "127.0.0.1:0"})
+	cfg := &config.Config{AgentListen: "127.0.0.1:0"}
+	if err := validateAgentListen(cfg); err != nil {
+		t.Fatalf("loopback tokenless config should validate (dev mode), got %v", err)
+	}
+	srv, err := startAgentHub(cfg)
 	if err != nil {
-		t.Fatalf("loopback tokenless listener should start (dev mode), got %v", err)
+		t.Fatalf("loopback tokenless listener should start, got %v", err)
 	}
 	srv.Stop()
 }
 
-func TestStartAgentHubNonLoopbackRefusedWithoutTokenAndTLS(t *testing.T) {
+func TestValidateNonLoopbackRefusedWithoutTokenAndTLS(t *testing.T) {
 	cases := []config.Config{
 		{AgentListen: "0.0.0.0:0"},                                          // neither
 		{AgentListen: "0.0.0.0:0", AgentToken: "t"},                         // token only
 		{AgentListen: "0.0.0.0:0", AgentTLSCert: "/x.pem", AgentTLSKey: ""}, // cert only
 	}
 	for _, cfg := range cases {
-		if srv, err := startAgentHub(&cfg); err == nil {
-			srv.Stop()
+		if err := validateAgentListen(&cfg); err == nil {
 			t.Fatalf("non-loopback listener must refuse without token+TLS: %+v", cfg)
 		} else if !strings.Contains(err.Error(), "refusing") && !strings.Contains(err.Error(), "TLS") {
 			t.Fatalf("unexpected refusal error: %v", err)
@@ -32,9 +36,24 @@ func TestStartAgentHubNonLoopbackRefusedWithoutTokenAndTLS(t *testing.T) {
 	}
 }
 
-func TestStartAgentHubBadAddress(t *testing.T) {
-	if srv, err := startAgentHub(&config.Config{AgentListen: "not-an-addr"}); err == nil {
-		srv.Stop()
+func TestValidateBadAddress(t *testing.T) {
+	if err := validateAgentListen(&config.Config{AgentListen: "not-an-addr"}); err == nil {
 		t.Fatal("malformed listen address must error")
+	}
+}
+
+// The first live drill's lesson: a taken port must surface as a returnable
+// operational error (main degrades without the hub), never a crash-loop of
+// the process manager.
+func TestStartAgentHubPortConflictIsReturnedNotFatal(t *testing.T) {
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+
+	_, err = startAgentHub(&config.Config{AgentListen: taken.Addr().String()})
+	if err == nil || !strings.Contains(err.Error(), "address already in use") {
+		t.Fatalf("expected a bind-conflict error, got %v", err)
 	}
 }
