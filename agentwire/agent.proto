@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// The gateway↔agentd wire protocol (docs/AGENT-ARCHITECTURE.md, Horizon B).
+// The CONTROL PLANE is the single gRPC server; agentd is a pure client that
+// dials in (no listener on engine hosts, NAT-friendly). Control→agent
+// commands flow as correlated request/response envelopes over one persistent
+// bidirectional Session stream. Bulk artifact bytes never ride the session:
+// the agent pulls them back over FetchArtifact on a separate HTTP/2 stream
+// of the same connection.
+//
+// Compatibility rules: field numbers are forever; new verbs/payloads are
+// additive oneof cases; an agent answering an unknown verb sets
+// CommandResult.unsupported. This protocol is the product boundary for the
+// managed-deployments layer — evolve it like a public API.
+
+syntax = "proto3";
+
+package openexchange.agent.v1;
+
+option go_package = "github.com/match/admin-gateway/agentwire";
+
+service ControlPlane {
+  // One persistent session per agent. First agent message MUST be Hello;
+  // the control plane answers HelloAck, then the agent sends a full
+  // StateSnapshot, replays buffered events, and serves commands.
+  rpc Session(stream AgentMessage) returns (stream ControlMessage);
+
+  // Agent-initiated pull of artifact bytes referenced by an InstallArtifact
+  // command (chunked; separate HTTP/2 stream, no head-of-line blocking).
+  rpc FetchArtifact(FetchArtifactRequest) returns (stream ArtifactChunk);
+
+  // Milestone 4+: join-token -> embedded-CA-issued client certificate.
+  // Declared now to freeze the wire surface; returns UNIMPLEMENTED.
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+}
+
+// ---- session envelopes ----
+
+message AgentMessage {
+  oneof msg {
+    Hello hello            = 1;
+    StateSnapshot snapshot = 2;
+    CommandResult result   = 3;
+    Event event            = 4; // unsolicited lifecycle events
+  }
+}
+
+message ControlMessage {
+  oneof msg {
+    HelloAck hello_ack = 1;
+    Command command    = 2;
+    // 3 reserved: DesiredState document (milestone 4)
+  }
+  reserved 3;
+}
+
+message Hello {
+  string host_id       = 1;
+  string agent_version = 2;
+  uint32 proto_version = 3; // bump on incompatible envelope changes
+}
+
+message HelloAck {
+  bool accepted  = 1;
+  string reason  = 2; // when rejected (version mismatch, duplicate host displaced, ...)
+}
+
+// Full process-state snapshot, sent after Hello and on control-plane request.
+message StateSnapshot {
+  repeated ProcessInfo processes = 1;
+}
+
+// ---- commands (control plane -> agent) ----
+
+message Command {
+  uint64 id = 1; // correlation id, unique per session
+  oneof verb {
+    ListRequest list                  = 10;
+    GetRequest get                    = 11;
+    SummaryRequest summary            = 12;
+    StartRequest start                = 13;
+    StopRequest stop                  = 14;
+    RestartRequest restart            = 15;
+    BulkRequest bulk                  = 16;
+    TailLogRequest tail_log           = 17;
+    NodeCountersRequest node_counters = 18;
+    InstallArtifactRequest install    = 19;
+    // future (additive): cluster_tool_op, archive_info, clean_node,
+    // stage_artifact, activate_artifact, follow_log
+  }
+}
+
+message ListRequest {}
+message GetRequest { string name = 1; }
+message SummaryRequest {}
+message StartRequest {
+  string name    = 1;
+  bool unchecked = 2; // StartUnchecked: caller sequenced the dependencies
+}
+message StopRequest {
+  string name = 1;
+  bool force  = 2; // ForceStop: bypass reverse-dependency check
+}
+message RestartRequest { string name = 1; }
+
+message BulkRequest {
+  enum Op {
+    OP_UNSPECIFIED = 0;
+    START_ALL      = 1;
+    STOP_ALL       = 2;
+    RESTART_ALL    = 3;
+  }
+  Op op = 1;
+}
+
+message TailLogRequest {
+  string service = 1;
+  int32 lines    = 2;
+}
+
+message NodeCountersRequest { int32 node_id = 1; }
+
+// The artifact bytes are NOT here: the agent calls FetchArtifact(transfer_id)
+// back on the same connection and streams them into its local temp-file →
+// sha-verify → atomic-rename install.
+message InstallArtifactRequest {
+  string transfer_id = 1; // single-use handle registered control-plane-side
+  string dest_path   = 2;
+  string sha256      = 3; // hex; empty skips verification (discouraged)
+  uint32 mode        = 4; // unix permission bits; 0 = default 0644
+  int64 size         = 5; // advisory, for progress reporting
+}
+
+// ---- command results (agent -> control plane) ----
+
+message CommandResult {
+  uint64 id        = 1; // matches Command.id
+  string error     = 2; // empty = success
+  bool unsupported = 3; // agent did not recognize the verb (older agent)
+  oneof payload {
+    ProcessList list       = 10;
+    GetResponse get        = 11;
+    Summary summary        = 12;
+    ActionResults results  = 13;
+    LogLines log           = 14;
+    CounterData counters   = 15;
+  }
+}
+
+message ProcessList { repeated ProcessInfo processes = 1; }
+
+message GetResponse {
+  bool found       = 1; // Get returns nil for unknown services
+  ProcessInfo info = 2;
+}
+
+message Summary {
+  int32 total           = 1;
+  int32 running         = 2;
+  int32 stopped         = 3;
+  int32 failed          = 4;
+  int64 total_memory_mb = 5;
+  map<string, string> failed_services = 6; // name -> lastError
+}
+
+message ActionResults { repeated ActionResult results = 1; }
+
+message LogLines { repeated string lines = 1; }
+
+// ---- data types (mirror package agent; JSON stability lives there) ----
+
+message ProcessInfo {
+  string name        = 1;
+  string display     = 2;
+  string role        = 3; // cluster | gateway | infra
+  int32 port         = 4;
+  bool running       = 5;
+  int32 pid          = 6;
+  int64 memory_bytes = 7;
+  double cpu_percent = 8;
+  int64 uptime_ms    = 9;
+  string started_at  = 10; // RFC3339, empty when stopped
+  int32 restart_count = 11;
+  bool enabled       = 12;
+  string status      = 13;
+  string last_error  = 14;
+}
+
+message ActionResult {
+  string service = 1;
+  string action  = 2;
+  bool success   = 3;
+  string error   = 4;
+}
+
+message CounterData {
+  int64 commit_position = 1;
+  int64 snapshot_count  = 2;
+  int64 node_role       = 3;
+}
+
+message Event {
+  string type       = 1; // started|stopped|crashed|cascade-stop|disarmed|adopted
+  string service    = 2;
+  int32 pid         = 3;
+  string detail     = 4;
+  int64 at_unix_ms  = 5;
+}
+
+// ---- artifact pull ----
+
+message FetchArtifactRequest { string transfer_id = 1; }
+
+message ArtifactChunk { bytes data = 1; } // 256KB chunks
+
+// ---- enrollment (milestone 4+) ----
+
+message EnrollRequest {
+  string join_token = 1;
+  string host_id    = 2;
+}
+
+message EnrollResponse {
+  bytes client_cert_pem = 1;
+  bytes client_key_pem  = 2;
+  bytes ca_pem          = 3;
+}

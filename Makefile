@@ -1,4 +1,4 @@
-.PHONY: build run clean install uninstall reinstall rebuild processes processes-summary help
+.PHONY: build run clean install uninstall reinstall rebuild processes processes-summary help proto
 
 # ==================== CONFIGURATION ====================
 ADMIN_GATEWAY_DIR := $(shell pwd)
@@ -12,6 +12,19 @@ LOG_ROTATE = /bin/bash -c '"'"'test -f $(LOG_DIR)/$(1).log && mv $(LOG_DIR)/$(1)
 
 build:
 	go build -o admin-gateway .
+
+# Regenerate agentwire/*.pb.go from agentwire/agent.proto. Pure-Go toolchain
+# (buf compiles the proto; no C++ protoc). Generated code is COMMITTED — CI
+# and normal builds never run this.
+PROTOC_GEN_GO_VERSION      := v1.36.6
+PROTOC_GEN_GO_GRPC_VERSION := v1.5.1
+BUF_VERSION                := v1.50.0
+TOOLS_DIR := $(ADMIN_GATEWAY_DIR)/.tools
+
+proto:
+	GOBIN=$(TOOLS_DIR) go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	GOBIN=$(TOOLS_DIR) go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
+	go run github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION) generate --path agentwire/agent.proto
 
 run: build
 	./admin-gateway
