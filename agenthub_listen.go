@@ -15,21 +15,29 @@ import (
 	"github.com/match/admin-gateway/config"
 )
 
-// startAgentHub serves the agent hub on cfg.AgentListen. Nothing in the
-// gateway consumes remote agents yet (handlers keep the in-process
-// LocalAgent until topology, milestone 4) — this listener exists for the
-// loopback pair and for early multi-host experiments.
-func startAgentHub(cfg *config.Config) (*grpc.Server, error) {
+// validateAgentListen enforces the security matrix for the agent listener.
+// A violation here is a misconfiguration the gateway must refuse to start
+// with (fail fast, same stance as the HTTP bind rule).
+func validateAgentListen(cfg *config.Config) error {
 	host, _, err := net.SplitHostPort(cfg.AgentListen)
 	if err != nil {
-		return nil, fmt.Errorf("ADMIN_AGENT_LISTEN %q: %w", cfg.AgentListen, err)
+		return fmt.Errorf("ADMIN_AGENT_LISTEN %q: %w", cfg.AgentListen, err)
 	}
 	ip := net.ParseIP(host)
-	loopback := ip != nil && ip.IsLoopback()
-	if !loopback && (cfg.AgentToken == "" || cfg.AgentTLSCert == "") {
-		return nil, fmt.Errorf("refusing a non-loopback agent listener without both ADMIN_AGENT_TOKEN(_FILE) and ADMIN_AGENT_TLS_CERT/KEY")
+	if loopback := ip != nil && ip.IsLoopback(); !loopback && (cfg.AgentToken == "" || cfg.AgentTLSCert == "") {
+		return fmt.Errorf("refusing a non-loopback agent listener without both ADMIN_AGENT_TOKEN(_FILE) and ADMIN_AGENT_TLS_CERT/KEY")
 	}
+	return nil
+}
 
+// startAgentHub serves the agent hub on cfg.AgentListen (validate first).
+// Nothing in the gateway consumes remote agents yet (handlers keep the
+// in-process LocalAgent until topology, milestone 4) — this listener exists
+// for the loopback pair and for early multi-host experiments. Errors here
+// are OPERATIONAL (port conflicts): callers degrade without the hub instead
+// of dying — the gateway's primary job is managing the cluster, and a taken
+// port crash-looped the whole process manager in the first live drill.
+func startAgentHub(cfg *config.Config) (*grpc.Server, error) {
 	hub := agenthub.NewHub(cfg.AgentToken)
 	serverOpts := hub.ServerOptions()
 	if cfg.AgentTLSCert != "" {

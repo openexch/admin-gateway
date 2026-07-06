@@ -78,16 +78,20 @@ func main() {
 
 	// Opt-in agent hub (docs/AGENTD.md): with ADMIN_AGENT_LISTEN unset the
 	// hub is never constructed and the gateway is byte-identical to
-	// pre-agentd builds. Same secure-by-default rule as the HTTP API, plus
-	// TLS: agent sessions drive process lifecycle, so a non-loopback
-	// listener refuses to start without BOTH a token and TLS.
+	// pre-agentd builds. Security misconfiguration (non-loopback without
+	// token+TLS) fails fast like the HTTP bind rule; OPERATIONAL failures
+	// (port conflicts) only disable the hub — the gateway's primary job is
+	// managing the cluster and must not crash-loop over an optional listener.
 	if cfg.AgentListen != "" {
-		agentSrv, err := startAgentHub(cfg)
-		if err != nil {
-			slog.Error("agent hub failed to start", "err", err)
+		if err := validateAgentListen(cfg); err != nil {
+			slog.Error("agent hub misconfigured", "err", err)
 			os.Exit(1)
 		}
-		defer agentSrv.Stop()
+		if agentSrv, err := startAgentHub(cfg); err != nil {
+			slog.Error("agent hub disabled (operational failure)", "err", err)
+		} else {
+			defer agentSrv.Stop()
+		}
 	}
 
 	// Start server
