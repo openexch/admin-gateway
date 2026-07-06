@@ -17,6 +17,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   demand via `GET /api/admin/preflight`. Knobs: `ADMIN_MIN_MEM_MB`,
   `ADMIN_MIN_ROOT_DISK_GB`, `ADMIN_MAX_SHM_USED_PCT`.
 
+### Added (rebuild-oms)
+- `POST /api/admin/rebuild-oms {restart, force}`: staged isolated-tree build
+  of the OMS uber-jar with sha-verified atomic install — replaces the manual
+  build-and-copy flow, and completes the honesty fix where rebuild-gateway
+  used to restart oms without building its code.
+
 ### Fixed
 - rebuild-gateway builds in an isolated rsync'd tree and installs the jar
   via the sha-verified atomic artifact swap (#45) — mvn (whose clean/-am

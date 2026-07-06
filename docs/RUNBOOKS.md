@@ -323,10 +323,15 @@ cost a 10-minute full outage when the crash-loop cap disarmed.
 |---|---|---|---|
 | `POST /api/admin/rebuild-cluster` | `match-cluster` | staging only (deploy via rolling-update) | nothing |
 | `POST /api/admin/rebuild-gateway` `{restart}` | `match-gateway` | live gateway jar | `market` (when `restart:true`) |
+| `POST /api/admin/rebuild-oms` `{restart}` | `oms-app` (OMS repo) | live oms jar | `oms` (when `restart:true`) |
 | `POST /api/admin/rebuild-admin` | admin gateway binary | atomic binary swap | `admin` unit (self) |
 
 Rebuilds are pre-flight gated on memory and disk (`{"force":true}`
 overrides). Build niceness is `ADMIN_BUILD_NICE` (default 10).
+
+OMS prerequisite: the OMS build resolves `match-common` from `~/.m2`; a
+fresh box must build the match repo once (`mvn install`) before rebuild-oms
+can succeed.
 
 If a service was restarted while its artifact was missing (rebuild in
 flight/failed), the start is REFUSED with "artifact missing" instead of

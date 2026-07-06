@@ -125,6 +125,7 @@ logged).
 |--------|------|-------------|
 | `POST` | `/api/admin/rebuild-admin` | Self-update admin gateway |
 | `GET` | `/api/admin/rebuild-status` | Post-restart verification of the last self-update |
+| `POST` | `/api/admin/rebuild-oms` | Staged OMS (oms-app) rebuild + optional restart |
 | `POST` | `/api/admin/rebuild-cluster` | Rebuild cluster module |
 | `POST` | `/api/admin/rebuild-gateway` | Rebuild gateway module |
 | `GET` | `/api/admin/backup-info` | Backup information |

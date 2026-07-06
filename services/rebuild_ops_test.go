@@ -145,6 +145,46 @@ func TestRebuildGatewayNoRestartWhenNotAsked(t *testing.T) {
 	}
 }
 
+func TestRebuildOmsStagedBuildAndHonestRestart(t *testing.T) {
+	liveOms := filepath.Join(t.TempDir(), "order-management")
+	if err := os.MkdirAll(liveOms, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{
+		OmsProjectDir: liveOms,
+		OmsJar:        filepath.Join(liveOms, "oms-app/target/oms-app.jar"),
+	}
+	fa := newFakeAgent()
+	rec := &[]recordedCmd{}
+	o := &OperationsService{cfg: cfg, progress: NewProgress(), log: logging.Component("ops")}
+	o.SetProcessManager(fa)
+	// The shade plugin's runnable jar carries the version; the live path does not.
+	o.execBuild = newBuildRecorder(rec, "oms-app/target/oms-app-1.0-SNAPSHOT.jar", "new-oms-jar")
+
+	if !o.progress.TryStart("rebuild-oms", 3) {
+		t.Fatal("could not claim progress")
+	}
+	o.doRebuildOms(true)
+
+	if pm := o.progress.ToMap(); pm["error"] != false || pm["complete"] != true {
+		t.Fatalf("rebuild should finish clean, got %+v", pm)
+	}
+	for _, c := range *rec {
+		if c.dir == liveOms {
+			t.Fatalf("build step executed in the LIVE OMS tree: %v", c.argv)
+		}
+		if c.argv[0] == "mvn" && !strings.Contains(strings.Join(c.argv, " "), "-pl oms-app") {
+			t.Fatalf("mvn must target oms-app, got %v", c.argv)
+		}
+	}
+	if len(fa.installed) != 1 || fa.installed[0].DestPath != cfg.OmsJar {
+		t.Fatalf("expected one install to %q, got %+v", cfg.OmsJar, fa.installed)
+	}
+	if fmt.Sprintf("%v", fa.restarts) != "[oms]" {
+		t.Fatalf("restart list must be exactly [oms], got %v", fa.restarts)
+	}
+}
+
 func TestStageModuleJarCleansTempTree(t *testing.T) {
 	o, _, _ := newRebuildFixture(t)
 	temp := filepath.Join(t.TempDir(), "build")

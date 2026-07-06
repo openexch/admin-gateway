@@ -74,6 +74,7 @@ func (h *Handlers) RegisterRoutes(r chi.Router) {
 	// Build operations (multi-module safe)
 	r.Post("/api/admin/rebuild-gateway", h.handleRebuildGateway)
 	r.Post("/api/admin/rebuild-cluster", h.handleRebuildCluster)
+	r.Post("/api/admin/rebuild-oms", h.handleRebuildOms)
 
 	// Live archive reclamation: purge log segments below latest snapshot.
 	// (Aeron offline ArchiveTool compaction was removed — running it against a
@@ -311,6 +312,26 @@ func (h *Handlers) handleRebuildGateway(w http.ResponseWriter, r *http.Request) 
 	msg := "Gateway rebuild initiated (isolated-tree build, staged install)"
 	if req.Restart {
 		msg += " (will restart the market gateway after install)"
+	}
+	jsonResponse(w, http.StatusAccepted, map[string]string{
+		"message": msg,
+	})
+}
+
+func (h *Handlers) handleRebuildOms(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Restart bool `json:"restart"`
+		Force   bool `json:"force"` // overrides pre-flight blocking failures
+	}
+	json.NewDecoder(r.Body).Decode(&req) // ignore error - defaults to false
+
+	if err := h.opsSvc.RebuildOms(req.Restart, req.Force); err != nil {
+		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	msg := "OMS rebuild initiated (isolated-tree build, staged install)"
+	if req.Restart {
+		msg += " (will restart oms after install)"
 	}
 	jsonResponse(w, http.StatusAccepted, map[string]string{
 		"message": msg,
