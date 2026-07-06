@@ -18,6 +18,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ADMIN_MIN_ROOT_DISK_GB`, `ADMIN_MAX_SHM_USED_PCT`.
 
 ### Fixed
+- rebuild-gateway builds in an isolated rsync'd tree and installs the jar
+  via the sha-verified atomic artifact swap (#45) — mvn (whose clean/-am
+  phases rebuild upstream modules in place) never runs against the live tree
+  again, so it can no longer delete the running cluster jar. Its restart now
+  touches only the market gateway: the oms restart never picked up new code
+  (oms-app.jar comes from the OMS repo) and was dropped. rebuild-gateway and
+  rebuild-cluster are pre-flight gated on memory/disk (`{"force":true}`
+  overrides).
 - Starting a service whose launch artifact is missing is refused with one
   clear "artifact missing — rebuild in progress?" failure on every start
   path including auto-restart (#45), instead of crash-looping into a

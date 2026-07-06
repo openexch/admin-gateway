@@ -298,19 +298,19 @@ func (h *Handlers) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) handleRebuildGateway(w http.ResponseWriter, r *http.Request) {
-	// Check if restart was requested
 	var req struct {
 		Restart bool `json:"restart"`
+		Force   bool `json:"force"` // overrides pre-flight blocking failures
 	}
 	json.NewDecoder(r.Body).Decode(&req) // ignore error - defaults to false
 
-	if err := h.opsSvc.RebuildGateway(req.Restart); err != nil {
+	if err := h.opsSvc.RebuildGateway(req.Restart, req.Force); err != nil {
 		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
-	msg := "Gateway rebuild initiated"
+	msg := "Gateway rebuild initiated (isolated-tree build, staged install)"
 	if req.Restart {
-		msg += " (will restart order & market gateways after build)"
+		msg += " (will restart the market gateway after install)"
 	}
 	jsonResponse(w, http.StatusAccepted, map[string]string{
 		"message": msg,
@@ -318,7 +318,7 @@ func (h *Handlers) handleRebuildGateway(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *Handlers) handleRebuildCluster(w http.ResponseWriter, r *http.Request) {
-	if err := h.opsSvc.RebuildCluster(); err != nil {
+	if err := h.opsSvc.RebuildCluster(parseForce(r)); err != nil {
 		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
