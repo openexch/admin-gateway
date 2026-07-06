@@ -32,6 +32,7 @@ type Config struct {
 	MinMemMB      int // block gated ops below this MemAvailable (ADMIN_MIN_MEM_MB)
 	MinRootDiskGB int // block gated ops below this free space on / (ADMIN_MIN_ROOT_DISK_GB)
 	MaxShmUsedPct int // block gated ops above this /dev/shm usage (ADMIN_MAX_SHM_USED_PCT)
+	BuildNice     int // niceness for rebuild mvn/go/rsync (ADMIN_BUILD_NICE; 0 disables)
 }
 
 func Load() *Config {
@@ -80,6 +81,7 @@ func Load() *Config {
 		MinMemMB:      getEnvIntOrDefault("ADMIN_MIN_MEM_MB", 4096),
 		MinRootDiskGB: getEnvIntOrDefault("ADMIN_MIN_ROOT_DISK_GB", 5),
 		MaxShmUsedPct: getEnvIntOrDefault("ADMIN_MAX_SHM_USED_PCT", 90),
+		BuildNice:     getEnvIntOrDefault("ADMIN_BUILD_NICE", 10),
 	}
 }
 

@@ -50,6 +50,7 @@ go build -o admin-gateway .
 | `ADMIN_MIN_MEM_MB` | `4096` | Pre-flight: block gated ops when host `MemAvailable` is below this (warn below 1.5x) |
 | `ADMIN_MIN_ROOT_DISK_GB` | `5` | Pre-flight: block gated ops when `/` has less free space |
 | `ADMIN_MAX_SHM_USED_PCT` | `90` | Pre-flight: block gated ops when `/dev/shm` is fuller than this |
+| `ADMIN_BUILD_NICE` | `10` | CPU niceness for rebuild mvn/go/rsync steps (`0` disables; ionice idle applied when available) |
 
 ### Authentication
 
