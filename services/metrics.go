@@ -75,6 +75,21 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap lets http.ResponseController reach the underlying writer's
+// Flush/deadline support through this wrapper (the SSE events stream flushes
+// per frame; without this the wrapper hid http.Flusher and /api/admin/events
+// returned "streaming unsupported" behind the metrics middleware).
+func (w *statusWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+// Flush forwards to the underlying writer for direct http.Flusher asserts.
+func (w *statusWriter) Flush() {
+	if fl, ok := w.ResponseWriter.(http.Flusher); ok {
+		fl.Flush()
+	}
+}
+
 // Handler serves GET /metrics.
 func (m *MetricsService) Handler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

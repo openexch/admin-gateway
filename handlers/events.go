@@ -30,11 +30,10 @@ var (
 // Last-Event-ID replay — the stream is live-only. Clients re-seed from
 // /api/admin/status after (re)connecting; /status stays the source of truth.
 func (h *Handlers) handleEvents(w http.ResponseWriter, r *http.Request) {
-	fl, ok := w.(http.Flusher)
-	if !ok {
-		jsonResponse(w, http.StatusInternalServerError, map[string]string{"error": "streaming unsupported"})
-		return
-	}
+	// ResponseController unwraps middleware ResponseWriter wrappers (chi's
+	// request logger, the metrics statusWriter) to reach the real Flusher —
+	// a bare http.Flusher type assert fails behind them.
+	rc := http.NewResponseController(w)
 
 	events, unsub := h.procMgr.Subscribe(64)
 	defer unsub()
@@ -42,6 +41,10 @@ func (h *Handlers) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
+	if err := rc.Flush(); err != nil {
+		// No flush support anywhere in the chain: nothing to stream over.
+		return
+	}
 
 	writeEvent := func(name string, v interface{}) {
 		data, err := json.Marshal(v)
@@ -49,7 +52,7 @@ func (h *Handlers) handleEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, data)
-		fl.Flush()
+		rc.Flush()
 	}
 
 	// Initial progress snapshot so a client connecting mid-operation renders
@@ -80,7 +83,7 @@ func (h *Handlers) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case <-hb.C:
 			// Comment frame: keeps proxies and EventSource from timing out.
 			fmt.Fprint(w, ": hb\n\n")
-			fl.Flush()
+			rc.Flush()
 		}
 	}
 }

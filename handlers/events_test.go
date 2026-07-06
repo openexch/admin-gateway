@@ -16,6 +16,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/match/admin-gateway/agent"
+	"github.com/match/admin-gateway/logging"
 	"github.com/match/admin-gateway/services"
 )
 
@@ -229,21 +230,65 @@ func TestEventsStreamsProgressChangesOnly(t *testing.T) {
 	}
 }
 
-func TestEventsQueryTokenAuth(t *testing.T) {
+// TestEventsStreamsThroughMiddlewareStack reproduces the live wiring (chi
+// request logger + metrics middleware, both of which wrap ResponseWriter):
+// the stream must still reach a Flusher through the wrappers. Direct
+// http.Flusher asserts fail here — this is the regression test for the
+// "streaming unsupported" bug found on the live box.
+func TestEventsStreamsThroughMiddlewareStack(t *testing.T) {
+	fake := &eventsFakeAgent{}
+	progress := services.NewProgress()
+	h := &Handlers{procMgr: fake, progress: progress}
+
+	metrics := services.NewMetricsService(nil, nil, fake, progress, nil)
+	r := chi.NewRouter()
+	r.Use(logging.RequestLogger)
+	r.Use(metrics.Middleware)
+	r.Get("/api/admin/events", h.handleEvents)
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/admin/events", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	fake.send(agent.Event{Type: agent.EventStarted, Service: "sim", PID: 1})
+	frames := readFrames(t, resp.Body, 2, 5*time.Second)
+	if frames[0].event != "progress" || frames[1].event != "process" {
+		t.Fatalf("expected progress snapshot then process frame through the middleware stack, got %+v", frames)
+	}
+}
+
+// TestEventsAuthIsHeaderOnly pins the auth posture for the stream: the
+// standard bearer header works, and a token in the URL NEVER does — URL
+// tokens leak into history, referrers and intermediary logs. Browser clients
+// that need a token must use fetch()-streaming (which can set headers), not
+// EventSource.
+func TestEventsAuthIsHeaderOnly(t *testing.T) {
 	const token = "sekrit"
 	fake := &eventsFakeAgent{}
 	h := &Handlers{procMgr: fake, progress: services.NewProgress()}
 	r := chi.NewRouter()
 	r.Use(AuthMiddleware(token))
 	r.Get("/api/admin/events", h.handleEvents)
-	r.Get("/api/admin/status", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
 	srv := httptest.NewServer(r)
 	defer srv.Close()
 
-	get := func(path string) int {
+	get := func(path, bearer string) int {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+path, nil)
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -252,17 +297,13 @@ func TestEventsQueryTokenAuth(t *testing.T) {
 		return resp.StatusCode
 	}
 
-	if got := get("/api/admin/events"); got != http.StatusUnauthorized {
-		t.Fatalf("no token should 401, got %d", got)
+	if got := get("/api/admin/events", ""); got != http.StatusUnauthorized {
+		t.Fatalf("no credentials should 401, got %d", got)
 	}
-	if got := get("/api/admin/events?token=wrong"); got != http.StatusUnauthorized {
-		t.Fatalf("wrong token should 401, got %d", got)
+	if got := get("/api/admin/events?token="+token, ""); got != http.StatusUnauthorized {
+		t.Fatalf("a URL token must NOT authenticate, got %d", got)
 	}
-	if got := get("/api/admin/events?token=" + token); got != http.StatusOK {
-		t.Fatalf("correct query token should 200 on the events path, got %d", got)
-	}
-	// The query token is an events-path exception, never a general mechanism.
-	if got := get("/api/admin/status?token=" + token); got != http.StatusUnauthorized {
-		t.Fatalf("query token must NOT work on other paths, got %d", got)
+	if got := get("/api/admin/events", token); got != http.StatusOK {
+		t.Fatalf("bearer header should 200, got %d", got)
 	}
 }
