@@ -57,6 +57,10 @@ type ServiceDef struct {
 	// absent or flapping driver lets it write a partial archive and die
 	// mid-write — the 2026-07-03 corruption engine (#17, match#35, match#48).
 	GatedBy string `json:"-"`
+	// External media driver aeron.dir this service owns (driver0-2 only).
+	// Drives the #42 orphan protections: start refuses while a live untracked
+	// driver holds <DriverDir>.pid, and force-stop kills that pid too.
+	DriverDir string `json:"-"`
 }
 
 // Restart-loop cap + driver gate tuning (#17). Vars, not consts, so tests can
@@ -232,6 +236,7 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 				// A node cannot outlive its driver's shared-memory files: on driver
 				// crash, stop the node first, restart the driver, then the node.
 				RestartCascades: []string{fmt.Sprintf("node%d", i)},
+				DriverDir:       driverDir(i),
 			})
 		}
 	}
@@ -694,6 +699,26 @@ func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) err
 	// This allows status queries and stop commands to proceed during preparation.
 	var startErr error
 
+	// Orphan-driver refusal (#42): reaching here means this driver is tracked
+	// stopped, so a live pid in <DriverDir>.pid is an untracked orphan. Launching
+	// over it would exit 0 (launch-driver.sh is idempotent), read as an instant
+	// crash, and burn the crash-loop cap into disarm while the real driver keeps
+	// running — the exact illusion behind the 2026-07-06 node0 outage. One clear
+	// refusal instead; force-stop kills the orphan and clears the state.
+	if def.DriverDir != "" {
+		if opid, alive := driverPidFileAlive(def.DriverDir); alive {
+			err := fmt.Errorf("orphan media driver alive (pid %d) holding %s — force-stop %s (kills the orphan too), then start",
+				opid, def.DriverDir, def.Name)
+			proc.mu.Lock()
+			proc.status = "failed"
+			proc.lastError = err.Error()
+			proc.starting = false
+			proc.mu.Unlock()
+			pm.log.Warn("refused start", "service", def.Name, "err", err)
+			return err
+		}
+	}
+
 	// Driver gate FIRST, before any cleanup touches node state on disk: a gated
 	// service must not start (or mutate its archive dirs) unless its driver is
 	// running, stable, and has published cnc.dat (#17).
@@ -853,6 +878,31 @@ func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) err
 
 func (pm *ProcessManager) stopProcess(name string, force bool) error {
 	proc := pm.procs[name]
+
+	// Force-stopping a driver also kills an orphan aeronmd named by the launch
+	// script's pid file (#42): the orphan state (live driver, tracked stopped)
+	// is otherwise unreachable by any API verb, leaving runbook 1's recovery
+	// sequence stuck behind manual kills.
+	if force {
+		if def := pm.findDef(name); def != nil && def.DriverDir != "" {
+			proc.mu.Lock()
+			trackedPid := proc.pid
+			proc.mu.Unlock()
+			if opid, alive := driverPidFileAlive(def.DriverDir); alive && opid != trackedPid {
+				pm.log.Warn("force-stop killing orphan driver from pid file",
+					"service", name, "pid", opid, "dir", def.DriverDir)
+				syscall.Kill(-opid, syscall.SIGTERM)
+				deadline := time.Now().Add(3 * time.Second)
+				for time.Now().Before(deadline) && isProcessAlive(opid) {
+					time.Sleep(100 * time.Millisecond)
+				}
+				if isProcessAlive(opid) {
+					syscall.Kill(-opid, syscall.SIGKILL)
+				}
+			}
+		}
+	}
+
 	proc.mu.Lock()
 
 	// Always cancel pending auto-restarts, even if process appears stopped
@@ -1226,7 +1276,10 @@ func (pm *ProcessManager) cleanStaleAeronState(name string) {
 	if nodeId, ok := nodeIds[name]; ok {
 		// Clean stale MediaDriver directory — but NEVER while an external driver
 		// process owns it (external mode shares this dir between driverN and nodeN;
-		// deleting it under a live driver corrupts the IPC files).
+		// deleting it under a live driver corrupts the IPC files). Tracked state
+		// alone is NOT trusted: it reads stopped during driver crash-loops and
+		// adoption gaps, which is how the 2026-07-06 rolling update deleted
+		// node0's live dir (#42) — the pid-file ground truth must agree.
 		driverRunning := false
 		if dproc, ok := pm.procs[fmt.Sprintf("driver%d", nodeId)]; ok {
 			dproc.mu.Lock()
@@ -1234,11 +1287,15 @@ func (pm *ProcessManager) cleanStaleAeronState(name string) {
 			dproc.mu.Unlock()
 		}
 		driverDir := driverDirPath(nodeId)
-		if !driverRunning {
+		if ok, reason := canDeleteDriverDir(driverDir, driverRunning); ok {
 			if _, err := os.Stat(driverDir); err == nil {
 				os.RemoveAll(driverDir)
 				pm.log.Info("cleaned stale media driver dir", "dir", driverDir)
 			}
+		} else if !driverRunning {
+			// Tracked stopped but a live driver holds the dir: the #42 state.
+			pm.log.Error("refusing to delete media driver dir (#42 guard)",
+				"dir", driverDir, "reason", reason)
 		}
 
 		// Clean stale mark files and locks
@@ -1671,6 +1728,38 @@ func isProcessAlive(pid int) bool {
 	// Signal 0 checks existence without actually sending a signal
 	err := syscall.Kill(pid, 0)
 	return err == nil
+}
+
+// driverPidFileAlive reads <driverDir>.pid — written by launch-driver.sh
+// before it execs aeronmd, so the recorded PID IS the driver's — and reports
+// whether it names a live process. This is ground truth independent of the
+// PM's tracked state, which is exactly what lies in the #42 incident class:
+// a duplicate driver start exits 0 (the script is idempotent), reads as an
+// instant crash, and leaves the real driver alive but tracked stopped.
+func driverPidFileAlive(driverDir string) (int, bool) {
+	data, err := os.ReadFile(driverDir + ".pid")
+	if err != nil {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return 0, false
+	}
+	return pid, isProcessAlive(pid)
+}
+
+// canDeleteDriverDir is the #42 guard shared by every deleter of a media
+// driver dir: deletion needs BOTH the tracked state stopped AND no live
+// process named by the dir's pid file. An absent procs entry or a
+// crash-looped tracked state must never default to "safe to delete".
+func canDeleteDriverDir(driverDir string, trackedRunning bool) (ok bool, reason string) {
+	if trackedRunning {
+		return false, "driver tracked running"
+	}
+	if pid, alive := driverPidFileAlive(driverDir); alive {
+		return false, fmt.Sprintf("live driver (pid %d) holds it per %s.pid despite tracked stopped", pid, driverDir)
+	}
+	return true, ""
 }
 
 func getProcessMemory(pid int) int64 {

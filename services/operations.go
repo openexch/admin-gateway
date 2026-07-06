@@ -1179,13 +1179,24 @@ func (o *OperationsService) waitForNodeStopped(log *slog.Logger, nodeId int, tim
 // cleanNodeMediaDriver removes stale Aeron MediaDriver directories for a node.
 // Never touches the dir while an external media driver (driverN) owns it — in external
 // mode the driver process survives node restarts and deleting its dir corrupts the IPC.
+// Ownership is judged by tracked state AND the launch script's pid file: tracked
+// state reads stopped during driver crash-loops and adoption gaps, which is how
+// the 2026-07-06 rolling update deleted node0's live dir (#42).
 func (o *OperationsService) cleanNodeMediaDriver(log *slog.Logger, nodeId int) {
+	trackedRunning := false
 	if o.procMgr != nil {
 		if info := o.procMgr.Get(fmt.Sprintf("driver%d", nodeId)); info != nil && info.Running {
-			return
+			trackedRunning = true
 		}
 	}
 	driverDir := driverDirPath(nodeId)
+	ok, reason := canDeleteDriverDir(driverDir, trackedRunning)
+	if !ok {
+		if !trackedRunning {
+			log.Error("refusing to delete media driver dir (#42 guard)", "dir", driverDir, "reason", reason)
+		}
+		return
+	}
 	if _, err := os.Stat(driverDir); err == nil {
 		os.RemoveAll(driverDir)
 		log.Info("cleaned stale media driver dir", "dir", driverDir)
