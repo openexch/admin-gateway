@@ -59,6 +59,7 @@ func (h *Handlers) RegisterRoutes(r chi.Router) {
 	r.Get("/api/admin/status", h.handleStatus)
 	r.Get("/api/admin/progress", h.handleProgress)
 	r.Get("/api/admin/preflight", h.handlePreflight)
+	r.Get("/api/admin/events", h.handleEvents) // SSE: agent events + progress
 
 	// Node operations
 	r.Post("/api/admin/restart-node", h.handleRestartNode)

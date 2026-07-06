@@ -38,7 +38,9 @@ talking to a remote `agentd`:
   Stage + Activate) is a refinement, not a break.
 - **`Subscribe()` event stream** — started / stopped / crashed /
   cascade-stopped / disarmed / adopted. Non-blocking sends with bounded
-  buffers: a slow consumer can never wedge the crash path.
+  buffers: a slow consumer can never wedge the crash path. First consumer:
+  the `GET /api/admin/events` SSE feed (agent events + operation progress
+  for the admin UI's live activity panel).
 
 ### What stays agent-side (never crosses the wire)
 

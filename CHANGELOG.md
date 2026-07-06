@@ -17,6 +17,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   demand via `GET /api/admin/preflight`. Knobs: `ADMIN_MIN_MEM_MB`,
   `ADMIN_MIN_ROOT_DISK_GB`, `ADMIN_MAX_SHM_USED_PCT`.
 
+### Added (observability)
+- `GET /api/admin/events`: Server-Sent Events stream of agent lifecycle
+  events (started/stopped/crashed/cascade-stop/disarmed/adopted) and
+  operation progress — the first consumer of the ProcessAgent Subscribe
+  stream. Live-only, best-effort delivery; `/status` remains the source of
+  truth. Browser EventSource clients may authenticate with `?token=` on this
+  path only.
+
 ### Added (rebuild-oms)
 - `POST /api/admin/rebuild-oms {restart, force}`: staged isolated-tree build
   of the OMS uber-jar with sha-verified atomic install — replaces the manual
