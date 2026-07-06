@@ -76,6 +76,20 @@ func main() {
 		slog.Warn("no admin token configured, loopback-only dev mode")
 	}
 
+	// Opt-in agent hub (docs/AGENTD.md): with ADMIN_AGENT_LISTEN unset the
+	// hub is never constructed and the gateway is byte-identical to
+	// pre-agentd builds. Same secure-by-default rule as the HTTP API, plus
+	// TLS: agent sessions drive process lifecycle, so a non-loopback
+	// listener refuses to start without BOTH a token and TLS.
+	if cfg.AgentListen != "" {
+		agentSrv, err := startAgentHub(cfg)
+		if err != nil {
+			slog.Error("agent hub failed to start", "err", err)
+			os.Exit(1)
+		}
+		defer agentSrv.Stop()
+	}
+
 	// Start server
 	addr := cfg.BindAddr + ":" + cfg.Port
 	slog.Info("admin gateway starting",

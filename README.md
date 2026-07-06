@@ -51,6 +51,9 @@ go build -o admin-gateway .
 | `ADMIN_MIN_ROOT_DISK_GB` | `5` | Pre-flight: block gated ops when `/` has less free space |
 | `ADMIN_MAX_SHM_USED_PCT` | `90` | Pre-flight: block gated ops when `/dev/shm` is fuller than this |
 | `ADMIN_BUILD_NICE` | `10` | CPU niceness for rebuild mvn/go/rsync steps (`0` disables; ionice idle applied when available) |
+| `ADMIN_AGENT_LISTEN` | _(unset)_ | Opt-in agentd hub listen address (e.g. `127.0.0.1:8083`); unset = hub never constructed (docs/AGENTD.md) |
+| `ADMIN_AGENT_TOKEN` / `_FILE` | _(empty)_ | Shared agent token; required (with TLS) for non-loopback agent listeners |
+| `ADMIN_AGENT_TLS_CERT` / `ADMIN_AGENT_TLS_KEY` | _(empty)_ | TLS keypair for the agent listener (TLS 1.3) |
 
 ### Authentication
 

@@ -33,6 +33,13 @@ type Config struct {
 	MinRootDiskGB int // block gated ops below this free space on / (ADMIN_MIN_ROOT_DISK_GB)
 	MaxShmUsedPct int // block gated ops above this /dev/shm usage (ADMIN_MAX_SHM_USED_PCT)
 	BuildNice     int // niceness for rebuild mvn/go/rsync (ADMIN_BUILD_NICE; 0 disables)
+
+	// Agent hub (docs/AGENTD.md). Unset AgentListen = the hub is never
+	// constructed; the gateway behaves byte-identically to pre-agentd builds.
+	AgentListen  string // gRPC listen address for agentd sessions (ADMIN_AGENT_LISTEN)
+	AgentToken   string // shared agent token (ADMIN_AGENT_TOKEN or _FILE)
+	AgentTLSCert string // TLS certificate for the agent listener (ADMIN_AGENT_TLS_CERT)
+	AgentTLSKey  string // TLS key for the agent listener (ADMIN_AGENT_TLS_KEY)
 }
 
 func Load() *Config {
@@ -82,6 +89,10 @@ func Load() *Config {
 		MinRootDiskGB: getEnvIntOrDefault("ADMIN_MIN_ROOT_DISK_GB", 5),
 		MaxShmUsedPct: getEnvIntOrDefault("ADMIN_MAX_SHM_USED_PCT", 90),
 		BuildNice:     getEnvIntOrDefault("ADMIN_BUILD_NICE", 10),
+		AgentListen:   os.Getenv("ADMIN_AGENT_LISTEN"),
+		AgentToken:    loadToken("ADMIN_AGENT_TOKEN"),
+		AgentTLSCert:  os.Getenv("ADMIN_AGENT_TLS_CERT"),
+		AgentTLSKey:   os.Getenv("ADMIN_AGENT_TLS_KEY"),
 	}
 }
 
@@ -123,13 +134,19 @@ func getEnvIntOrDefault(key string, defaultVal int) int {
 // loadAuthToken reads the admin API bearer token from ADMIN_AUTH_TOKEN, or
 // from the file named by ADMIN_AUTH_TOKEN_FILE (surrounding whitespace trimmed).
 func loadAuthToken() string {
-	if tok := os.Getenv("ADMIN_AUTH_TOKEN"); tok != "" {
+	return loadToken("ADMIN_AUTH_TOKEN")
+}
+
+// loadToken reads a token from <envKey> or the file named by <envKey>_FILE
+// (whitespace trimmed). Unreadable files fail closed to an empty token: main
+// refuses insecure bind combinations without one.
+func loadToken(envKey string) string {
+	if tok := os.Getenv(envKey); tok != "" {
 		return tok
 	}
-	if file := os.Getenv("ADMIN_AUTH_TOKEN_FILE"); file != "" {
+	if file := os.Getenv(envKey + "_FILE"); file != "" {
 		data, err := os.ReadFile(file)
 		if err != nil {
-			// Fail closed: main refuses non-loopback binds without a token.
 			return ""
 		}
 		return strings.TrimSpace(string(data))
