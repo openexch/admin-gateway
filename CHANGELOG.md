@@ -17,6 +17,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   demand via `GET /api/admin/preflight`. Knobs: `ADMIN_MIN_MEM_MB`,
   `ADMIN_MIN_ROOT_DISK_GB`, `ADMIN_MAX_SHM_USED_PCT`.
 
+### Fixed
+- Live media-driver dirs can no longer be deleted by any admin path (#42):
+  both deleters (rolling-update's per-node cleanup and the pre-start stale
+  Aeron sweep) now require the launch script's `<dir>.pid` ground truth to
+  agree with the tracked state before removing anything. Starting a driver
+  over a live untracked orphan is refused with one actionable error instead
+  of burning the crash-loop cap on idempotent exit-0 launches, and
+  `force-stop driverN` kills the orphan pid too, making runbook 1 recovery
+  fully API-driven.
+
 ## [0.3.0-beta] - 2026-07-05
 
 The beta hardening release: honest status, guarded operations, secure

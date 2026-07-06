@@ -81,6 +81,15 @@ curl -X POST $ADMIN/api/admin/processes/node0/start
 The same sequence applies if `/dev/shm/aeron-emre-0-driver` vanishes under a
 live driver0.
 
+Since the #42 guards, the "dir vanishes under a live driver" state should no
+longer be reachable through the admin API: every deleter checks the launch
+script's `<dir>.pid` ground truth (not just tracked state), a driver start
+while an untracked orphan `aeronmd` holds the dir is refused with one clear
+error (instead of burning the crash-loop cap on idempotent exit-0 launches),
+and `force-stop driverN` kills the orphan pid too. If the invariant does
+fire, `/api/admin/status` invariants and `admin_invariant_ok{check="driver-dirs"}`
+flag it; recover with the sequence above (force-stop now clears the orphan).
+
 ---
 
 ## 2. Rolling update (deploy new cluster code, zero downtime)
