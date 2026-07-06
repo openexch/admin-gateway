@@ -25,18 +25,20 @@ type MetricsService struct {
 	opsSvc    *OperationsService
 	pm        agent.ProcessAgent
 	progress  *Progress
+	preflight *Preflight
 	startTime time.Time
 
 	mu       sync.Mutex
 	requests map[string]int64 // "method|route|code" -> count
 }
 
-func NewMetricsService(statusSvc *StatusService, opsSvc *OperationsService, pm agent.ProcessAgent, progress *Progress) *MetricsService {
+func NewMetricsService(statusSvc *StatusService, opsSvc *OperationsService, pm agent.ProcessAgent, progress *Progress, preflight *Preflight) *MetricsService {
 	return &MetricsService{
 		statusSvc: statusSvc,
 		opsSvc:    opsSvc,
 		pm:        pm,
 		progress:  progress,
+		preflight: preflight,
 		startTime: time.Now(),
 		requests:  make(map[string]int64),
 	}
@@ -138,6 +140,20 @@ func (m *MetricsService) render() string {
 			if v, ok := n["archiveBytes"]; ok {
 				series("admin_node_archive_bytes", nodeLabel(n), toF(v, 0))
 			}
+		}
+	}
+
+	// ---- pre-flight invariants (from the 2s status cache; #42/#43/#45) ----
+	if inv, ok := status["invariants"].([]InvariantResult); ok {
+		head("admin_invariant_ok", "1 when the named pre-flight invariant holds (see GET /api/admin/preflight).", "gauge")
+		for _, r := range inv {
+			series("admin_invariant_ok", fmt.Sprintf("check=%q", r.Name), b2f(r.OK))
+		}
+	}
+	if m.preflight != nil {
+		if avail := m.preflight.MemAvailableBytes(); avail >= 0 {
+			gauge("admin_mem_available_bytes", "Host MemAvailable from /proc/meminfo (the #43 pre-flight input).",
+				float64(avail), "")
 		}
 	}
 

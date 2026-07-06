@@ -49,20 +49,7 @@ func (ac *AeronCounters) GetNodeCounters(nodeId int) (*CounterData, error) {
 		return nil, fmt.Errorf("invalid nodeId: %d", nodeId)
 	}
 
-	// Get home directory for username pattern
-	homeDir, _ := os.UserHomeDir()
-	var username string
-	if homeDir != "" {
-		parts := strings.Split(homeDir, "/")
-		if len(parts) > 0 {
-			username = parts[len(parts)-1]
-		}
-	}
-	if username == "" {
-		username = os.Getenv("USER")
-	}
-
-	cncPath := fmt.Sprintf("/dev/shm/aeron-%s-%d-driver/cnc.dat", username, nodeId)
+	cncPath := driverDirPath(nodeId) + "/cnc.dat"
 
 	// Open file
 	f, err := os.Open(cncPath)

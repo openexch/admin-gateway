@@ -23,6 +23,7 @@ type Handlers struct {
 	logSvc       *services.LogService
 	procMgr      agent.ProcessAgent
 	metrics      *services.MetricsService
+	preflight    *services.Preflight
 }
 
 func New(
@@ -35,6 +36,7 @@ func New(
 	logSvc *services.LogService,
 	procMgr agent.ProcessAgent,
 	metrics *services.MetricsService,
+	preflight *services.Preflight,
 ) *Handlers {
 	return &Handlers{
 		statusSvc:    statusSvc,
@@ -46,6 +48,7 @@ func New(
 		logSvc:       logSvc,
 		procMgr:      procMgr,
 		metrics:      metrics,
+		preflight:    preflight,
 	}
 }
 
@@ -55,6 +58,7 @@ func (h *Handlers) RegisterRoutes(r chi.Router) {
 	// Status
 	r.Get("/api/admin/status", h.handleStatus)
 	r.Get("/api/admin/progress", h.handleProgress)
+	r.Get("/api/admin/preflight", h.handlePreflight)
 
 	// Node operations
 	r.Post("/api/admin/restart-node", h.handleRestartNode)
@@ -143,6 +147,16 @@ func (h *Handlers) handleProgress(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) handleHealth(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handlePreflight runs every invariant check on demand. Always 200: this is a
+// report, never a gate — gated operations enforce blocking failures themselves.
+func (h *Handlers) handlePreflight(w http.ResponseWriter, r *http.Request) {
+	checks := h.preflight.RunAll()
+	jsonResponse(w, http.StatusOK, map[string]interface{}{
+		"ok":     services.InvariantsOK(checks),
+		"checks": checks,
+	})
 }
 
 // Node operations
