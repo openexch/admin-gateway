@@ -68,6 +68,7 @@ type StatusService struct {
 	// flagged Horizon B seam (docs/AGENT-ARCHITECTURE.md).
 	counters     *AeronCounters
 	autoSnapshot *AutoSnapshot
+	preflight    *Preflight
 
 	// Cached status
 	cacheMu      sync.RWMutex
@@ -112,6 +113,12 @@ func (s *StatusService) SetProcessManager(pm agent.ProcessAgent) {
 
 func (s *StatusService) SetAutoSnapshot(as *AutoSnapshot) {
 	s.autoSnapshot = as
+}
+
+// SetPreflight injects the invariant engine; every status poll then surfaces
+// the cheap invariant checks (#42's driver-dir lie in particular).
+func (s *StatusService) SetPreflight(p *Preflight) {
+	s.preflight = p
 }
 
 func (s *StatusService) Stop() {
@@ -369,6 +376,11 @@ func (s *StatusService) fetchStatus() map[string]interface{} {
 			"port":    8080,
 		},
 		"autoSnapshot": s.getAutoSnapshotStatus(),
+	}
+	if s.preflight != nil {
+		inv := s.preflight.RunCheap()
+		result["invariants"] = inv
+		result["invariantsOk"] = InvariantsOK(inv)
 	}
 	// Surface an in-flight or completed rebuild-admin handshake (omitted when
 	// no rebuild has happened on this checkout).

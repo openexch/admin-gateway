@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -23,6 +24,14 @@ type Config struct {
 	LogFormat     string // "json" (default) or "text" (ADMIN_LOG_FORMAT)
 	GoBin         string // go binary for rebuild-admin (ADMIN_GO_BIN; see resolveGoBin)
 	SimBinary     string // market simulator binary (SIM_BINARY; openexch/tools market-sim)
+
+	// Pre-flight invariant thresholds (services/preflight.go, #42/#43/#45).
+	// Defaults sized for the 31G demo box: steady-state MemAvailable there is
+	// ~7-8GB with the full stack up, and the #43 OOM hit during a node
+	// restart's catchup transient.
+	MinMemMB      int // block gated ops below this MemAvailable (ADMIN_MIN_MEM_MB)
+	MinRootDiskGB int // block gated ops below this free space on / (ADMIN_MIN_ROOT_DISK_GB)
+	MaxShmUsedPct int // block gated ops above this /dev/shm usage (ADMIN_MAX_SHM_USED_PCT)
 }
 
 func Load() *Config {
@@ -68,6 +77,9 @@ func Load() *Config {
 		// `cd tools/market-sim && go build -o market-sim .`
 		SimBinary: getEnvOrDefault("SIM_BINARY",
 			filepath.Join(filepath.Dir(projectDir), "tools/market-sim/market-sim")),
+		MinMemMB:      getEnvIntOrDefault("ADMIN_MIN_MEM_MB", 4096),
+		MinRootDiskGB: getEnvIntOrDefault("ADMIN_MIN_ROOT_DISK_GB", 5),
+		MaxShmUsedPct: getEnvIntOrDefault("ADMIN_MAX_SHM_USED_PCT", 90),
 	}
 }
 
@@ -93,6 +105,15 @@ func resolveGoBin() string {
 func getEnvOrDefault(key, defaultVal string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
+	}
+	return defaultVal
+}
+
+func getEnvIntOrDefault(key string, defaultVal int) int {
+	if val := os.Getenv(key); val != "" {
+		if n, err := strconv.Atoi(val); err == nil {
+			return n
+		}
 	}
 	return defaultVal
 }

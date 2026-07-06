@@ -1185,7 +1185,7 @@ func (o *OperationsService) cleanNodeMediaDriver(log *slog.Logger, nodeId int) {
 			return
 		}
 	}
-	driverDir := fmt.Sprintf("/dev/shm/aeron-%s-%d-driver", currentUsername(), nodeId)
+	driverDir := driverDirPath(nodeId)
 	if _, err := os.Stat(driverDir); err == nil {
 		os.RemoveAll(driverDir)
 		log.Info("cleaned stale media driver dir", "dir", driverDir)

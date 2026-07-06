@@ -142,10 +142,7 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 		driverProfile = "dev"
 	}
 
-	username := currentUsername()
-	driverDir := func(nodeId int) string {
-		return fmt.Sprintf("/dev/shm/aeron-%s-%d-driver", username, nodeId)
-	}
+	driverDir := driverDirPath
 
 	// Driver shares its node's core quad: SHARED-mode threads coexist with the engine
 	// in dev; the prod layout instead pins driver threads via launch-driver.sh core vars.
@@ -1236,7 +1233,7 @@ func (pm *ProcessManager) cleanStaleAeronState(name string) {
 			driverRunning = dproc.running
 			dproc.mu.Unlock()
 		}
-		driverDir := fmt.Sprintf("/dev/shm/aeron-%s-%d-driver", currentUsername(), nodeId)
+		driverDir := driverDirPath(nodeId)
 		if !driverRunning {
 			if _, err := os.Stat(driverDir); err == nil {
 				os.RemoveAll(driverDir)

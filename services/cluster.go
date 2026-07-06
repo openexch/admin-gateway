@@ -205,7 +205,7 @@ func (c *Cluster) SeedRecordingLogFromSnapshot(nodeId int) (string, error) {
 // and breaks recover-from-snapshot). Invoked automatically after every snapshot.
 func (c *Cluster) ArchiveHousekeeping(nodeId int) (string, error) {
 	clusterDir := fmt.Sprintf("%s/node%d/cluster", c.cfg.ClusterDir, nodeId)
-	aeronDir := fmt.Sprintf("/dev/shm/aeron-%s-%d-driver", currentUsername(), nodeId)
+	aeronDir := driverDirPath(nodeId)
 	cmd := exec.Command("java",
 		"--add-opens", "java.base/jdk.internal.misc=ALL-UNNAMED",
 		"-cp", c.cfg.JarPath,
@@ -223,6 +223,13 @@ func currentUsername() string {
 		return u.Username
 	}
 	return "unknown"
+}
+
+// driverDirPath is the single source of truth for an external media driver's
+// aeron.dir. Every reader and (guarded) deleter of these dirs must derive the
+// path here so the #42 protections cannot diverge from the launch config.
+func driverDirPath(nodeId int) string {
+	return fmt.Sprintf("/dev/shm/aeron-%s-%d-driver", currentUsername(), nodeId)
 }
 
 // ArchiveToolDescribe describes the archive catalog for a node

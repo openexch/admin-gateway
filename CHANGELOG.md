@@ -7,6 +7,16 @@ four repos.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+- Pre-flight invariant engine (#42, #43, #45): named checks for memory
+  headroom, disk space, live-driver-dir integrity, launch artifacts and
+  cluster quorum. Surfaced continuously in `/api/admin/status` and the
+  `admin_invariant_ok{check}` / `admin_mem_available_bytes` metrics, and on
+  demand via `GET /api/admin/preflight`. Knobs: `ADMIN_MIN_MEM_MB`,
+  `ADMIN_MIN_ROOT_DISK_GB`, `ADMIN_MAX_SHM_USED_PCT`.
+
 ## [0.3.0-beta] - 2026-07-05
 
 The beta hardening release: honest status, guarded operations, secure

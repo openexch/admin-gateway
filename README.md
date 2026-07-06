@@ -47,6 +47,9 @@ go build -o admin-gateway .
 | `ADMIN_AUTH_TOKEN_FILE` | _(empty)_ | File to read the token from (whitespace trimmed) |
 | `ADMIN_LOG_FORMAT` | `json` | Structured log format: `json` or `text` |
 | `MATCH_PROJECT_DIR` | (auto-detected) | Path to the match engine project |
+| `ADMIN_MIN_MEM_MB` | `4096` | Pre-flight: block gated ops when host `MemAvailable` is below this (warn below 1.5x) |
+| `ADMIN_MIN_ROOT_DISK_GB` | `5` | Pre-flight: block gated ops when `/` has less free space |
+| `ADMIN_MAX_SHM_USED_PCT` | `90` | Pre-flight: block gated ops when `/dev/shm` is fuller than this |
 
 ### Authentication
 
@@ -64,8 +67,9 @@ logged).
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/admin/status` | Cluster status |
+| `GET` | `/api/admin/status` | Cluster status (includes pre-flight invariants) |
 | `GET` | `/api/admin/progress` | Operation progress |
+| `GET` | `/api/admin/preflight` | Run all pre-flight invariant checks (report only, never a gate) |
 | `GET` | `/api/admin/logs?node=0&lines=100` | Service logs |
 | `GET` | `/health` | Health check |
 | `GET` | `/metrics` | Prometheus metrics (auth-exempt, for the local scraper) |

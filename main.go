@@ -39,14 +39,18 @@ func main() {
 	opsSvc := services.NewOperationsService(cfg, systemd, cluster, progress, clusterStatus)
 	opsSvc.SetProcessManager(procMgr)
 	opsSvc.SetStatusService(statusSvc)
+	preflight := services.NewPreflight(cfg)
+	preflight.SetProcessManager(procMgr)
+	preflight.SetStatusService(statusSvc)
+	statusSvc.SetPreflight(preflight)
 	autoSnapshot := services.NewAutoSnapshot(opsSvc)
 	statusSvc.SetAutoSnapshot(autoSnapshot)
 	autoSnapshot.Start(5) // Auto-snapshot every 5 minutes to prevent unbounded log growth
 	logSvc := services.NewLogService(cfg)
-	metricsSvc := services.NewMetricsService(statusSvc, opsSvc, procMgr, progress)
+	metricsSvc := services.NewMetricsService(statusSvc, opsSvc, procMgr, progress, preflight)
 
 	// Initialize handlers
-	h := handlers.New(statusSvc, opsSvc, cluster, progress, clusterStatus, autoSnapshot, logSvc, procMgr, metricsSvc)
+	h := handlers.New(statusSvc, opsSvc, cluster, progress, clusterStatus, autoSnapshot, logSvc, procMgr, metricsSvc, preflight)
 
 	// Setup router
 	r := chi.NewRouter()
