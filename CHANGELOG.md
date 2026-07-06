@@ -18,6 +18,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ADMIN_MIN_ROOT_DISK_GB`, `ADMIN_MAX_SHM_USED_PCT`.
 
 ### Fixed
+- Rolling update is gated on pre-flight invariants (#43): refused (409)
+  without memory headroom, full quorum, intact driver dirs or disk space;
+  `{"force":true}` overrides. Abort messages now report the actual per-node
+  cluster state at abort time ("QUORUM LOST" when it is) instead of a
+  hardcoded "cluster keeps quorum (2/3)" that lied during the incident.
 - Live media-driver dirs can no longer be deleted by any admin path (#42):
   both deleters (rolling-update's per-node cleanup and the pre-start stale
   Aeron sweep) now require the launch script's `<dir>.pid` ground truth to

@@ -30,6 +30,7 @@ type OperationsService struct {
 	clusterStatus *ClusterStatus
 	procMgr       agent.ProcessAgent
 	statusSvc     *StatusService
+	preflight     *Preflight
 	log           *slog.Logger
 }
 
@@ -52,6 +53,26 @@ func (o *OperationsService) SetProcessManager(pm agent.ProcessAgent) {
 // SetStatusService injects the status service for the archive-op lag guard.
 func (o *OperationsService) SetStatusService(s *StatusService) {
 	o.statusSvc = s
+}
+
+// SetPreflight injects the invariant engine that gates destructive operations.
+func (o *OperationsService) SetPreflight(p *Preflight) {
+	o.preflight = p
+}
+
+// gate runs the pre-flight gate for op inside an already-claimed progress
+// slot, releasing the slot on refusal (an early return without Finish would
+// wedge every future operation — the #26 lesson, same shape as Snapshot's
+// lag guard).
+func (o *OperationsService) gate(op string, force bool) error {
+	if o.preflight == nil {
+		return nil
+	}
+	if err := o.preflight.Gate(op, force); err != nil {
+		o.progress.Finish(false, "refused: "+err.Error())
+		return err
+	}
+	return nil
 }
 
 // archiveOpBlockReason returns a non-empty reason when snapshot/housekeeping
@@ -158,13 +179,58 @@ func (o *OperationsService) installStagedJar(stagingJar, jarPath string) error {
 }
 
 // RollingUpdate performs a rolling update of all cluster nodes
-func (o *OperationsService) RollingUpdate() error {
+func (o *OperationsService) RollingUpdate(force bool) error {
 	if !o.progress.TryStart("rolling-update", 11) {
 		return fmt.Errorf("another operation in progress")
+	}
+	// Pre-flight (#43): a node restart's catchup transient on a box without
+	// memory headroom OOM-stalled the whole cluster on 2026-07-06, and rolling
+	// at 2/3 gambles the remaining follower. Refuse unless forced.
+	if err := o.gate("rolling-update", force); err != nil {
+		return err
 	}
 
 	go o.doRollingUpdate()
 	return nil
+}
+
+// clusterStateAtAbort renders the truthful cluster state for abort messages,
+// from the same 2s status cache the archive-op guard trusts. Hardcoded
+// "cluster keeps quorum (2/3)" claims lied during the #43 incident: the abort
+// fired after a full-cluster OOM crash with all three nodes down.
+func (o *OperationsService) clusterStateAtAbort() string {
+	if o.statusSvc == nil {
+		return "cluster state unknown (status service unavailable)"
+	}
+	s := o.statusSvc.GetStatus()
+	nodes, ok := s["nodes"].([]map[string]interface{})
+	if !ok {
+		return "cluster state unknown (node health unavailable)"
+	}
+	return summarizeNodeStates(nodes)
+}
+
+// summarizeNodeStates is the pure core of clusterStateAtAbort:
+// "state at abort per last poll: node0=OFFLINE node1=HEALTHY node2=DEAD — 1/3 healthy, QUORUM LOST".
+func summarizeNodeStates(nodes []map[string]interface{}) string {
+	healthy := 0
+	var parts []string
+	for _, n := range nodes {
+		h, _ := n["health"].(string)
+		if h == "" {
+			h = "UNKNOWN"
+		}
+		if h == HealthHealthy {
+			healthy++
+		}
+		parts = append(parts, fmt.Sprintf("node%v=%s", n["id"], h))
+	}
+	quorum := "quorum intact"
+	if healthy < 2 {
+		quorum = "QUORUM LOST"
+	}
+	return fmt.Sprintf("state at abort per last poll: %s — %d/%d healthy, %s",
+		strings.Join(parts, " "), healthy, len(nodes), quorum)
 }
 
 // stageClusterJar builds match-cluster in an isolated copy of the project
@@ -268,7 +334,7 @@ func (o *OperationsService) doRollingUpdate() {
 			if err := o.installStagedJar(stagingJar, jarPath); err != nil {
 				o.clusterStatus.SetNodeStatus(nodeId, "OFFLINE", false)
 				o.progress.Finish(false, fmt.Sprintf(
-					"JAR deploy failed (%v) — ABORTED with node%d stopped; cluster keeps quorum (2/3)", err, nodeId))
+					"JAR deploy failed (%v) — ABORTED with node%d stopped; %s", err, nodeId, o.clusterStateAtAbort()))
 				return
 			}
 			jarSwapped = true
@@ -296,7 +362,7 @@ func (o *OperationsService) doRollingUpdate() {
 			o.clusterStatus.SetNodeStatus(nodeId, "OFFLINE", false)
 			o.progress.Finish(false, fmt.Sprintf(
 				"%s did not rejoin within 60s — ABORTED before touching more nodes; "+
-					"cluster keeps quorum (2/3), investigate node%d then re-run rolling-update", nodeLabel, nodeId))
+					"%s; investigate node%d then re-run rolling-update", nodeLabel, o.clusterStateAtAbort(), nodeId))
 			return
 		}
 		// Wait for the node to catch up to the leader's commit position before moving on.
@@ -306,7 +372,7 @@ func (o *OperationsService) doRollingUpdate() {
 		if !o.waitForFollowerCatchUp(log, nodeId, leader, 60*time.Second) {
 			o.progress.Finish(false, fmt.Sprintf(
 				"%s rejoined but did not catch up to the leader within 60s — ABORTED before "+
-					"touching more nodes; cluster keeps quorum (2/3), investigate node%d then re-run", nodeLabel, nodeId))
+					"touching more nodes; %s; investigate node%d then re-run", nodeLabel, o.clusterStateAtAbort(), nodeId))
 			return
 		}
 		o.progress.Update(step, nodeLabel+" caught up, marking as follower")
@@ -361,7 +427,8 @@ func (o *OperationsService) doRollingUpdate() {
 		}
 	}
 	if !electionOk {
-		o.progress.Finish(false, "Leader election failed after 60s — cluster may need manual recovery")
+		o.progress.Finish(false, "Leader election failed after 60s — cluster may need manual recovery; "+
+			o.clusterStateAtAbort())
 		return
 	}
 
@@ -378,25 +445,26 @@ func (o *OperationsService) doRollingUpdate() {
 	newLeader := o.cluster.DetectLeader()
 	if !o.waitForPort("127.0.0.1", ingressPort, 60*time.Second) {
 		o.clusterStatus.SetNodeStatus(leader, "OFFLINE", false)
-		exec.Command("rm", "-rf", stagingDir).Run()
+		os.RemoveAll(stagingDir)
 		o.progress.Finish(false, fmt.Sprintf(
 			"New code deployed on all nodes, but node%d (old leader) did not rejoin within 60s — "+
-				"cluster running at 2/3, investigate node%d", leader, leader))
+				"%s; investigate node%d", leader, o.clusterStateAtAbort(), leader))
 		return
 	}
 	if newLeader < 0 || !o.waitForFollowerCatchUp(log, leader, newLeader, 60*time.Second) {
 		o.clusterStatus.SetNodeStatus(leader, "FOLLOWER", true)
-		exec.Command("rm", "-rf", stagingDir).Run()
+		os.RemoveAll(stagingDir)
 		o.progress.Finish(false, fmt.Sprintf(
 			"New code deployed on all nodes, but node%d (old leader) rejoined without confirmed "+
-				"catch-up within 60s — verify commit positions before further operations", leader))
+				"catch-up within 60s — %s; verify commit positions before further operations",
+			leader, o.clusterStateAtAbort()))
 		return
 	}
 	o.progress.Update(11, fmt.Sprintf("Node %d rejoined and caught up", leader))
 	o.clusterStatus.SetNodeStatus(leader, "FOLLOWER", true)
 
 	// Cleanup staging
-	exec.Command("rm", "-rf", stagingDir).Run()
+	os.RemoveAll(stagingDir)
 
 	o.progress.Finish(true, "All nodes updated successfully with new code")
 }
