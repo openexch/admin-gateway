@@ -94,6 +94,14 @@ flag it; recover with the sequence above (force-stop now clears the orphan).
 
 ## 2. Rolling update (deploy new cluster code, zero downtime)
 
+0. Pre-flight: `GET /api/admin/preflight` and fix anything not `ok` first.
+   The operation runs the same checks itself and REFUSES (409) on blocking
+   failures: memory headroom below `ADMIN_MIN_MEM_MB` (default 4096MB — a
+   node restart's catchup transient is exactly when the extra memory hits;
+   the 2026-07-06 OOM took the whole cluster down, #43), any node not
+   HEALTHY, a live driver with a missing dir (#42), or low disk. On a
+   memory-pressured box: close browsers / pause the sim before rolling.
+   `{"force":true}` overrides for drills — you own the blast radius.
 1. Build: `POST /api/admin/rebuild-cluster` (or `rebuild-gateway` for the
    market gateway). Wait for `progress.complete` without `error`.
 2. Preconditions: `allNodesHealthy: true` and no operation in progress
@@ -104,11 +112,15 @@ flag it; recover with the sequence above (force-stop now clears the orphan).
    curl -X POST $ADMIN/api/admin/rolling-update
    ```
 
-   Followers restart first, the leader last. The operation HARD-FAILS (aborts,
-   keeping 2/3 quorum) if a follower fails to rejoin/catch up or the old leader
-   does not come back; it never "continues past" a wedge.
-4. On abort: fix the named node (often runbook 1's node0-limbo sequence), wait
-   for `allNodesHealthy`, re-run. A healthy run takes about 60 to 70 s.
+   Followers restart first, the leader last. The operation HARD-FAILS (aborts)
+   if a follower fails to rejoin/catch up or the old leader does not come
+   back; it never "continues past" a wedge.
+4. On abort: the message reports the ACTUAL per-node state at abort time
+   ("state at abort per last poll: node0=OFFLINE ... — 1/3 healthy, QUORUM
+   LOST"). Quorum intact: fix the named node (often runbook 1's node0-limbo
+   sequence), wait for `allNodesHealthy`, re-run. QUORUM LOST: stop — act on
+   runbook 5 (recovery), do NOT re-run the update. A healthy run takes about
+   60 to 70 s.
 5. Verify: `status` 3/3 healthy, leader present, `backup.fresh` back to true
    within a couple of minutes.
 

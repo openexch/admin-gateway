@@ -43,6 +43,7 @@ func main() {
 	preflight.SetProcessManager(procMgr)
 	preflight.SetStatusService(statusSvc)
 	statusSvc.SetPreflight(preflight)
+	opsSvc.SetPreflight(preflight)
 	autoSnapshot := services.NewAutoSnapshot(opsSvc)
 	statusSvc.SetAutoSnapshot(autoSnapshot)
 	autoSnapshot.Start(5) // Auto-snapshot every 5 minutes to prevent unbounded log growth

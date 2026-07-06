@@ -276,7 +276,9 @@ func (h *Handlers) handleStartAllNodes(w http.ResponseWriter, r *http.Request) {
 
 // Complex operations
 func (h *Handlers) handleRollingUpdate(w http.ResponseWriter, r *http.Request) {
-	if err := h.opsSvc.RollingUpdate(); err != nil {
+	// {"force": true} overrides pre-flight blocking failures (#43), the same
+	// escape hatch as the snapshot/housekeeping lag guard.
+	if err := h.opsSvc.RollingUpdate(parseForce(r)); err != nil {
 		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
