@@ -33,3 +33,4 @@ admin-gateway.prev
 admin-gateway.staging
 rebuild-pending.json
 rebuild-result.json
+.tools/

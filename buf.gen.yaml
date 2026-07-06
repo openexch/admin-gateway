@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# Code generation for agentwire/agent.proto — run via `make proto`.
+# Plugins are the pinned protoc-gen-go/-go-grpc binaries `make proto`
+# installs into .tools/ (pure-Go toolchain, no C++ protoc needed).
+version: v2
+plugins:
+  - local: .tools/protoc-gen-go
+    out: .
+    opt: paths=source_relative
+  - local: .tools/protoc-gen-go-grpc
+    out: .
+    opt: paths=source_relative
