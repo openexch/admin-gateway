@@ -18,6 +18,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ADMIN_MIN_ROOT_DISK_GB`, `ADMIN_MAX_SHM_USED_PCT`.
 
 ### Fixed
+- Starting a service whose launch artifact is missing is refused with one
+  clear "artifact missing — rebuild in progress?" failure on every start
+  path including auto-restart (#45), instead of crash-looping into a
+  disarmed auto-restart within seconds. All rebuild build steps (mvn, go
+  build, rsync) now run niced (`ADMIN_BUILD_NICE`, default 10, plus ionice
+  idle) so builds cannot starve the trading processes.
 - Rolling update is gated on pre-flight invariants (#43): refused (409)
   without memory headroom, full quorum, intact driver dirs or disk space;
   `{"force":true}` overrides. Abort messages now report the actual per-node

@@ -61,6 +61,10 @@ type ServiceDef struct {
 	// Drives the #42 orphan protections: start refuses while a live untracked
 	// driver holds <DriverDir>.pid, and force-stop kills that pid too.
 	DriverDir string `json:"-"`
+	// Launch artifact (jar/binary) this service execs. Start refuses when it
+	// is missing (#45): relaunching into a vanished artifact exits instantly,
+	// burns the crash-loop cap in seconds and disarms auto-restart.
+	Artifact string `json:"-"`
 }
 
 // Restart-loop cap + driver gate tuning (#17). Vars, not consts, so tests can
@@ -216,6 +220,7 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 			Command: nodeCmd(nodeCpuSets[nodeId]), Env: nodeEnv(nodeId), WorkDir: cfg.ProjectDir,
 			PreStart:    nodePreStart(nodeId),
 			AutoRestart: true, RestartSec: 10, StopTimeout: 5,
+			Artifact: cfg.JarPath, // the Command jar path is WorkDir-relative; check the absolute one
 		}
 		if externalDriver {
 			def.DependsOn = []string{fmt.Sprintf("driver%d", nodeId)}
@@ -262,6 +267,7 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 				PreStart:    [][]string{{"mkdir", "-p", filepath.Join(cfg.ProjectDir, "backup")}},
 				DependsOn:   []string{"node0", "node1", "node2"},
 				AutoRestart: true, RestartSec: 10, StopTimeout: 5,
+				Artifact: cfg.JarPath,
 			},
 			{
 				Name: "oms", Display: "Order Management", Role: RoleGateway, Port: 8080,
@@ -285,6 +291,7 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 				WorkDir:     cfg.OmsProjectDir,
 				DependsOn:   []string{"node0", "node1", "node2"},
 				AutoRestart: true, RestartSec: 5, StopTimeout: 10,
+				Artifact: cfg.OmsJar,
 			},
 			{
 				Name: "market", Display: "Market Gateway", Role: RoleGateway, Port: 8081,
@@ -307,6 +314,7 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 				WorkDir:     cfg.ProjectDir,
 				DependsOn:   []string{"node0", "node1", "node2"},
 				AutoRestart: true, RestartSec: 5, StopTimeout: 5,
+				Artifact: cfg.GatewayJar,
 			},
 			{
 				// Market simulator + demo canary (openexch/tools market-sim):
@@ -327,6 +335,7 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 				WorkDir:     filepath.Dir(cfg.SimBinary),
 				DependsOn:   []string{"oms", "market"},
 				AutoRestart: true, RestartSec: 10, StopTimeout: 15, // shutdown cancels sim quotes
+				Artifact: cfg.SimBinary,
 			},
 			{
 				Name: "admin", Display: "Admin Gateway", Role: RoleGateway, Port: 8082,
@@ -698,6 +707,25 @@ func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) err
 	// Phase 2: Pre-start work WITHOUT holding the lock (port wait, cleanup, etc.)
 	// This allows status queries and stop commands to proceed during preparation.
 	var startErr error
+
+	// Pre-start artifact check (#45): relaunching into a missing jar exits
+	// instantly ("Unable to access jarfile"), burns the crash-loop cap in
+	// seconds and disarms auto-restart — that turned a rebuild-gateway mvn
+	// clean into a 10-minute full outage on 2026-07-06. One refused start
+	// with the cause instead. This is the single start funnel, so the check
+	// covers API starts, StartAll, auto-restart and cascade recovery alike.
+	if def.Artifact != "" {
+		if _, err := os.Stat(def.Artifact); err != nil {
+			refuse := fmt.Errorf("artifact missing: %s — rebuild in progress or failed? start refused; restore the artifact, then start explicitly", def.Artifact)
+			proc.mu.Lock()
+			proc.status = "failed"
+			proc.lastError = refuse.Error()
+			proc.starting = false
+			proc.mu.Unlock()
+			pm.log.Warn("refused start", "service", def.Name, "err", refuse)
+			return refuse
+		}
+	}
 
 	// Orphan-driver refusal (#42): reaching here means this driver is tracked
 	// stopped, so a live pid in <DriverDir>.pid is an untracked orphan. Launching

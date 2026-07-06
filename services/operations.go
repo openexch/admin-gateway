@@ -144,6 +144,25 @@ func (o *OperationsService) restartService(name string) {
 	}
 }
 
+// buildCmd returns an exec.Cmd for a heavy build step (mvn, go build, rsync),
+// niced so compiles cannot starve the trading processes: an unniced maven
+// build on this box is the same resource-pressure family that OOM-crashed the
+// cluster during the #43 rolling update. ADMIN_BUILD_NICE (default 10) tunes
+// CPU niceness, 0 disables; disk I/O drops to idle best-effort when ionice
+// is available.
+func (o *OperationsService) buildCmd(dir string, argv ...string) *exec.Cmd {
+	if n := o.cfg.BuildNice; n > 0 {
+		prefix := []string{"nice", "-n", strconv.Itoa(n)}
+		if _, err := exec.LookPath("ionice"); err == nil {
+			prefix = append([]string{"ionice", "-c2", "-n7"}, prefix...)
+		}
+		argv = append(prefix, argv...)
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Dir = dir
+	return cmd
+}
+
 // installStagedJar deploys a staged JAR to its live path through the agent's
 // artifact primitive (sha256-verified, atomic). Removes the staging file on
 // success, preserving the old mv semantics.
@@ -248,15 +267,14 @@ func (o *OperationsService) stageClusterJar(tempBuildDir, stagingDir, stagingJar
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		return fmt.Errorf("create staging dir: %w", err)
 	}
-	rsync := exec.Command("rsync", "-a",
+	rsync := o.buildCmd("", "rsync", "-a",
 		"--exclude=*/target", "--exclude=.git", "--exclude=admin-gateway",
 		"--exclude=backup", "--exclude=binaries", "--exclude=binance-replay",
 		o.cfg.ProjectDir+"/", tempBuildDir+"/")
 	if output, err := rsync.CombinedOutput(); err != nil {
 		return fmt.Errorf("rsync: %v: %s", err, output)
 	}
-	mvn := exec.Command("mvn", "package", "-pl", "match-cluster", "-am", "-DskipTests", "-q")
-	mvn.Dir = tempBuildDir
+	mvn := o.buildCmd(tempBuildDir, "mvn", "package", "-pl", "match-cluster", "-am", "-DskipTests", "-q")
 	if output, err := mvn.CombinedOutput(); err != nil {
 		return fmt.Errorf("mvn: %v: %s", err, output)
 	}
@@ -493,8 +511,7 @@ func (o *OperationsService) doRebuildAdmin() {
 	// disabled, so `go build` must not depend on ambient PATH resolution or
 	// on downloading the go.mod toolchain.
 	o.progress.Update(1, "Building admin gateway from source...")
-	cmd := exec.Command(o.cfg.GoBin, "build", "-o", stagingBinary, ".")
-	cmd.Dir = adminDir
+	cmd := o.buildCmd(adminDir, o.cfg.GoBin, "build", "-o", stagingBinary, ".")
 	cmd.Env = append(os.Environ(), "GOTOOLCHAIN=local")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		os.Remove(stagingBinary)
@@ -708,8 +725,7 @@ func (o *OperationsService) RebuildGateway(restart bool) error {
 func (o *OperationsService) doRebuildGateway(restart bool) {
 	// Step 1: Build gateway module (safe - separate JAR from cluster)
 	o.progress.Update(1, "Building gateway module...")
-	cmd := exec.Command("mvn", "package", "-pl", "match-gateway", "-am", "-DskipTests", "-q")
-	cmd.Dir = o.cfg.ProjectDir
+	cmd := o.buildCmd(o.cfg.ProjectDir, "mvn", "package", "-pl", "match-gateway", "-am", "-DskipTests", "-q")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		o.progress.Finish(false, "Gateway build failed: "+err.Error()+" output: "+string(output))
