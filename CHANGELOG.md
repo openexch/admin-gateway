@@ -22,8 +22,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   events (started/stopped/crashed/cascade-stop/disarmed/adopted) and
   operation progress — the first consumer of the ProcessAgent Subscribe
   stream. Live-only, best-effort delivery; `/status` remains the source of
-  truth. Browser EventSource clients may authenticate with `?token=` on this
-  path only.
+  truth. Auth is the standard bearer header — URL tokens are rejected
+  everywhere (they leak into history and logs); browser clients needing a
+  token consume the stream via fetch-streaming instead of EventSource.
 
 ### Added (rebuild-oms)
 - `POST /api/admin/rebuild-oms {restart, force}`: staged isolated-tree build
