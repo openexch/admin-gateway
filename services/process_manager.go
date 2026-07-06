@@ -270,10 +270,12 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 					"OMS_GRPC_PORT":     "9090",
 					"EGRESS_PORT":       "9093",
 					"CLUSTER_ADDRESSES": "127.0.0.1,127.0.0.1,127.0.0.1",
-					// Dev box only: OMS defaults to secure auth (api-key with no
-					// keys = reject everything, oms#36); the demo UI and load
-					// harness need the dev provider.
-					"OMS_AUTH_MODE": "dev",
+					// Public demo auth (oms#72): self-registered users with opaque
+					// tokens, scoped to their own data. The dev-token backdoor
+					// stays for local infrastructure only (userId 1 + the sim
+					// range 900000-900999, all self-scoped), so the market-sim
+					// bots and the demo canary keep working unchanged.
+					"OMS_AUTH_MODE": "demo",
 					// CORS is default-deny since oms#37; the hosted demo UI is a
 					// cross-origin browser client and needs an explicit allowlist.
 					"OMS_CORS_ORIGINS": "https://trade.openexch.io",
