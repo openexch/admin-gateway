@@ -172,6 +172,13 @@ func NewProcessManagerWith(opts ProcessManagerOptions) *ProcessManager {
 // NewProcessManager builds the single-box catalog (drivers, nodes, backup,
 // gateways, sim) from the gateway config. The catalog construction is the
 // only config-dependent part; everything else lives in NewProcessManagerWith.
+// marketEdgeTokenFile is the bearer token the market gateway presents to the
+// edge relay's /publish endpoint (edge/market-relay PUBLISH_TOKEN secret).
+func marketEdgeTokenFile() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config/openexchange-market-edge.token")
+}
+
 func NewProcessManager(cfg *config.Config) *ProcessManager {
 	logger := logging.Component("pm")
 
@@ -363,6 +370,15 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 					// runs pure in-memory, exactly as before persistence existed.
 					"MARKET_PG_URL":  "jdbc:postgresql://localhost:5432/marketdata",
 					"MARKET_PG_USER": "market",
+					// Edge fan-out (match edge/market-relay): the gateway
+					// publishes each broadcast frame ONCE to the relay Worker,
+					// which fans out to all public viewers at the Cloudflare
+					// edge — origin upload stays flat in viewer count (the box
+					// uplink is ~5 Mbit/s). The token FILE is the secret
+					// (0600, outside the repo); with URL or token absent the
+					// gateway serves viewers directly, exactly as before.
+					"MARKET_EDGE_URL":        "wss://market-relay.emrebulutlar.workers.dev/publish",
+					"MARKET_EDGE_TOKEN_FILE": marketEdgeTokenFile(),
 				},
 				WorkDir:     cfg.ProjectDir,
 				DependsOn:   []string{"node0", "node1", "node2"},
