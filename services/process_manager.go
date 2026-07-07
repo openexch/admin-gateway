@@ -400,6 +400,11 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 					"SIM_HEALTH_ADDR":    "127.0.0.1:8090",
 					"SIM_CORS_ORIGIN":    "https://trade.openexch.io",
 					"SIM_PUBLIC_OMS_URL": "https://oms.openexch.io",
+					// The edge-relay viewer path (market-relay Worker): the
+					// canary watches the SAME public WS real viewers use, so
+					// a frozen edge (half-open publisher, 2026-07-07) flips
+					// admin_demo_healthy even while the local stack is fine.
+					"SIM_EDGE_WS_URL": "wss://market.openexch.io/ws",
 				},
 				WorkDir:     filepath.Dir(cfg.SimBinary),
 				DependsOn:   []string{"oms", "market"},
