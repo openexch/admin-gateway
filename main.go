@@ -24,6 +24,16 @@ func main() {
 	cfg := config.Load()
 	logging.Setup(cfg.LogFormat)
 
+	// Active runtime profile (config/profiles.go): drives the service catalog
+	// heaps/idle/pinning/etc. and the preflight mem gate. Apply the live OS knobs
+	// (governor/THP) best-effort now; the catalog knobs take effect as services
+	// (re)start.
+	slog.Info("active runtime profile",
+		"profile", cfg.ProfileName, "nodeHeapMB", cfg.Profile.NodeHeapMB,
+		"idle", cfg.Profile.IdleMode, "driver", cfg.Profile.DriverProfile,
+		"pinning", cfg.Profile.Pinning, "minMemMB", cfg.Profile.MinMemMB)
+	services.ApplyProfileOSKnobs(cfg.Profile)
+
 	// Initialize services
 	systemd := services.NewSystemd()   // only used by OperationsService for admin gateway self-restart
 	cluster := services.NewCluster(cfg)
@@ -51,7 +61,7 @@ func main() {
 	metricsSvc := services.NewMetricsService(statusSvc, opsSvc, procMgr, progress, preflight)
 
 	// Initialize handlers
-	h := handlers.New(statusSvc, opsSvc, cluster, progress, clusterStatus, autoSnapshot, logSvc, procMgr, metricsSvc, preflight)
+	h := handlers.New(statusSvc, opsSvc, cluster, progress, clusterStatus, autoSnapshot, logSvc, procMgr, metricsSvc, preflight, cfg)
 
 	// Setup router
 	r := chi.NewRouter()

@@ -182,51 +182,66 @@ func marketEdgeTokenFile() string {
 func NewProcessManager(cfg *config.Config) *ProcessManager {
 	logger := logging.Component("pm")
 
-	javaBase := []string{
-		"/usr/bin/java",
-		"-XX:+UseZGC", "-XX:+ZGenerational",
-		"-XX:+UnlockDiagnosticVMOptions", "-XX:GuaranteedSafepointInterval=0",
-		"-XX:+AlwaysPreTouch", "-XX:+UseNUMA",
-		"-XX:+PerfDisableSharedMem",
-		"-XX:+TieredCompilation", "-XX:TieredStopAtLevel=4",
-		"--add-opens", "java.base/jdk.internal.misc=ALL-UNNAMED",
-		"--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED",
-		"-Xmx2g", "-Xms2g",
+	// The active runtime profile (config/profiles.go) drives heaps, idle
+	// strategy, pinning, book capacity, log-term, driver mode/profile and the
+	// sim load. STACK_PROFILE selects it (default demo); values in profiles.json.
+	prof := cfg.Profile
+
+	// javaFlags builds the JVM launch flags for a given heap (-Xmx==-Xms).
+	// AlwaysPreTouch (commit the whole heap at boot) is profile-gated so the
+	// light/dev profiles keep a small resident footprint instead of committing
+	// the full heap up front.
+	javaFlags := func(heapMB int) []string {
+		flags := []string{
+			"/usr/bin/java",
+			"-XX:+UseZGC", "-XX:+ZGenerational",
+			"-XX:+UnlockDiagnosticVMOptions", "-XX:GuaranteedSafepointInterval=0",
+			"-XX:+UseNUMA", "-XX:+PerfDisableSharedMem",
+			"-XX:+TieredCompilation", "-XX:TieredStopAtLevel=4",
+			"--add-opens", "java.base/jdk.internal.misc=ALL-UNNAMED",
+			"--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED",
+			fmt.Sprintf("-Xmx%dm", heapMB), fmt.Sprintf("-Xms%dm", heapMB),
+		}
+		if prof.PreTouch {
+			flags = append(flags, "-XX:+AlwaysPreTouch")
+		}
+		return flags
 	}
 
-	// External media driver mode (default): one standalone driver process per node,
-	// engine JVMs connect over shared-memory IPC only (kernel-bypass-ready; see
-	// match/docs/kernel-bypass.md). ENGINE_DRIVER_MODE=embedded reverts to the old
-	// in-JVM ClusteredMediaDriver (no driver services, no extra env).
-	engineDriverMode := os.Getenv("ENGINE_DRIVER_MODE")
-	externalDriver := engineDriverMode != "embedded"
-
-	// dev profile (default): SHARED driver threads + backoff idles — three DEDICATED
-	// busy-spin drivers do not fit a single 13700K next to three engine nodes.
-	// prod: set ENGINE_DRIVER_PROFILE=prod plus SENDER/RECEIVER/CONDUCTOR_CORE in the
-	// admin gateway's environment (one node per host, isolated cores).
-	driverProfile := os.Getenv("ENGINE_DRIVER_PROFILE")
-	if driverProfile == "" {
-		driverProfile = "dev"
+	// pin prefixes a command with taskset for dedicated-core pinning; the "none"
+	// profile (light) returns no prefix so scheduling stays with the OS and the
+	// cores are free for other work (an IDE, a browser).
+	pin := func(cpuSet string) []string {
+		if prof.Pinning == "none" {
+			return nil
+		}
+		return []string{"/usr/bin/taskset", "-c", cpuSet}
 	}
+
+	// External media driver mode: one standalone driver process per node, engine
+	// JVMs connect over shared-memory IPC (kernel-bypass-ready; see
+	// match/docs/kernel-bypass.md). driverMode=embedded reverts to the in-JVM
+	// ClusteredMediaDriver (no driver services). Driven by the profile.
+	externalDriver := prof.DriverMode != "embedded"
+
+	// dev driver profile: SHARED threads + backoff idles; prod: DEDICATED
+	// busy-spin (+ SENDER/RECEIVER/CONDUCTOR_CORE pinning if set in the env).
+	driverProfile := prof.DriverProfile
 
 	driverDir := driverDirPath
 
-	// Driver shares its node's core quad: SHARED-mode threads coexist with the engine
-	// in dev; the prod layout instead pins driver threads via launch-driver.sh core vars.
 	driverCmd := func(nodeId int, cpuSet string) []string {
-		return []string{"/usr/bin/taskset", "-c", cpuSet,
-			"/usr/bin/bash", filepath.Join(cfg.ProjectDir, "deploy/media-driver/launch-driver.sh"),
+		cmd := pin(cpuSet)
+		return append(cmd, "/usr/bin/bash",
+			filepath.Join(cfg.ProjectDir, "deploy/media-driver/launch-driver.sh"),
 			"--instance", fmt.Sprintf("node%d", nodeId),
-			"--profile", driverProfile}
+			"--profile", driverProfile)
 	}
 
-	// Node command with taskset for CPU pinning
 	nodeCmd := func(cpuSet string) []string {
-		cmd := []string{"/usr/bin/taskset", "-c", cpuSet}
-		cmd = append(cmd, javaBase...)
-		cmd = append(cmd, "-jar", "match-cluster/target/match-cluster.jar")
-		return cmd
+		cmd := pin(cpuSet)
+		cmd = append(cmd, javaFlags(prof.NodeHeapMB)...)
+		return append(cmd, "-jar", "match-cluster/target/match-cluster.jar")
 	}
 
 	nodeEnv := func(nodeId int) map[string]string {
@@ -235,6 +250,11 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 			"CLUSTER_NODE":      strconv.Itoa(nodeId),
 			"CLUSTER_PORT_BASE": "9000",
 			"BASE_DIR":          fmt.Sprintf("/dev/shm/aeron-cluster/node%d", nodeId),
+			// Profile-driven engine/transport tuning; def.Env is layered after
+			// os.Environ() so these override any inherited driver-profile.conf.
+			"TRANSPORT_IDLE_MODE":        prof.IdleMode,
+			"TRANSPORT_LOG_TERM_LENGTH":  prof.LogTermLength,
+			"MATCH_ENGINE_BOOK_CAPACITY": strconv.Itoa(prof.BookCapacity),
 		}
 		if externalDriver {
 			env["TRANSPORT_DRIVER_MODE"] = "external"
@@ -249,24 +269,20 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 		}
 	}
 
+	// backup runs unpinned on the backup heap.
 	gatewayCmd := func() []string {
-		cmd := make([]string, len(javaBase))
-		copy(cmd, javaBase)
-		return cmd
+		return javaFlags(prof.BackupHeapMB)
 	}
 
-	// Pinned variants for OMS and market gateway. Cluster nodes occupy cores 0-11
-	// (4 each on a 13700K). Pin client processes to disjoint cores so their busy/spin
-	// polling threads don't compete with the cluster's BusySpinIdleStrategy threads.
+	// Pinned client commands (market gateway, OMS) on cores disjoint from the
+	// cluster's 0-11 so their poll threads don't compete with the cluster's idle
+	// strategy. Heaps are per-role from the profile.
 	pinnedGatewayCmd := func(cpuSet string) []string {
-		cmd := []string{"/usr/bin/taskset", "-c", cpuSet}
-		cmd = append(cmd, javaBase...)
-		return cmd
+		return append(pin(cpuSet), javaFlags(prof.MarketHeapMB)...)
 	}
 
 	omsCmd := func(cpuSet string) []string {
-		cmd := []string{"/usr/bin/taskset", "-c", cpuSet}
-		cmd = append(cmd, javaBase...)
+		cmd := append(pin(cpuSet), javaFlags(prof.OmsHeapMB)...)
 		return append(cmd, "-jar", cfg.OmsJar)
 	}
 
@@ -392,8 +408,10 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 				// :8090/health. Pinned to the spare E-cores; pause it before
 				// ad-hoc load tests (POST :8090/control {"pause":true}).
 				Name: "sim", Display: "Market Simulator", Role: RoleInfra, Port: 8090,
-				Command: []string{"/usr/bin/taskset", "-c", "20-23", cfg.SimBinary,
-					"-mode=run", "-source=auto", "-global-ops=60"},
+				// -global-ops is profile-driven (0 = canary only, no maker load);
+				// stop the sim (processes/sim/stop) to fully free cores 20-23.
+				Command: append(pin("20-23"), cfg.SimBinary,
+					"-mode=run", "-source=auto", fmt.Sprintf("-global-ops=%d", prof.SimGlobalOps)),
 				Env: map[string]string{
 					"OMS_URL":            "http://127.0.0.1:8080",
 					"MARKET_WS_URL":      "ws://127.0.0.1:8081/ws",

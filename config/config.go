@@ -2,6 +2,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,6 +41,13 @@ type Config struct {
 	AgentToken   string // shared agent token (ADMIN_AGENT_TOKEN or _FILE)
 	AgentTLSCert string // TLS certificate for the agent listener (ADMIN_AGENT_TLS_CERT)
 	AgentTLSKey  string // TLS key for the agent listener (ADMIN_AGENT_TLS_KEY)
+
+	// Runtime profile (profiles.go): the active tuning bundle and the full set.
+	// ProfileName is chosen by STACK_PROFILE (default demo); Profile drives the
+	// service catalog (heaps/idle/pinning/etc.) and the preflight mem gate.
+	ProfileName string
+	Profile     Profile
+	Profiles    map[string]Profile
 }
 
 func Load() *Config {
@@ -67,6 +75,23 @@ func Load() *Config {
 
 	homeDir, _ := os.UserHomeDir()
 
+	// Resolve the active runtime profile. A malformed embedded default is a
+	// build bug; fall back to a minimal safe demo so the admin still boots.
+	profiles, err := LoadProfiles()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "profiles: %v; using built-in fallback\n", err)
+		profiles = fallbackProfiles()
+	}
+	profileName := ActiveProfileName(profiles)
+	profile := profiles[profileName]
+
+	// The profile sets the mem-available block threshold; ADMIN_MIN_MEM_MB, when
+	// explicitly set, remains an operator override (emergency escape hatch).
+	minMemMB := profile.MinMemMB
+	if v := os.Getenv("ADMIN_MIN_MEM_MB"); v != "" {
+		minMemMB = getEnvIntOrDefault("ADMIN_MIN_MEM_MB", minMemMB)
+	}
+
 	return &Config{
 		Port:          getEnvOrDefault("ADMIN_PORT", "8082"),
 		BindAddr:      getEnvOrDefault("ADMIN_BIND", "127.0.0.1"),
@@ -85,7 +110,7 @@ func Load() *Config {
 		// `cd tools/market-sim && go build -o market-sim .`
 		SimBinary: getEnvOrDefault("SIM_BINARY",
 			filepath.Join(filepath.Dir(projectDir), "tools/market-sim/market-sim")),
-		MinMemMB:      getEnvIntOrDefault("ADMIN_MIN_MEM_MB", 4096),
+		MinMemMB:      minMemMB,
 		MinRootDiskGB: getEnvIntOrDefault("ADMIN_MIN_ROOT_DISK_GB", 5),
 		MaxShmUsedPct: getEnvIntOrDefault("ADMIN_MAX_SHM_USED_PCT", 90),
 		BuildNice:     getEnvIntOrDefault("ADMIN_BUILD_NICE", 10),
@@ -93,6 +118,9 @@ func Load() *Config {
 		AgentToken:    loadToken("ADMIN_AGENT_TOKEN"),
 		AgentTLSCert:  os.Getenv("ADMIN_AGENT_TLS_CERT"),
 		AgentTLSKey:   os.Getenv("ADMIN_AGENT_TLS_KEY"),
+		ProfileName:   profileName,
+		Profile:       profile,
+		Profiles:      profiles,
 	}
 }
 
