@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/match/admin-gateway/agent"
+	"github.com/match/admin-gateway/config"
 	"github.com/match/admin-gateway/logging"
 	"github.com/match/admin-gateway/services"
 )
@@ -24,6 +25,7 @@ type Handlers struct {
 	procMgr      agent.ProcessAgent
 	metrics      *services.MetricsService
 	preflight    *services.Preflight
+	cfg          *config.Config
 }
 
 func New(
@@ -37,6 +39,7 @@ func New(
 	procMgr agent.ProcessAgent,
 	metrics *services.MetricsService,
 	preflight *services.Preflight,
+	cfg *config.Config,
 ) *Handlers {
 	return &Handlers{
 		statusSvc:    statusSvc,
@@ -49,6 +52,7 @@ func New(
 		procMgr:      procMgr,
 		metrics:      metrics,
 		preflight:    preflight,
+		cfg:          cfg,
 	}
 }
 
@@ -59,7 +63,8 @@ func (h *Handlers) RegisterRoutes(r chi.Router) {
 	r.Get("/api/admin/status", h.handleStatus)
 	r.Get("/api/admin/progress", h.handleProgress)
 	r.Get("/api/admin/preflight", h.handlePreflight)
-	r.Get("/api/admin/events", h.handleEvents) // SSE: agent events + progress
+	r.Get("/api/admin/profile", h.handleGetProfile) // active runtime profile + available set
+	r.Get("/api/admin/events", h.handleEvents)       // SSE: agent events + progress
 
 	// Node operations
 	r.Post("/api/admin/restart-node", h.handleRestartNode)
@@ -158,6 +163,33 @@ func (h *Handlers) handlePreflight(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
 		"ok":     services.InvariantsOK(checks),
 		"checks": checks,
+	})
+}
+
+// handleGetProfile reports the active runtime profile and the full available
+// set (config/profiles.go). Read-only; applying a profile (POST) lands with the
+// apply-via-roll work.
+func (h *Handlers) handleGetProfile(w http.ResponseWriter, r *http.Request) {
+	available := make([]map[string]interface{}, 0, len(h.cfg.Profiles))
+	for _, name := range config.ProfileNames(h.cfg.Profiles) {
+		p := h.cfg.Profiles[name]
+		available = append(available, map[string]interface{}{
+			"name":         name,
+			"description":  p.Description,
+			"nodeHeapMB":   p.NodeHeapMB,
+			"idleMode":     p.IdleMode,
+			"driverMode":   p.DriverMode,
+			"pinning":      p.Pinning,
+			"bookCapacity": p.BookCapacity,
+			"minMemMB":     p.MinMemMB,
+			"simGlobalOps": p.SimGlobalOps,
+			"governor":     p.Governor,
+		})
+	}
+	jsonResponse(w, http.StatusOK, map[string]interface{}{
+		"active":    h.cfg.ProfileName,
+		"profile":   h.cfg.Profile,
+		"available": available,
 	})
 }
 
