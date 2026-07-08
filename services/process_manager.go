@@ -180,12 +180,23 @@ func marketEdgeTokenFile() string {
 }
 
 func NewProcessManager(cfg *config.Config) *ProcessManager {
-	logger := logging.Component("pm")
+	_, prof := cfg.Active()
+	return NewProcessManagerWith(ProcessManagerOptions{
+		Services:   buildServiceCatalog(cfg, prof),
+		ProjectDir: cfg.ProjectDir,
+	})
+}
 
-	// The active runtime profile (config/profiles.go) drives heaps, idle
-	// strategy, pinning, book capacity, log-term, driver mode/profile and the
-	// sim load. STACK_PROFILE selects it (default demo); values in profiles.json.
-	prof := cfg.Profile
+// buildServiceCatalog constructs the single-box service catalog (drivers,
+// nodes, backup, gateways, sim) from cfg and the given runtime profile. Pure in
+// (cfg, prof): the same inputs always yield the same []ServiceDef, so a live
+// profile switch rebuilds it and diffs against the current catalog to roll only
+// the services whose launch spec changed (services/operations_profile.go).
+//
+// The active runtime profile (config/profiles.go) drives heaps, idle strategy,
+// pinning, book capacity, log-term, driver mode/profile and the sim load.
+func buildServiceCatalog(cfg *config.Config, prof config.Profile) []ServiceDef {
+	logger := logging.Component("pm")
 
 	// javaFlags builds the JVM launch flags for a given heap (-Xmx==-Xms).
 	// AlwaysPreTouch (commit the whole heap at boot) is profile-gated so the
@@ -447,10 +458,7 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 		logger.Info("engine driver mode: embedded")
 	}
 
-	return NewProcessManagerWith(ProcessManagerOptions{
-		Services:   services,
-		ProjectDir: cfg.ProjectDir,
-	})
+	return services
 }
 
 func (pm *ProcessManager) Shutdown() {
@@ -458,7 +466,7 @@ func (pm *ProcessManager) Shutdown() {
 	close(pm.stopChan)
 
 	// Also close every per-process stopChan to prevent any in-flight auto-restarts
-	for _, def := range pm.services {
+	for _, def := range pm.servicesSnapshot() {
 		if def.Name == "admin" {
 			continue
 		}
@@ -482,8 +490,9 @@ func (pm *ProcessManager) Shutdown() {
 
 // List returns live info for all managed services
 func (pm *ProcessManager) List() []ProcessInfo {
-	result := make([]ProcessInfo, len(pm.services))
-	for i, def := range pm.services {
+	defs := pm.servicesSnapshot()
+	result := make([]ProcessInfo, len(defs))
+	for i, def := range defs {
 		result[i] = pm.getInfo(def)
 	}
 	return result
@@ -691,14 +700,15 @@ func (pm *ProcessManager) RestartAll() []ActionResult {
 
 // Summary returns an overview
 func (pm *ProcessManager) Summary() map[string]interface{} {
-	total := len(pm.services)
+	defs := pm.servicesSnapshot()
+	total := len(defs)
 	running := 0
 	stopped := 0
 	failed := 0
 	failedServices := map[string]string{}
 	var totalMem int64
 
-	for _, def := range pm.services {
+	for _, def := range defs {
 		proc := pm.procs[def.Name]
 		proc.mu.Lock()
 		switch {
@@ -1716,7 +1726,7 @@ func (pm *ProcessManager) backgroundPoller() {
 // silently disabled — an incident amplifier on 2026-07-02). Death of an
 // adopted process now runs the same crash protocol as monitored ones.
 func (pm *ProcessManager) refreshAdoptedProcesses() {
-	for _, def := range pm.services {
+	for _, def := range pm.servicesSnapshot() {
 		if def.Name == "admin" {
 			continue
 		}
@@ -1782,7 +1792,49 @@ func (pm *ProcessManager) getInfo(def ServiceDef) ProcessInfo {
 	return info
 }
 
+// servicesSnapshot returns a copy of the current catalog under a read lock.
+// Runtime readers (List/Summary/the poller) iterate the copy so they never race
+// a live ReloadCatalog swap (Phase 2 profile switch); before ReloadCatalog the
+// catalog was immutable-after-construction and read lock-free.
+func (pm *ProcessManager) servicesSnapshot() []ServiceDef {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	out := make([]ServiceDef, len(pm.services))
+	copy(out, pm.services)
+	return out
+}
+
+// ReloadCatalog atomically swaps the managed-service catalog, e.g. after a
+// profile switch rebuilds every ServiceDef's Command/Env. Membership must be
+// identical to the current catalog (same service names): the per-service proc
+// state map is built once at construction and read lock-free everywhere, so
+// adding or removing keys here would race those readers. Callers that change
+// membership (only the embedded↔external driver-mode boundary does) must go
+// through an admin restart instead. A running process keeps its old launch spec
+// until it is explicitly restarted onto the new def.
+func (pm *ProcessManager) ReloadCatalog(newServices []ServiceDef) error {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if len(newServices) != len(pm.services) {
+		return fmt.Errorf("catalog membership changed (%d→%d services); a driver-mode switch needs an admin restart, not a live reload",
+			len(pm.services), len(newServices))
+	}
+	have := make(map[string]bool, len(pm.services))
+	for _, d := range pm.services {
+		have[d.Name] = true
+	}
+	for _, d := range newServices {
+		if !have[d.Name] {
+			return fmt.Errorf("catalog membership changed (new service %q has no proc state); a driver-mode switch needs an admin restart", d.Name)
+		}
+	}
+	pm.services = newServices
+	return nil
+}
+
 func (pm *ProcessManager) findDef(name string) *ServiceDef {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	for i := range pm.services {
 		if pm.services[i].Name == name {
 			return &pm.services[i]
@@ -1793,7 +1845,7 @@ func (pm *ProcessManager) findDef(name string) *ServiceDef {
 
 func (pm *ProcessManager) findDependents(name string) []string {
 	var deps []string
-	for _, def := range pm.services {
+	for _, def := range pm.servicesSnapshot() {
 		for _, d := range def.DependsOn {
 			if d == name {
 				deps = append(deps, def.Name)
@@ -1805,9 +1857,7 @@ func (pm *ProcessManager) findDependents(name string) []string {
 }
 
 func (pm *ProcessManager) bootOrder() []ServiceDef {
-	ordered := make([]ServiceDef, len(pm.services))
-	copy(ordered, pm.services)
-	return ordered
+	return pm.servicesSnapshot()
 }
 
 func (pm *ProcessManager) shutdownOrder() []ServiceDef {

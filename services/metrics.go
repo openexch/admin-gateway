@@ -129,6 +129,14 @@ func (m *MetricsService) render() string {
 	gauge("admin_demo_healthy", "1 when the market simulator's end-to-end demo canary is healthy (orders, fills, market data, CORS incl. public edge).",
 		boolF(status["demoHealthy"]), "")
 
+	// Active runtime profile as a label'd gauge=1 (the series' label carries the
+	// value, à la node_exporter's info metrics), so a dashboard can alert on a
+	// profile drift or show which profile the stack is running.
+	if prof, ok := status["activeProfile"].(string); ok && prof != "" {
+		gauge("admin_active_profile", "The active stack runtime profile (label carries the name; value always 1).",
+			1, fmt.Sprintf("profile=%q", prof))
+	}
+
 	if nodes, ok := status["nodes"].([]map[string]interface{}); ok {
 		head("admin_node_healthy", "1 when the node's derived health is HEALTHY.", "gauge")
 		for _, n := range nodes {

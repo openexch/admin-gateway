@@ -371,6 +371,7 @@ func (s *StatusService) fetchStatus() map[string]interface{} {
 		"backup":          backup,
 		"demo":            demo,
 		"demoHealthy":     demoHealthy,
+		"activeProfile":   s.cfg.ActiveName(), // live runtime profile (Phase 2 switch)
 		"gateway": map[string]interface{}{ // Legacy field
 			"running": s.isServiceRunning("oms"),
 			"port":    8080,

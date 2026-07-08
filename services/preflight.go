@@ -53,6 +53,11 @@ var opGates = map[string][]string{
 	"rebuild-cluster": {"mem-available", "disk-space"},
 	"rebuild-gateway": {"mem-available", "disk-space"},
 	"rebuild-oms":     {"mem-available", "disk-space"},
+	// A profile switch rolls the nodes one at a time exactly like a rolling
+	// update, so it carries the same quorum hazard: starting from a degraded
+	// cluster can drop it below quorum when the first (healthy) node is stopped.
+	// No jar is built, so disk-space is irrelevant. force overrides.
+	"apply-profile": {"mem-available", "cluster-quorum", "driver-dirs"},
 }
 
 // statusReader is the slice of StatusService the quorum check needs.
@@ -176,10 +181,11 @@ func (p *Preflight) checkMemAvailable() InvariantResult {
 	if err != nil {
 		return InvariantResult{Name: name, OK: false, Severity: SeverityWarn, Detail: err.Error()}
 	}
-	blockBytes := int64(p.cfg.MinMemMB) * 1024 * 1024
+	minMemMB := p.cfg.MinMem() // live: a profile switch moves this floor atomically
+	blockBytes := int64(minMemMB) * 1024 * 1024
 	warnBytes := blockBytes + blockBytes/2 // 1.5x
 	detail := fmt.Sprintf("MemAvailable %dMB (block <%dMB, warn <%dMB; tune ADMIN_MIN_MEM_MB)",
-		avail/(1024*1024), p.cfg.MinMemMB, warnBytes/(1024*1024))
+		avail/(1024*1024), minMemMB, warnBytes/(1024*1024))
 	switch {
 	case avail < blockBytes:
 		return InvariantResult{Name: name, OK: false, Severity: SeverityBlock, Detail: detail}
