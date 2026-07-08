@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"runtime/debug"
 	"time"
 
 	"google.golang.org/grpc"
@@ -242,7 +243,20 @@ func runSession(ctx context.Context, cfg Config, client agentwire.ControlPlaneCl
 			continue // HelloAck duplicates / future message kinds
 		}
 		go func(cmd *agentwire.Command) {
-			res := execute(sctx, cfg, client, pa, cmd)
+			var res *agentwire.CommandResult
+			func() {
+				// A panic in any single command handler must not tear down the
+				// whole agent — recover and report it as a failed result so the
+				// session (and every other command) survives.
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("agentd: command handler panicked",
+							"cmdId", cmd.Id, "panic", r, "stack", string(debug.Stack()))
+						res = &agentwire.CommandResult{Error: fmt.Sprintf("command handler panicked: %v", r)}
+					}
+				}()
+				res = execute(sctx, cfg, client, pa, cmd)
+			}()
 			res.Id = cmd.Id
 			select {
 			case outbox <- &agentwire.AgentMessage{Msg: &agentwire.AgentMessage_Result{Result: res}}:
