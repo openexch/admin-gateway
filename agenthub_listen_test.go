@@ -22,14 +22,16 @@ func TestStartAgentHubLoopbackNoTokenAllowed(t *testing.T) {
 }
 
 func TestValidateNonLoopbackRefusedWithoutTokenAndTLS(t *testing.T) {
-	cases := []config.Config{
+	// Pointers, not values: config.Config carries a sync.RWMutex (the live
+	// profile guard) and must never be copied.
+	cases := []*config.Config{
 		{AgentListen: "0.0.0.0:0"},                                          // neither
 		{AgentListen: "0.0.0.0:0", AgentToken: "t"},                         // token only
 		{AgentListen: "0.0.0.0:0", AgentTLSCert: "/x.pem", AgentTLSKey: ""}, // cert only
 	}
 	for _, cfg := range cases {
-		if err := validateAgentListen(&cfg); err == nil {
-			t.Fatalf("non-loopback listener must refuse without token+TLS: %+v", cfg)
+		if err := validateAgentListen(cfg); err == nil {
+			t.Fatalf("non-loopback listener must refuse without token+TLS: %s", cfg.AgentListen)
 		} else if !strings.Contains(err.Error(), "refusing") && !strings.Contains(err.Error(), "TLS") {
 			t.Fatalf("unexpected refusal error: %v", err)
 		}

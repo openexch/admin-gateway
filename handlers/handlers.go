@@ -63,7 +63,8 @@ func (h *Handlers) RegisterRoutes(r chi.Router) {
 	r.Get("/api/admin/status", h.handleStatus)
 	r.Get("/api/admin/progress", h.handleProgress)
 	r.Get("/api/admin/preflight", h.handlePreflight)
-	r.Get("/api/admin/profile", h.handleGetProfile) // active runtime profile + available set
+	r.Get("/api/admin/profile", h.handleGetProfile)  // active runtime profile + available set
+	r.Post("/api/admin/profile", h.handleSetProfile) // switch the stack profile (apply-via-roll)
 	r.Get("/api/admin/events", h.handleEvents)       // SSE: agent events + progress
 
 	// Node operations
@@ -167,8 +168,8 @@ func (h *Handlers) handlePreflight(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleGetProfile reports the active runtime profile and the full available
-// set (config/profiles.go). Read-only; applying a profile (POST) lands with the
-// apply-via-roll work.
+// set (config/profiles.go). The active fields read the LIVE profile (cfg.Active)
+// so a switch is reflected immediately; the available set is immutable.
 func (h *Handlers) handleGetProfile(w http.ResponseWriter, r *http.Request) {
 	available := make([]map[string]interface{}, 0, len(h.cfg.Profiles))
 	for _, name := range config.ProfileNames(h.cfg.Profiles) {
@@ -186,10 +187,44 @@ func (h *Handlers) handleGetProfile(w http.ResponseWriter, r *http.Request) {
 			"governor":     p.Governor,
 		})
 	}
+	activeName, activeProfile := h.cfg.Active()
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"active":    h.cfg.ProfileName,
-		"profile":   h.cfg.Profile,
+		"active":    activeName,
+		"profile":   activeProfile,
 		"available": available,
+	})
+}
+
+// handleSetProfile switches the whole stack onto a named profile, applying it
+// via an in-process catalog rebuild + a quorum-safe roll (no admin restart, no
+// jar build). Async: 202 + poll /api/admin/progress. {"force":true} overrides
+// the switch-up memory guard and permits re-applying the already-active profile
+// (a full re-roll to converge stragglers). Membership-changing switches
+// (to/from the embedded-driver "light" profile) are refused with guidance.
+func (h *Handlers) handleSetProfile(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name    string `json:"name"`
+		Profile string `json:"profile"` // accepted alias for name
+		Force   bool   `json:"force"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]string{"error": "body must be {\"name\": \"<profile>\", \"force\": <bool>}"})
+		return
+	}
+	name := req.Name
+	if name == "" {
+		name = req.Profile
+	}
+	if name == "" {
+		jsonResponse(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+		return
+	}
+	if err := h.opsSvc.ApplyProfile(name, req.Force); err != nil {
+		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusAccepted, map[string]string{
+		"message": "Applying profile " + name + " — rolling services onto it. Poll GET /api/admin/progress.",
 	})
 }
 

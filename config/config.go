@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type Config struct {
@@ -43,11 +44,76 @@ type Config struct {
 	AgentTLSKey  string // TLS key for the agent listener (ADMIN_AGENT_TLS_KEY)
 
 	// Runtime profile (profiles.go): the active tuning bundle and the full set.
-	// ProfileName is chosen by STACK_PROFILE (default demo); Profile drives the
-	// service catalog (heaps/idle/pinning/etc.) and the preflight mem gate.
+	// ProfileName is chosen at boot (state file > STACK_PROFILE > demo); Profile
+	// drives the service catalog (heaps/idle/pinning/etc.) and the preflight mem
+	// gate. Profiles is immutable after Load. ProfileName/Profile/MinMemMB become
+	// MUTABLE once POST /api/admin/profile lands (Phase 2), so every concurrent
+	// reader must go through Active()/MinMem() — direct field reads are only safe
+	// at boot, before the server serves. mu guards the mutable trio; the setter
+	// is SetActive.
+	mu          sync.RWMutex
 	ProfileName string
 	Profile     Profile
 	Profiles    map[string]Profile
+
+	// minMemOverride is the operator's ADMIN_MIN_MEM_MB escape hatch (nil when
+	// unset). When present it pins MinMemMB across profile switches so a live
+	// switch never silently drops the emergency floor an operator set by hand.
+	minMemOverride *int
+}
+
+// Active returns the live active profile name and bundle under a read lock, so
+// a concurrent POST /api/admin/profile switch is observed atomically. Boot-time
+// code may read the fields directly (no writer exists yet); everything reachable
+// from a request or the status poller must use this.
+func (c *Config) Active() (string, Profile) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ProfileName, c.Profile
+}
+
+// ActiveName is the live active profile name (read-locked).
+func (c *Config) ActiveName() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ProfileName
+}
+
+// MinMem is the live preflight mem-available block threshold (MB), read-locked.
+// Preflight and the status poller call this every cycle; a profile switch moves
+// it atomically.
+func (c *Config) MinMem() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.MinMemMB
+}
+
+// EffectiveMinMem returns the mem floor that WOULD be in force if prof were the
+// active profile: the ADMIN_MIN_MEM_MB override if the operator set one, else
+// prof's own MinMemMB. Used by the switch-up headroom check so it reasons about
+// the post-switch floor, override included.
+func (c *Config) EffectiveMinMem(prof Profile) int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.minMemOverride != nil {
+		return *c.minMemOverride
+	}
+	return prof.MinMemMB
+}
+
+// SetActive commits a profile switch in memory: ProfileName, Profile and the
+// derived MinMemMB move together under the write lock. The ADMIN_MIN_MEM_MB
+// override, when set, still wins over the profile's own floor.
+func (c *Config) SetActive(name string, prof Profile) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ProfileName = name
+	c.Profile = prof
+	if c.minMemOverride != nil {
+		c.MinMemMB = *c.minMemOverride
+	} else {
+		c.MinMemMB = prof.MinMemMB
+	}
 }
 
 func Load() *Config {
@@ -82,14 +148,29 @@ func Load() *Config {
 		fmt.Fprintf(os.Stderr, "profiles: %v; using built-in fallback\n", err)
 		profiles = fallbackProfiles()
 	}
+	// Precedence for the boot profile: a persisted live switch (Phase 2's
+	// active-profile.json) wins, then STACK_PROFILE, then demo — so a profile
+	// chosen from the admin console survives an admin restart, while a fresh box
+	// with no state file still honours the env default.
 	profileName := ActiveProfileName(profiles)
+	if persisted, ok := ReadPersistedProfile(adminDir); ok {
+		if _, exists := profiles[persisted]; exists {
+			profileName = persisted
+		} else {
+			fmt.Fprintf(os.Stderr, "profiles: persisted profile %q not in the set; using %q\n", persisted, profileName)
+		}
+	}
 	profile := profiles[profileName]
 
 	// The profile sets the mem-available block threshold; ADMIN_MIN_MEM_MB, when
-	// explicitly set, remains an operator override (emergency escape hatch).
+	// explicitly set, remains an operator override (emergency escape hatch) that
+	// also pins the floor across live profile switches (see SetActive).
 	minMemMB := profile.MinMemMB
+	var minMemOverride *int
 	if v := os.Getenv("ADMIN_MIN_MEM_MB"); v != "" {
 		minMemMB = getEnvIntOrDefault("ADMIN_MIN_MEM_MB", minMemMB)
+		ov := minMemMB
+		minMemOverride = &ov
 	}
 
 	return &Config{
@@ -110,17 +191,18 @@ func Load() *Config {
 		// `cd tools/market-sim && go build -o market-sim .`
 		SimBinary: getEnvOrDefault("SIM_BINARY",
 			filepath.Join(filepath.Dir(projectDir), "tools/market-sim/market-sim")),
-		MinMemMB:      minMemMB,
-		MinRootDiskGB: getEnvIntOrDefault("ADMIN_MIN_ROOT_DISK_GB", 5),
-		MaxShmUsedPct: getEnvIntOrDefault("ADMIN_MAX_SHM_USED_PCT", 90),
-		BuildNice:     getEnvIntOrDefault("ADMIN_BUILD_NICE", 10),
-		AgentListen:   os.Getenv("ADMIN_AGENT_LISTEN"),
-		AgentToken:    loadToken("ADMIN_AGENT_TOKEN"),
-		AgentTLSCert:  os.Getenv("ADMIN_AGENT_TLS_CERT"),
-		AgentTLSKey:   os.Getenv("ADMIN_AGENT_TLS_KEY"),
-		ProfileName:   profileName,
-		Profile:       profile,
-		Profiles:      profiles,
+		MinMemMB:       minMemMB,
+		minMemOverride: minMemOverride,
+		MinRootDiskGB:  getEnvIntOrDefault("ADMIN_MIN_ROOT_DISK_GB", 5),
+		MaxShmUsedPct:  getEnvIntOrDefault("ADMIN_MAX_SHM_USED_PCT", 90),
+		BuildNice:      getEnvIntOrDefault("ADMIN_BUILD_NICE", 10),
+		AgentListen:    os.Getenv("ADMIN_AGENT_LISTEN"),
+		AgentToken:     loadToken("ADMIN_AGENT_TOKEN"),
+		AgentTLSCert:   os.Getenv("ADMIN_AGENT_TLS_CERT"),
+		AgentTLSKey:    os.Getenv("ADMIN_AGENT_TLS_KEY"),
+		ProfileName:    profileName,
+		Profile:        profile,
+		Profiles:       profiles,
 	}
 }
 
