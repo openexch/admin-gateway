@@ -68,6 +68,11 @@ func (l *LogService) getLogFile(name string, lines int, extra map[string]interfa
 	if lines > 500 {
 		lines = 500
 	}
+	// Floor at 0: a negative count would make start exceed len(allLines) and
+	// panic the slice below (the start<0 guard alone does not cover it).
+	if lines < 0 {
+		lines = 0
+	}
 
 	start := len(allLines) - lines
 	if start < 0 {

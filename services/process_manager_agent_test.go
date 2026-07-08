@@ -158,4 +158,15 @@ func TestTailLogAgent(t *testing.T) {
 	if _, err := pm.TailLog("../etc/passwd", 10); err == nil {
 		t.Fatal("path traversal must be rejected")
 	}
+	// A negative line count (e.g. an unvalidated wire int32) must not panic the
+	// slice; it clamps to zero lines.
+	for _, n := range []int{-1, 0} {
+		got, err := pm.TailLog("oms", n)
+		if err != nil {
+			t.Fatalf("TailLog(oms, %d): %v", n, err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("TailLog(oms, %d) = %v, want empty", n, got)
+		}
+	}
 }

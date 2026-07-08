@@ -48,6 +48,11 @@ func (pm *ProcessManager) TailLog(service string, lines int) ([]string, error) {
 	if lines > 500 {
 		lines = 500
 	}
+	if lines < 0 {
+		// A negative count (e.g. an unvalidated wire int32) would make
+		// start = len(all) - lines exceed len(all) and panic the slice below.
+		lines = 0
+	}
 	var all []string
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
