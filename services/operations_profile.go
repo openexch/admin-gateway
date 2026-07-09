@@ -130,9 +130,15 @@ func allManagedServices(cat []ServiceDef) map[string]bool {
 // path). Returns an error synchronously for a bad request or a busy slot; the
 // roll itself reports via the progress slot.
 func (o *OperationsService) ApplyProfile(name string, force bool) error {
-	prof, ok := o.cfg.Profiles[name]
+	prof, ok := o.cfg.ProfileByName(name)
 	if !ok {
-		return fmt.Errorf("unknown profile %q (have: %s)", name, strings.Join(config.ProfileNames(o.cfg.Profiles), ", "))
+		return fmt.Errorf("unknown profile %q (have: %s)", name, strings.Join(config.ProfileNames(o.cfg.ProfilesSnapshot()), ", "))
+	}
+	// Strict cross-field validation against the LIVE topology: a profile that
+	// cannot fit this box (heaps + floor vs RAM) or contradicts the current
+	// node count (dedicated pinning past the core quads) is refused up front.
+	if err := prof.ValidateStrict(o.cluster.NodeCount(), MemTotalMB()); err != nil {
+		return fmt.Errorf("profile %q fails validation: %w", name, err)
 	}
 	curName, curProf := o.cfg.Active()
 

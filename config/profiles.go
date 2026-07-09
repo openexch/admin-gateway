@@ -137,6 +137,34 @@ func (p Profile) validate() error {
 	return nil
 }
 
+// validTermLengths are Aeron's accepted log-term sizes (power-of-two);
+// LogTermLength is otherwise a free string passed straight to the env, so a
+// typo would only surface as a node boot failure.
+var validTermLengths = map[string]bool{"16m": true, "32m": true, "64m": true, "128m": true}
+
+// ValidateStrict runs the cross-field invariants a CUSTOM profile must satisfy
+// on top of validate()'s per-field checks. nodeCount is the matching engine's
+// LIVE topology (the heaviest heap multiplier) and memTotalMB the box's
+// physical RAM: a profile that cannot coexist with its own mem floor on this
+// box is refused at save/apply time instead of OOMing the stack later.
+func (p Profile) ValidateStrict(nodeCount int, memTotalMB int64) error {
+	if err := p.validate(); err != nil {
+		return err
+	}
+	if !validTermLengths[p.LogTermLength] {
+		return fmt.Errorf("logTermLength %q must be one of 16m, 32m, 64m, 128m", p.LogTermLength)
+	}
+	totalHeap := int64(p.NodeHeapMB*nodeCount + p.OmsHeapMB + p.MarketHeapMB + p.BackupHeapMB)
+	if memTotalMB > 0 && totalHeap+int64(p.MinMemMB) > memTotalMB {
+		return fmt.Errorf("total JVM heap %dMB (%d nodes) + minMemMB floor %dMB exceeds the box's %dMB RAM",
+			totalHeap, nodeCount, p.MinMemMB, memTotalMB)
+	}
+	if p.Pinning == "dedicated" && nodeCount > 3 {
+		return fmt.Errorf("pinning:dedicated only has core quads for 3 nodes; the cluster runs %d — use pinning:none", nodeCount)
+	}
+	return nil
+}
+
 func oneOf(field, val string, allowed ...string) error {
 	for _, a := range allowed {
 		if val == a {

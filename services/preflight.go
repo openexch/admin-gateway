@@ -197,6 +197,31 @@ func (p *Preflight) checkMemAvailable() InvariantResult {
 }
 
 // memAvailableBytes parses MemAvailable out of /proc/meminfo content.
+// MemTotalMB reads the box's physical RAM from /proc/meminfo (0 on failure).
+// The strict profile validation uses it to refuse profiles whose committed
+// heaps + mem floor cannot fit this box.
+func MemTotalMB() int64 {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			break
+		}
+		var kb int64
+		if _, err := fmt.Sscanf(fields[1], "%d", &kb); err != nil {
+			return 0
+		}
+		return kb / 1024
+	}
+	return 0
+}
+
 func memAvailableBytes(meminfo []byte) (int64, error) {
 	for _, line := range strings.Split(string(meminfo), "\n") {
 		if !strings.HasPrefix(line, "MemAvailable:") {

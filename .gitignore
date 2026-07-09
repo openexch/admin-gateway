@@ -40,3 +40,6 @@ active-profile.json
 
 # Runtime state (per-cluster node counts, written by the topology op)
 cluster-topology.json
+
+# Runtime state (operator-defined custom profiles)
+custom-profiles.json
