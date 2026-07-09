@@ -13,7 +13,7 @@
       "bookCapacity": 16384,
       "logTermLength": "16m",
       "minMemMB": 1024,
-      "simGlobalOps": 20,
+      "simGlobalOps": 60,
       "governor": "schedutil",
       "thp": "madvise",
       "pinning": "none"
