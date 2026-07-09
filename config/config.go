@@ -67,6 +67,89 @@ type Config struct {
 	// clustertopology.go), guarded by mu like the profile trio. Absent entries
 	// fall back to the descriptor constructor defaults (match=3, assets=1).
 	topology map[string]int
+
+	// customNames marks which entries of Profiles are operator-defined customs
+	// (custom-profiles.json) vs immutable embedded presets. Guarded by mu:
+	// the profiles CRUD mutates Profiles live, so every post-boot read of the
+	// set goes through ProfileByName/ProfilesSnapshot.
+	customNames map[string]bool
+}
+
+// ProfileByName returns one profile from the live set (presets + customs).
+func (c *Config) ProfileByName(name string) (Profile, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	p, ok := c.Profiles[name]
+	return p, ok
+}
+
+// ProfilesSnapshot returns a copy of the live profile set.
+func (c *Config) ProfilesSnapshot() map[string]Profile {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]Profile, len(c.Profiles))
+	for k, v := range c.Profiles {
+		out[k] = v
+	}
+	return out
+}
+
+// IsBuiltin reports whether name is one of the immutable embedded presets.
+func (c *Config) IsBuiltin(name string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, exists := c.Profiles[name]
+	return exists && !c.customNames[name]
+}
+
+// UpsertCustomProfile creates or updates a custom profile and returns the
+// customs snapshot for persistence. The caller has already validated the
+// profile and rejected preset names.
+func (c *Config) UpsertCustomProfile(name string, p Profile) map[string]Profile {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.customNames == nil {
+		c.customNames = map[string]bool{}
+	}
+	c.Profiles[name] = p
+	c.customNames[name] = true
+	// If the edited profile is the ACTIVE one, the live bundle moves with it so
+	// the next apply/diff reasons from what the operator just saved.
+	if c.ProfileName == name {
+		c.Profile = p
+		if c.minMemOverride == nil {
+			c.MinMemMB = p.MinMemMB
+		}
+	}
+	return c.customsSnapshotLocked()
+}
+
+// DeleteCustomProfile removes a custom profile and returns the customs
+// snapshot for persistence. Presets and unknown names are refused; the ACTIVE
+// check is the caller's (it owns the error message).
+func (c *Config) DeleteCustomProfile(name string) (map[string]Profile, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.Profiles[name]; !ok {
+		return nil, fmt.Errorf("unknown profile %q", name)
+	}
+	if !c.customNames[name] {
+		return nil, fmt.Errorf("%q is a built-in preset and cannot be deleted", name)
+	}
+	delete(c.Profiles, name)
+	delete(c.customNames, name)
+	return c.customsSnapshotLocked(), nil
+}
+
+// customsSnapshotLocked copies the custom subset; callers hold mu.
+func (c *Config) customsSnapshotLocked() map[string]Profile {
+	out := map[string]Profile{}
+	for name := range c.customNames {
+		if p, ok := c.Profiles[name]; ok {
+			out[name] = p
+		}
+	}
+	return out
 }
 
 // NodeCountFor returns the persisted node count for a cluster, or def when the
@@ -192,6 +275,19 @@ func Load() *Config {
 	// active-profile.json) wins, then STACK_PROFILE, then demo — so a profile
 	// chosen from the admin console survives an admin restart, while a fresh box
 	// with no state file still honours the env default.
+	// Merge the operator's custom profiles over the embedded presets BEFORE the
+	// persisted-active check — a custom profile can be the active one across
+	// restarts. Preset names win any collision (presets are immutable).
+	customNames := map[string]bool{}
+	for name, p := range ReadCustomProfiles(adminDir) {
+		if _, exists := profiles[name]; exists {
+			fmt.Fprintf(os.Stderr, "profiles: custom profile %q collides with a preset; ignoring the custom\n", name)
+			continue
+		}
+		profiles[name] = p
+		customNames[name] = true
+	}
+
 	profileName := ActiveProfileName(profiles)
 	if persisted, ok := ReadPersistedProfile(adminDir); ok {
 		if _, exists := profiles[persisted]; exists {
@@ -245,6 +341,7 @@ func Load() *Config {
 		ProfileName:    profileName,
 		Profile:        profile,
 		Profiles:       profiles,
+		customNames:    customNames,
 		topology:       ReadTopology(adminDir),
 	}
 }

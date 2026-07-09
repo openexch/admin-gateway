@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/match/admin-gateway/agent"
@@ -69,9 +72,12 @@ func (h *Handlers) RegisterRoutes(r chi.Router) {
 	r.Get("/api/admin/status", h.handleStatus)
 	r.Get("/api/admin/progress", h.handleProgress)
 	r.Get("/api/admin/preflight", h.handlePreflight)
-	r.Get("/api/admin/profile", h.handleGetProfile)  // active runtime profile + available set
-	r.Post("/api/admin/profile", h.handleSetProfile) // switch the stack profile (apply-via-roll)
-	r.Get("/api/admin/events", h.handleEvents)       // SSE: agent events + progress
+	r.Get("/api/admin/profile", h.handleGetProfile) // active runtime profile + available set
+	r.Post("/api/admin/profile", h.handleSetProfile)
+	r.Get("/api/admin/profiles", h.handleListProfiles)
+	r.Post("/api/admin/profiles", h.handleSaveProfile)
+	r.Delete("/api/admin/profiles/{name}", h.handleDeleteProfile)
+	r.Get("/api/admin/events", h.handleEvents) // SSE: agent events + progress
 
 	// Node operations
 	r.Post("/api/admin/restart-node", h.handleRestartNode)
@@ -174,33 +180,122 @@ func (h *Handlers) handlePreflight(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleGetProfile reports the active runtime profile and the full available
-// set (config/profiles.go). The active fields read the LIVE profile (cfg.Active)
-// so a switch is reflected immediately; the available set is immutable.
-func (h *Handlers) handleGetProfile(w http.ResponseWriter, r *http.Request) {
-	available := make([]map[string]interface{}, 0, len(h.cfg.Profiles))
-	for _, name := range config.ProfileNames(h.cfg.Profiles) {
-		p := h.cfg.Profiles[name]
-		available = append(available, map[string]interface{}{
-			"name":         name,
-			"description":  p.Description,
-			"nodeHeapMB":   p.NodeHeapMB,
-			"idleMode":     p.IdleMode,
-			"driverMode":   p.DriverMode,
-			"pinning":      p.Pinning,
-			"bookCapacity": p.BookCapacity,
-			"minMemMB":     p.MinMemMB,
-			"simGlobalOps": p.SimGlobalOps,
-			"governor":     p.Governor,
-		})
+// profileEntry renders one profile with its full field set + identity flags —
+// the shared shape between GET /profile's available list and the profiles CRUD.
+func (h *Handlers) profileEntry(name string, p config.Profile) map[string]interface{} {
+	return map[string]interface{}{
+		"name":          name,
+		"builtin":       h.cfg.IsBuiltin(name),
+		"description":   p.Description,
+		"nodeHeapMB":    p.NodeHeapMB,
+		"omsHeapMB":     p.OmsHeapMB,
+		"marketHeapMB":  p.MarketHeapMB,
+		"backupHeapMB":  p.BackupHeapMB,
+		"preTouch":      p.PreTouch,
+		"idleMode":      p.IdleMode,
+		"driverProfile": p.DriverProfile,
+		"driverMode":    p.DriverMode,
+		"bookCapacity":  p.BookCapacity,
+		"logTermLength": p.LogTermLength,
+		"minMemMB":      p.MinMemMB,
+		"simGlobalOps":  p.SimGlobalOps,
+		"governor":      p.Governor,
+		"thp":           p.THP,
+		"pinning":       p.Pinning,
 	}
+}
+
+// availableProfiles renders the live set (presets + customs) in stable order.
+func (h *Handlers) availableProfiles() []map[string]interface{} {
+	profiles := h.cfg.ProfilesSnapshot()
+	out := make([]map[string]interface{}, 0, len(profiles))
+	for _, name := range config.ProfileNames(profiles) {
+		out = append(out, h.profileEntry(name, profiles[name]))
+	}
+	return out
+}
+
+// handleGetProfile reports the active runtime profile and the full available
+// set (presets + operator customs). The active fields read the LIVE profile
+// (cfg.Active) so a switch is reflected immediately.
+func (h *Handlers) handleGetProfile(w http.ResponseWriter, r *http.Request) {
 	activeName, activeProfile := h.cfg.Active()
 	jsonResponse(w, http.StatusOK, map[string]interface{}{
 		"active":    activeName,
 		"profile":   activeProfile,
-		"available": available,
+		"available": h.availableProfiles(),
 	})
 }
+
+// --- Custom profiles CRUD (the presets are immutable; customs live in
+// custom-profiles.json and behave exactly like presets once saved) ---
+
+func (h *Handlers) handleListProfiles(w http.ResponseWriter, r *http.Request) {
+	jsonResponse(w, http.StatusOK, map[string]interface{}{"profiles": h.availableProfiles()})
+}
+
+// handleSaveProfile creates or updates a CUSTOM profile (save-as from any
+// starting point). Preset names are refused; the profile passes per-field AND
+// strict cross-field validation (heaps+floor vs box RAM, pinning vs the live
+// matching-engine topology, valid term lengths) before anything persists.
+func (h *Handlers) handleSaveProfile(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name    string         `json:"name"`
+		Profile config.Profile `json:"profile"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Name) == "" {
+		jsonResponse(w, http.StatusBadRequest, map[string]string{"error": "body must be {\"name\": \"<custom name>\", \"profile\": {…}}"})
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if !profileNameRe.MatchString(name) {
+		jsonResponse(w, http.StatusBadRequest, map[string]string{
+			"error": "profile name must be 1-32 chars of [a-z0-9-] (it becomes a file/env-safe id)"})
+		return
+	}
+	if h.cfg.IsBuiltin(name) {
+		jsonResponse(w, http.StatusConflict, map[string]string{
+			"error": fmt.Sprintf("%q is a built-in preset and cannot be overwritten; pick another name", name)})
+		return
+	}
+	if err := req.Profile.ValidateStrict(h.cluster.NodeCount(), services.MemTotalMB()); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	customs := h.cfg.UpsertCustomProfile(name, req.Profile)
+	if err := config.PersistCustomProfiles(h.cfg.AdminDir, customs, time.Now()); err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]string{"error": "could not persist custom profiles: " + err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]interface{}{
+		"message": "Profile " + name + " saved",
+		"profile": h.profileEntry(name, req.Profile),
+	})
+}
+
+// handleDeleteProfile removes a CUSTOM profile. Presets and the ACTIVE profile
+// are refused (deleting the active one would strand the persisted boot choice).
+func (h *Handlers) handleDeleteProfile(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	if name == h.cfg.ActiveName() {
+		jsonResponse(w, http.StatusConflict, map[string]string{
+			"error": fmt.Sprintf("%q is the active profile; switch to another profile before deleting it", name)})
+		return
+	}
+	customs, err := h.cfg.DeleteCustomProfile(name)
+	if err != nil {
+		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := config.PersistCustomProfiles(h.cfg.AdminDir, customs, time.Now()); err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]string{"error": "could not persist custom profiles: " + err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]string{"message": "Profile " + name + " deleted"})
+}
+
+// profileNameRe keeps custom profile names file- and env-safe.
+var profileNameRe = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
 
 // handleSetProfile switches the whole stack onto a named profile, applying it
 // via an in-process catalog rebuild + a quorum-safe roll (no admin restart, no
