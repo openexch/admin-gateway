@@ -62,6 +62,38 @@ type Config struct {
 	// unset). When present it pins MinMemMB across profile switches so a live
 	// switch never silently drops the emergency floor an operator set by hand.
 	minMemOverride *int
+
+	// topology is the persisted per-cluster node-count map (cluster-topology.json,
+	// clustertopology.go), guarded by mu like the profile trio. Absent entries
+	// fall back to the descriptor constructor defaults (match=3, assets=1).
+	topology map[string]int
+}
+
+// NodeCountFor returns the persisted node count for a cluster, or def when the
+// topology store has no entry for it.
+func (c *Config) NodeCountFor(name string, def int) int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if n, ok := c.topology[name]; ok && n > 0 {
+		return n
+	}
+	return def
+}
+
+// SetNodeCount commits a topology change in memory and returns a snapshot of
+// the full map for persistence. The caller persists via PersistTopology.
+func (c *Config) SetNodeCount(name string, n int) map[string]int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.topology == nil {
+		c.topology = map[string]int{}
+	}
+	c.topology[name] = n
+	snap := make(map[string]int, len(c.topology))
+	for k, v := range c.topology {
+		snap[k] = v
+	}
+	return snap
 }
 
 // Active returns the live active profile name and bundle under a read lock, so
@@ -213,6 +245,7 @@ func Load() *Config {
 		ProfileName:    profileName,
 		Profile:        profile,
 		Profiles:       profiles,
+		topology:       ReadTopology(adminDir),
 	}
 }
 

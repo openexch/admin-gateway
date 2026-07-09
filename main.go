@@ -44,7 +44,7 @@ func main() {
 	assetsCluster := services.NewAssetsCluster(cfg)
 	cluster := matchCluster
 	progress := services.NewProgress()
-	clusterStatus := services.NewClusterStatus()
+	clusterStatus := services.NewClusterStatusSized(matchCluster.NodeCount())
 	// The in-process LocalAgent. Everything downstream depends only on the
 	// agent contract (docs/AGENT-ARCHITECTURE.md), so a remote agentd client
 	// can slot in per host later.
@@ -60,7 +60,7 @@ func main() {
 	// descriptor + its own status tracker. Intentionally no preflight/statusSvc —
 	// a single-node cluster has no quorum to gate, so its "rolling update"
 	// degenerates to a swap-and-restart (see doRollingUpdate's NodeCount==1 path).
-	assetsClusterStatus := services.NewClusterStatus()
+	assetsClusterStatus := services.NewClusterStatusSized(assetsCluster.NodeCount())
 	assetsOps := services.NewOperationsService(cfg, systemd, assetsCluster, progress, assetsClusterStatus)
 	assetsOps.SetProcessManager(procMgr)
 	// Each cluster's cleanup must never touch the other's state/driver dirs.

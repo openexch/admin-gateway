@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/match/admin-gateway/config"
 )
@@ -36,9 +37,15 @@ type Cluster struct {
 	Display string // human label
 	Kind    string // UI discriminator: "match" | "assets" (icon/money-slot branch)
 
-	NodeCount int    // 3 (match) | 1 (assets)
-	PortBase  int    // 9000 | 9300; ingress = PortBase + node*100 + 2
-	StateDir  string // cluster+archive state root: /dev/shm/aeron-cluster | /dev/shm/aeron-assets
+	// nodeCount is MUTABLE: the topology-change op (genesis re-form) rewrites it
+	// on the live descriptor while status pollers read it concurrently, so all
+	// access goes through NodeCount()/SetNodeCount (atomic). Boot value = the
+	// cluster-topology.json entry, falling back to the constructor default
+	// (match=3, assets=1). Valid counts are odd (Raft majority): 1/3/5/7.
+	nodeCount atomic.Int32
+
+	PortBase int    // 9000 | 9300; ingress = PortBase + node*100 + 2
+	StateDir string // cluster+archive state root: /dev/shm/aeron-cluster | /dev/shm/aeron-assets
 
 	NodePrefix   string // node service + state-dir name prefix: "node" -> node0, "ae" -> ae0
 	DriverPrefix string // external driver service prefix: "driver" -> driver0; "" when embedded
@@ -76,6 +83,14 @@ type Cluster struct {
 	RichArchiveStats bool
 }
 
+// NodeCount is the cluster's live member count (atomic — see the field doc).
+func (c *Cluster) NodeCount() int { return int(c.nodeCount.Load()) }
+
+// SetNodeCount commits a topology change on the live descriptor. Callers (the
+// topology op only) persist it via config.PersistTopology and re-form the
+// cluster from genesis — Aeron 1.51 membership is static.
+func (c *Cluster) SetNodeCount(n int) { c.nodeCount.Store(int32(n)) }
+
 // Capabilities reports what management operations this cluster supports, derived
 // from its descriptor. The UI gates buttons on these (no Housekeeping/Backup for a
 // cluster that has neither), and the handlers reject incapable ops before touching
@@ -92,14 +107,14 @@ func (c *Cluster) Capabilities() map[string]interface{} {
 }
 
 // NewMatchCluster is the matching-engine descriptor — exactly today's values, so
-// migrating the ops onto it is behavior-preserving.
+// migrating the ops onto it is behavior-preserving. Node count comes from the
+// topology store (default 3).
 func NewMatchCluster(cfg *config.Config) *Cluster {
-	return &Cluster{
+	c := &Cluster{
 		cfg:              cfg,
 		Name:             "match",
 		Display:          "Matching Engine",
 		Kind:             "match",
-		NodeCount:        3,
 		PortBase:         9000,
 		StateDir:         cfg.ClusterDir, // /dev/shm/aeron-cluster
 		NodePrefix:       "node",
@@ -115,18 +130,19 @@ func NewMatchCluster(cfg *config.Config) *Cluster {
 		BackupDir:        filepath.Join(cfg.ProjectDir, "backup"),
 		RichArchiveStats: true, // the ME status has always carried positions/archive sizes
 	}
+	c.nodeCount.Store(int32(cfg.NodeCountFor(c.Name, 3)))
+	return c
 }
 
-// NewAssetsCluster is the money-ledger descriptor: a single embedded-driver node
-// on disjoint ports/dirs. Node count and driver mode are just fields — flip to a
-// 3-node external-driver cluster (full matching-engine parity) with no code change.
+// NewAssetsCluster is the money-ledger descriptor: embedded-driver nodes on
+// disjoint ports/dirs. Node count comes from the topology store (default 1) —
+// flip to a multi-node cluster with no code change.
 func NewAssetsCluster(cfg *config.Config) *Cluster {
-	return &Cluster{
+	c := &Cluster{
 		cfg:              cfg,
 		Name:             "assets",
 		Display:          "Assets Engine",
 		Kind:             "assets",
-		NodeCount:        1,
 		PortBase:         9300,
 		StateDir:         "/dev/shm/aeron-assets",
 		NodePrefix:       "ae",
@@ -142,6 +158,8 @@ func NewAssetsCluster(cfg *config.Config) *Cluster {
 		BackupDir:        "",    // no backup yet
 		RichArchiveStats: false, // CnC-counter-only status: no JVM/du on the shared box
 	}
+	c.nodeCount.Store(int32(cfg.NodeCountFor(c.Name, 1)))
+	return c
 }
 
 // NewCluster preserves the original single-cluster constructor (the matching
@@ -202,11 +220,11 @@ func (c *Cluster) NodeServiceDefs(
 	nodeEnv func(i int) map[string]string,
 	preStart func(i int) [][]string,
 ) []ServiceDef {
-	defs := make([]ServiceDef, 0, c.NodeCount*2)
+	defs := make([]ServiceDef, 0, c.NodeCount()*2)
 
 	// Driver services first (boot order): each coupled to its node.
 	if external {
-		for i := 0; i < c.NodeCount; i++ {
+		for i := 0; i < c.NodeCount(); i++ {
 			defs = append(defs, ServiceDef{
 				Name:            c.DriverName(i),
 				Display:         fmt.Sprintf("%s %d", c.DriverDisplay, i),
@@ -223,7 +241,7 @@ func (c *Cluster) NodeServiceDefs(
 	}
 
 	// Node services, gated on their driver in external mode.
-	for i := 0; i < c.NodeCount; i++ {
+	for i := 0; i < c.NodeCount(); i++ {
 		def := ServiceDef{
 			Name:        c.NodeName(i),
 			Display:     fmt.Sprintf("%s %d", c.NodeDisplay, i),
@@ -275,7 +293,7 @@ func (c *Cluster) archiveTool(nodeId int, command string) (string, error) {
 
 // DetectLeader finds the current cluster leader
 func (c *Cluster) DetectLeader() int {
-	for nodeId := 0; nodeId < c.NodeCount; nodeId++ {
+	for nodeId := 0; nodeId < c.NodeCount(); nodeId++ {
 		output, err := c.clusterTool(nodeId, "list-members")
 		if err != nil {
 			continue

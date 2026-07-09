@@ -39,11 +39,11 @@ type catalogReloader interface {
 	ReloadCatalogMembership(newServices []ServiceDef) error
 }
 
-// totalHeapMB is the committed JVM heap a profile asks for across the six JVMs
-// (3 nodes + oms + market + backup). The sim is Go; drivers are C. Used only to
-// judge switch-up headroom.
-func totalHeapMB(p config.Profile) int {
-	return p.NodeHeapMB*3 + p.OmsHeapMB + p.MarketHeapMB + p.BackupHeapMB
+// totalHeapMB is the committed JVM heap a profile asks for across the stack's
+// JVMs (nodeCount matching-engine nodes + oms + market + backup). The sim is
+// Go; drivers are C. Used only to judge switch-up headroom.
+func totalHeapMB(p config.Profile, nodeCount int) int {
+	return p.NodeHeapMB*nodeCount + p.OmsHeapMB + p.MarketHeapMB + p.BackupHeapMB
 }
 
 // sameLaunch is true when two service defs launch identically — same argv, env,
@@ -149,7 +149,7 @@ func (o *OperationsService) ApplyProfile(name string, force bool) error {
 	// Switch-up headroom: refuse to commit bigger heaps than the box can hold
 	// above the (post-switch, override-aware) floor, unless forced.
 	if !reapply {
-		if delta := totalHeapMB(prof) - totalHeapMB(curProf); delta > 0 && !force {
+		if delta := totalHeapMB(prof, o.cluster.NodeCount()) - totalHeapMB(curProf, o.cluster.NodeCount()); delta > 0 && !force {
 			if o.preflight != nil {
 				if avail := o.preflight.MemAvailableBytes(); avail >= 0 {
 					floor := o.cfg.EffectiveMinMem(prof)
@@ -338,7 +338,7 @@ func (o *OperationsService) doApplyProfileMembership(fromName, toName string, to
 	// drivers being removed. Stopping an already-stopped service is a no-op,
 	// which is exactly what makes this re-runnable from a half-stopped state.
 	o.progress.Update(3, "Stopping cluster for the driver-mode change ("+fromName+"→"+toName+")...")
-	for i := 0; i < o.cluster.NodeCount; i++ {
+	for i := 0; i < o.cluster.NodeCount(); i++ {
 		o.clusterStatus.SetNodeStatus(i, "STOPPING", false)
 		o.stopService(o.cluster.NodeName(i))
 		o.waitForNodeStopped(log, i, 15*time.Second)
@@ -367,11 +367,11 @@ func (o *OperationsService) doApplyProfileMembership(fromName, toName string, to
 	for _, name := range diff.added {
 		o.startService(name)
 	}
-	for i := 0; i < o.cluster.NodeCount; i++ {
+	for i := 0; i < o.cluster.NodeCount(); i++ {
 		o.clusterStatus.SetNodeStatus(i, "STARTING", false)
 		o.startService(o.cluster.NodeName(i))
 	}
-	for i := 0; i < o.cluster.NodeCount; i++ {
+	for i := 0; i < o.cluster.NodeCount(); i++ {
 		o.clusterStatus.SetNodeStatus(i, "REJOINING", true)
 		if !o.waitForPort("127.0.0.1", o.cluster.IngressPort(i), 120*time.Second) {
 			o.clusterStatus.SetNodeStatus(i, "OFFLINE", false)
@@ -458,7 +458,7 @@ func (o *OperationsService) rollNodesOntoProfile(log *slog.Logger, toName string
 		return changed[o.cluster.NodeName(i)] || (!o.cluster.Embedded && changed[o.cluster.DriverName(i)])
 	}
 	any := false
-	for i := 0; i < o.cluster.NodeCount; i++ {
+	for i := 0; i < o.cluster.NodeCount(); i++ {
 		if nodeChanged(i) {
 			any = true
 		}
@@ -482,7 +482,7 @@ func (o *OperationsService) rollNodesOntoProfile(log *slog.Logger, toName string
 	// The leader is fixed for this phase (we never touch it here), so pass it
 	// down as the catch-up target rather than re-detecting per node — a transient
 	// DetectLeader() failure must NOT silently skip the catch-up gate.
-	for i := 0; i < o.cluster.NodeCount; i++ {
+	for i := 0; i < o.cluster.NodeCount(); i++ {
 		if i == leader || !nodeChanged(i) {
 			continue
 		}

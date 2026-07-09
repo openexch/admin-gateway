@@ -11,25 +11,44 @@ import (
 	"github.com/match/admin-gateway/config"
 )
 
-// ClusterStatus tracks the state of cluster nodes
+// ClusterStatus tracks the transitional state of one cluster's nodes. Sized by
+// the cluster's node count and RESIZABLE: a topology change (genesis re-form)
+// grows/shrinks it under the same lock the readers take.
 type ClusterStatus struct {
 	mu               sync.RWMutex
-	nodeStatus       [3]string
-	nodeRunning      [3]bool
+	nodeStatus       []string
+	nodeRunning      []bool
 	leaderId         int
 	leadershipTermId int64
 }
 
 func NewClusterStatus() *ClusterStatus {
+	return NewClusterStatusSized(3)
+}
+
+// NewClusterStatusSized builds a tracker for a cluster of n nodes.
+func NewClusterStatusSized(n int) *ClusterStatus {
 	return &ClusterStatus{
-		leaderId: -1,
+		nodeStatus:  make([]string, n),
+		nodeRunning: make([]bool, n),
+		leaderId:    -1,
 	}
+}
+
+// Resize re-sizes the tracker for a new node count (topology change), clearing
+// all transitional state — the cluster is re-forming from genesis anyway.
+func (cs *ClusterStatus) Resize(n int) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.nodeStatus = make([]string, n)
+	cs.nodeRunning = make([]bool, n)
+	cs.leaderId = -1
 }
 
 func (cs *ClusterStatus) SetNodeStatus(nodeId int, status string, running bool) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	if nodeId >= 0 && nodeId < 3 {
+	if nodeId >= 0 && nodeId < len(cs.nodeStatus) {
 		cs.nodeStatus[nodeId] = status
 		cs.nodeRunning[nodeId] = running
 	}
@@ -38,7 +57,7 @@ func (cs *ClusterStatus) SetNodeStatus(nodeId int, status string, running bool) 
 func (cs *ClusterStatus) GetNodeStatus(nodeId int) string {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
-	if nodeId >= 0 && nodeId < 3 {
+	if nodeId >= 0 && nodeId < len(cs.nodeStatus) {
 		return cs.nodeStatus[nodeId]
 	}
 	return ""
@@ -153,9 +172,9 @@ func (s *StatusService) freshFor(name string, n int) *clusterFresh {
 // populates only the cheap CnC counters and derives its leader from the CnC role
 // counter — no JVM spawns competing with the ME's busy-spin cores.
 func (s *StatusService) buildRichClusterStatus(c *Cluster, tracker *ClusterStatus) map[string]interface{} {
-	n := c.NodeCount
+	n := c.NodeCount()
 	if tracker == nil {
-		tracker = NewClusterStatus() // never nil: a fresh tracker reports no transitional state
+		tracker = NewClusterStatusSized(n) // never nil: a fresh tracker reports no transitional state
 	}
 
 	// Leader: the matching engine spawns a JVM (authoritative across terms and

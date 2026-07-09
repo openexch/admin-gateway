@@ -221,9 +221,10 @@ func buildServiceCatalog(cfg *config.Config, prof config.Profile) []ServiceDef {
 
 	// pin prefixes a command with taskset for dedicated-core pinning; the "none"
 	// profile (light) returns no prefix so scheduling stays with the OS and the
-	// cores are free for other work (an IDE, a browser).
+	// cores are free for other work (an IDE, a browser). An empty cpuSet (no
+	// spare quad for this node index) also runs unpinned.
 	pin := func(cpuSet string) []string {
-		if prof.Pinning == "none" {
+		if prof.Pinning == "none" || cpuSet == "" {
 			return nil
 		}
 		return []string{"/usr/bin/taskset", "-c", cpuSet}
@@ -241,11 +242,25 @@ func buildServiceCatalog(cfg *config.Config, prof config.Profile) []ServiceDef {
 
 	driverDir := driverDirPath
 
+	// The descriptors: node counts come from the topology store (via cfg), so the
+	// whole catalog — member lists, service sets, dirs — is generated per count.
+	matchCluster := NewMatchCluster(cfg)
+	assetsCluster := NewAssetsCluster(cfg)
+
+	// clusterAddresses is the Raft member list: N comma-separated hosts, one per
+	// member (all loopback on this box, disambiguated by the per-node port
+	// offset). Its LENGTH is what the JVM forms the cluster from — this literal
+	// IS the topology.
+	clusterAddresses := func(n int) string {
+		return strings.TrimSuffix(strings.Repeat("127.0.0.1,", n), ",")
+	}
+	matchAddresses := clusterAddresses(matchCluster.NodeCount())
+
 	driverCmd := func(nodeId int, cpuSet string) []string {
 		cmd := pin(cpuSet)
 		return append(cmd, "/usr/bin/bash",
 			filepath.Join(cfg.ProjectDir, "deploy/media-driver/launch-driver.sh"),
-			"--instance", fmt.Sprintf("node%d", nodeId),
+			"--instance", matchCluster.NodeName(nodeId),
 			"--profile", driverProfile)
 	}
 
@@ -257,10 +272,10 @@ func buildServiceCatalog(cfg *config.Config, prof config.Profile) []ServiceDef {
 
 	nodeEnv := func(nodeId int) map[string]string {
 		env := map[string]string{
-			"CLUSTER_ADDRESSES": "127.0.0.1,127.0.0.1,127.0.0.1",
+			"CLUSTER_ADDRESSES": matchAddresses,
 			"CLUSTER_NODE":      strconv.Itoa(nodeId),
-			"CLUSTER_PORT_BASE": "9000",
-			"BASE_DIR":          fmt.Sprintf("/dev/shm/aeron-cluster/node%d", nodeId),
+			"CLUSTER_PORT_BASE": strconv.Itoa(matchCluster.PortBase),
+			"BASE_DIR":          matchCluster.NodeStateDir(nodeId),
 			// Profile-driven engine/transport tuning; def.Env is layered after
 			// os.Environ() so these override any inherited driver-profile.conf.
 			"TRANSPORT_IDLE_MODE":        prof.IdleMode,
@@ -276,7 +291,7 @@ func buildServiceCatalog(cfg *config.Config, prof config.Profile) []ServiceDef {
 
 	nodePreStart := func(nodeId int) [][]string {
 		return [][]string{
-			{"mkdir", "-p", fmt.Sprintf("/dev/shm/aeron-cluster/node%d", nodeId)},
+			{"mkdir", "-p", matchCluster.NodeStateDir(nodeId)},
 		}
 	}
 
@@ -297,8 +312,29 @@ func buildServiceCatalog(cfg *config.Config, prof config.Profile) []ServiceDef {
 		return append(cmd, "-jar", cfg.OmsJar)
 	}
 
-	// Cluster node core quads on the 13700K (see comment on pinnedGatewayCmd below)
-	nodeCpuSets := []string{"0-3", "4-7", "8-11"}
+	// Cluster node cores on the 13700K: dedicated 4-core quads exist for up to 3
+	// nodes (0-3/4-7/8-11; OMS/market/sim own 12-23). Beyond 3 nodes there are no
+	// spare quads — those nodes run unpinned (the pinning:none / light path; the
+	// topology validator steers >3-node counts there).
+	nodeCpuSet := func(i int) string {
+		if i < 3 {
+			return fmt.Sprintf("%d-%d", i*4, i*4+3)
+		}
+		return ""
+	}
+	pinnedNodeCmd := func(i int) []string {
+		return nodeCmd(nodeCpuSet(i)) // empty set (node >= 3) runs unpinned via pin()
+	}
+
+	// nodeNames is the gateway dependency list: every cluster node, whatever the
+	// count (gateways boot after the whole member set).
+	nodeNames := func(c *Cluster) []string {
+		names := make([]string, c.NodeCount())
+		for i := range names {
+			names[i] = c.NodeName(i)
+		}
+		return names
+	}
 
 	// The matching-engine cluster generates its own node + coupled media-driver
 	// services from its descriptor: the driver is PART of the cluster and the
@@ -306,12 +342,11 @@ func buildServiceCatalog(cfg *config.Config, prof config.Profile) []ServiceDef {
 	// is derived, not hand-wired. Launch specifics stay profile-driven via the
 	// existing nodeCmd/driverCmd/nodeEnv/nodePreStart closures. In embedded-driver
 	// mode (light profile) no driver services are generated — the node runs its own.
-	matchCluster := NewMatchCluster(cfg)
 	services := []ServiceDef{}
 	services = append(services, matchCluster.NodeServiceDefs(
 		externalDriver,
-		func(i int) []string { return nodeCmd(nodeCpuSets[i]) },
-		func(i int) []string { return driverCmd(i, nodeCpuSets[i]) },
+		pinnedNodeCmd,
+		func(i int) []string { return driverCmd(i, nodeCpuSet(i)) },
 		nodeEnv,
 		nodePreStart,
 	)...)
@@ -328,13 +363,13 @@ func buildServiceCatalog(cfg *config.Config, prof config.Profile) []ServiceDef {
 				// BASE_DIR pins backup data to durable DISK, never tmpfs — it is the
 				// power-loss recovery source (#9).
 				Env: map[string]string{
-					"CLUSTER_ADDRESSES":     "127.0.0.1,127.0.0.1,127.0.0.1",
+					"CLUSTER_ADDRESSES":     matchAddresses,
 					"BASE_DIR":              filepath.Join(cfg.ProjectDir, "backup"),
 					"BACKUP_STALL_EXIT_SEC": "300",
 				},
 				WorkDir:     cfg.ProjectDir,
 				PreStart:    [][]string{{"mkdir", "-p", filepath.Join(cfg.ProjectDir, "backup")}},
-				DependsOn:   []string{"node0", "node1", "node2"},
+				DependsOn:   nodeNames(matchCluster),
 				AutoRestart: true, RestartSec: 10, StopTimeout: 5,
 				Artifact: cfg.JarPath,
 			},
@@ -346,7 +381,7 @@ func buildServiceCatalog(cfg *config.Config, prof config.Profile) []ServiceDef {
 					"OMS_HTTP_PORT":     "8080",
 					"OMS_GRPC_PORT":     "9090",
 					"EGRESS_PORT":       "9093",
-					"CLUSTER_ADDRESSES": "127.0.0.1,127.0.0.1,127.0.0.1",
+					"CLUSTER_ADDRESSES": matchAddresses,
 					// Public demo auth (oms#72): self-registered users with opaque
 					// tokens, scoped to their own data. The dev-token backdoor
 					// stays for local infrastructure only (userId 1 + the sim
@@ -358,7 +393,7 @@ func buildServiceCatalog(cfg *config.Config, prof config.Profile) []ServiceDef {
 					"OMS_CORS_ORIGINS": "https://trade.openexch.io",
 				},
 				WorkDir:     cfg.OmsProjectDir,
-				DependsOn:   []string{"node0", "node1", "node2"},
+				DependsOn:   nodeNames(matchCluster),
 				AutoRestart: true, RestartSec: 5, StopTimeout: 10,
 				Artifact: cfg.OmsJar,
 			},
@@ -390,7 +425,7 @@ func buildServiceCatalog(cfg *config.Config, prof config.Profile) []ServiceDef {
 					"MARKET_EDGE_TOKEN_FILE": marketEdgeTokenFile(),
 				},
 				WorkDir:     cfg.ProjectDir,
-				DependsOn:   []string{"node0", "node1", "node2"},
+				DependsOn:   nodeNames(matchCluster),
 				AutoRestart: true, RestartSec: 5, StopTimeout: 5,
 				Artifact: cfg.GatewayJar,
 			},
@@ -422,46 +457,49 @@ func buildServiceCatalog(cfg *config.Config, prof config.Profile) []ServiceDef {
 				AutoRestart: true, RestartSec: 10, StopTimeout: 15, // shutdown cancels sim quotes
 				Artifact: cfg.SimBinary,
 			},
-			{
-				// Assets Engine node (the money ledger — a SEPARATE Aeron cluster from
-				// the matching engine). Always runs LIGHT regardless of the stack
-				// profile: backoff idle + embedded driver + small heap + pinned to
-				// cores 20-23 (the sim's E-cores) so it NEVER competes with the
-				// matching engine's busy-spin on 0-11. Ports 9300+, state on tmpfs;
-				// the embedded driver self-cleans (dirDeleteOnStart). The launch spec
-				// is FIXED (not profile-derived) so a live profile switch never rolls
-				// it, and it is added UNCONDITIONALLY so catalog membership stays
-				// constant across profiles (ReloadCatalog rejects membership changes).
-				Name: "ae0", Display: "Assets Engine 0", Role: RoleInfra, Port: 9302,
-				ExtraPorts: []int{9301, 9303, 9304, 9305}, // archive/member/log/transfer (ingress 9302 = Port)
-				Command: []string{
-					"/usr/bin/taskset", "-c", "20-23",
-					"/usr/bin/java",
-					"-XX:+UseZGC", "-XX:+ZGenerational",
-					"--add-opens", "java.base/jdk.internal.misc=ALL-UNNAMED",
-					"--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED",
-					"-Xmx512m", "-Xms512m",
-					"-jar", cfg.AssetsJar,
-				},
-				Env: map[string]string{
-					"CLUSTER_ADDRESSES":     "127.0.0.1", // single node
-					"CLUSTER_NODE":          "0",
-					"CLUSTER_PORT_BASE":     "9300",
-					"BASE_DIR":              "/dev/shm/aeron-assets/ae0",
-					"TRANSPORT_IDLE_MODE":   "backoff",  // never busy-spin on a shared box
-					"TRANSPORT_DRIVER_MODE": "embedded", // self-contained, no external driver service
-				},
-				WorkDir:     cfg.AssetsProjectDir,
-				PreStart:    [][]string{{"mkdir", "-p", "/dev/shm/aeron-assets/ae0"}},
-				AutoRestart: true, RestartSec: 10, StopTimeout: 5,
-				Artifact: cfg.AssetsJar,
-			},
-			{
-				Name: "admin", Display: "Admin Gateway", Role: RoleGateway, Port: 8082,
-				// Admin is self — we don't manage ourselves, just report status
-			},
-			// Trading UI lives in separate repo (trading-ui)
 		}...)
+
+	// Assets Engine nodes (the money ledger — a SEPARATE Aeron cluster from the
+	// matching engine), generated from the descriptor like the ME so its node
+	// count is topology-driven. The launch spec stays FIXED (not profile-derived):
+	// backoff idle + embedded driver + small heap + pinned to cores 20-23 (the
+	// sim's E-cores) so it NEVER competes with the matching engine on 0-11.
+	// Ports 9300+, state on tmpfs; the embedded driver self-cleans.
+	aeAddresses := clusterAddresses(assetsCluster.NodeCount())
+	services = append(services, assetsCluster.NodeServiceDefs(
+		false, // embedded driver: no external driver services, ever
+		func(i int) []string {
+			return []string{
+				"/usr/bin/taskset", "-c", "20-23",
+				"/usr/bin/java",
+				"-XX:+UseZGC", "-XX:+ZGenerational",
+				"--add-opens", "java.base/jdk.internal.misc=ALL-UNNAMED",
+				"--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED",
+				"-Xmx512m", "-Xms512m",
+				"-jar", cfg.AssetsJar,
+			}
+		},
+		func(i int) []string { return nil }, // never invoked with external=false
+		func(i int) map[string]string {
+			return map[string]string{
+				"CLUSTER_ADDRESSES":     aeAddresses,
+				"CLUSTER_NODE":          strconv.Itoa(i),
+				"CLUSTER_PORT_BASE":     strconv.Itoa(assetsCluster.PortBase),
+				"BASE_DIR":              assetsCluster.NodeStateDir(i),
+				"TRANSPORT_IDLE_MODE":   "backoff",  // never busy-spin on a shared box
+				"TRANSPORT_DRIVER_MODE": "embedded", // self-contained, no external driver service
+			}
+		},
+		func(i int) [][]string {
+			return [][]string{{"mkdir", "-p", assetsCluster.NodeStateDir(i)}}
+		},
+	)...)
+
+	services = append(services, ServiceDef{
+		Name: "admin", Display: "Admin Gateway", Role: RoleGateway, Port: 8082,
+		// Admin is self — we don't manage ourselves, just report status
+	})
+	// Trading UI lives in separate repo (trading-ui)
 
 	// Slice order IS the boot order; StartOrder mirrors it for display/debugging
 	for i := range services {
@@ -1443,9 +1481,12 @@ func (pm *ProcessManager) removePID(name string) {
 // cleanStaleAeronState removes stale mark files and media driver directories
 // that prevent a node from restarting after a crash
 func (pm *ProcessManager) cleanStaleAeronState(name string) {
-	// Map service name to node ID for media driver cleanup
-	nodeIds := map[string]int{"node0": 0, "node1": 1, "node2": 2}
-	if nodeId, ok := nodeIds[name]; ok {
+	// Matching-engine nodes are named node<i> for any topology; the assets
+	// engine's embedded driver self-cleans (dirDeleteOnStart), so ae<i> nodes
+	// deliberately do not match here.
+	var nodeId int
+	matched, err := fmt.Sscanf(name, "node%d", &nodeId)
+	if matched == 1 && err == nil {
 		// Clean stale MediaDriver directory — but NEVER while an external driver
 		// process owns it (external mode shares this dir between driverN and nodeN;
 		// deleting it under a live driver corrupts the IPC files). Tracked state
