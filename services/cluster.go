@@ -138,8 +138,8 @@ func NewAssetsCluster(cfg *config.Config) *Cluster {
 		Jar:              cfg.AssetsJar,
 		ProjectDir:       cfg.AssetsProjectDir,
 		Module:           "assets-cluster",
-		HousekeepingMain: "", // no housekeeping yet
-		BackupDir:        "", // no backup yet
+		HousekeepingMain: "",    // no housekeeping yet
+		BackupDir:        "",    // no backup yet
 		RichArchiveStats: false, // CnC-counter-only status: no JVM/du on the shared box
 	}
 }
