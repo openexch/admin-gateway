@@ -300,39 +300,21 @@ func buildServiceCatalog(cfg *config.Config, prof config.Profile) []ServiceDef {
 	// Cluster node core quads on the 13700K (see comment on pinnedGatewayCmd below)
 	nodeCpuSets := []string{"0-3", "4-7", "8-11"}
 
-	nodeDef := func(nodeId int) ServiceDef {
-		def := ServiceDef{
-			Name: fmt.Sprintf("node%d", nodeId), Display: fmt.Sprintf("Cluster Node %d", nodeId),
-			Role:    RoleClusterNode,
-			Command: nodeCmd(nodeCpuSets[nodeId]), Env: nodeEnv(nodeId), WorkDir: cfg.ProjectDir,
-			PreStart:    nodePreStart(nodeId),
-			AutoRestart: true, RestartSec: 10, StopTimeout: 5,
-			Artifact: cfg.JarPath, // the Command jar path is WorkDir-relative; check the absolute one
-		}
-		if externalDriver {
-			def.DependsOn = []string{fmt.Sprintf("driver%d", nodeId)}
-			def.WaitForFile = filepath.Join(driverDir(nodeId), "cnc.dat")
-			def.GatedBy = fmt.Sprintf("driver%d", nodeId)
-		}
-		return def
-	}
-
+	// The matching-engine cluster generates its own node + coupled media-driver
+	// services from its descriptor: the driver is PART of the cluster and the
+	// driver↔node linkage (DependsOn/GatedBy/WaitForFile/RestartCascades/DriverDir)
+	// is derived, not hand-wired. Launch specifics stay profile-driven via the
+	// existing nodeCmd/driverCmd/nodeEnv/nodePreStart closures. In embedded-driver
+	// mode (light profile) no driver services are generated — the node runs its own.
+	matchCluster := NewMatchCluster(cfg)
 	services := []ServiceDef{}
-	if externalDriver {
-		for i := range nodeCpuSets {
-			services = append(services, ServiceDef{
-				Name: fmt.Sprintf("driver%d", i), Display: fmt.Sprintf("Media Driver %d", i),
-				Role:    RoleInfra,
-				Command: driverCmd(i, nodeCpuSets[i]), WorkDir: cfg.ProjectDir,
-				AutoRestart: true, RestartSec: 3, StopTimeout: 5,
-				// A node cannot outlive its driver's shared-memory files: on driver
-				// crash, stop the node first, restart the driver, then the node.
-				RestartCascades: []string{fmt.Sprintf("node%d", i)},
-				DriverDir:       driverDir(i),
-			})
-		}
-	}
-	services = append(services, nodeDef(0), nodeDef(1), nodeDef(2))
+	services = append(services, matchCluster.NodeServiceDefs(
+		externalDriver,
+		func(i int) []string { return nodeCmd(nodeCpuSets[i]) },
+		func(i int) []string { return driverCmd(i, nodeCpuSets[i]) },
+		nodeEnv,
+		nodePreStart,
+	)...)
 	services = append(services,
 		[]ServiceDef{
 			{
@@ -439,6 +421,40 @@ func buildServiceCatalog(cfg *config.Config, prof config.Profile) []ServiceDef {
 				DependsOn:   []string{"oms", "market"},
 				AutoRestart: true, RestartSec: 10, StopTimeout: 15, // shutdown cancels sim quotes
 				Artifact: cfg.SimBinary,
+			},
+			{
+				// Assets Engine node (the money ledger — a SEPARATE Aeron cluster from
+				// the matching engine). Always runs LIGHT regardless of the stack
+				// profile: backoff idle + embedded driver + small heap + pinned to
+				// cores 20-23 (the sim's E-cores) so it NEVER competes with the
+				// matching engine's busy-spin on 0-11. Ports 9300+, state on tmpfs;
+				// the embedded driver self-cleans (dirDeleteOnStart). The launch spec
+				// is FIXED (not profile-derived) so a live profile switch never rolls
+				// it, and it is added UNCONDITIONALLY so catalog membership stays
+				// constant across profiles (ReloadCatalog rejects membership changes).
+				Name: "ae0", Display: "Assets Engine 0", Role: RoleInfra, Port: 9302,
+				ExtraPorts: []int{9301, 9303, 9304, 9305}, // archive/member/log/transfer (ingress 9302 = Port)
+				Command: []string{
+					"/usr/bin/taskset", "-c", "20-23",
+					"/usr/bin/java",
+					"-XX:+UseZGC", "-XX:+ZGenerational",
+					"--add-opens", "java.base/jdk.internal.misc=ALL-UNNAMED",
+					"--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED",
+					"-Xmx512m", "-Xms512m",
+					"-jar", cfg.AssetsJar,
+				},
+				Env: map[string]string{
+					"CLUSTER_ADDRESSES":     "127.0.0.1", // single node
+					"CLUSTER_NODE":          "0",
+					"CLUSTER_PORT_BASE":     "9300",
+					"BASE_DIR":              "/dev/shm/aeron-assets/ae0",
+					"TRANSPORT_IDLE_MODE":   "backoff",  // never busy-spin on a shared box
+					"TRANSPORT_DRIVER_MODE": "embedded", // self-contained, no external driver service
+				},
+				WorkDir:     cfg.AssetsProjectDir,
+				PreStart:    [][]string{{"mkdir", "-p", "/dev/shm/aeron-assets/ae0"}},
+				AutoRestart: true, RestartSec: 10, StopTimeout: 5,
+				Artifact: cfg.AssetsJar,
 			},
 			{
 				Name: "admin", Display: "Admin Gateway", Role: RoleGateway, Port: 8082,

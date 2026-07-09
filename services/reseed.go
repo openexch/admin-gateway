@@ -33,8 +33,8 @@ func reseedExcluded(name string) bool {
 
 // ReseedNode validates and launches the reseed operation.
 func (o *OperationsService) ReseedNode(targetId, sourceId int, force bool) error {
-	if targetId < 0 || targetId > 2 || sourceId < 0 || sourceId > 2 {
-		return fmt.Errorf("nodeId and sourceNodeId must be 0, 1, or 2")
+	if targetId < 0 || targetId >= o.cluster.NodeCount || sourceId < 0 || sourceId >= o.cluster.NodeCount {
+		return fmt.Errorf("nodeId and sourceNodeId must be 0..%d", o.cluster.NodeCount-1)
 	}
 	if targetId == sourceId {
 		return fmt.Errorf("sourceNodeId must differ from nodeId")
@@ -60,13 +60,13 @@ func (o *OperationsService) ReseedNode(targetId, sourceId int, force bool) error
 func (o *OperationsService) doReseedNode(targetId, sourceId, leader int) {
 	log := o.log.With("op", "reseed-node", "op_id", o.progress.CurrentOpID(),
 		"target", targetId, "source", sourceId)
-	targetDir := fmt.Sprintf("%s/node%d", o.cfg.ClusterDir, targetId)
-	sourceDir := fmt.Sprintf("%s/node%d", o.cfg.ClusterDir, sourceId)
+	targetDir := o.cluster.NodeStateDir(targetId)
+	sourceDir := o.cluster.NodeStateDir(sourceId)
 
 	// Step 1: stop the stranded target (force: it may be wedged or crash-looping)
 	o.progress.Update(1, fmt.Sprintf("Force-stopping node%d (stranded target)...", targetId))
 	o.clusterStatus.SetNodeStatus(targetId, "STOPPING", false)
-	if err := o.procMgr.ForceStop(fmt.Sprintf("node%d", targetId)); err != nil {
+	if err := o.procMgr.ForceStop(o.cluster.NodeName(targetId)); err != nil {
 		log.Warn("force-stop of target reported an error (may already be dead)", "err", err)
 	}
 	o.waitForNodeStopped(log, targetId, 15*time.Second)
@@ -75,7 +75,7 @@ func (o *OperationsService) doReseedNode(targetId, sourceId, leader int) {
 	// Step 2: stop the healthy source follower (quorum outage begins)
 	o.progress.Update(2, fmt.Sprintf("Stopping node%d (healthy source) — quorum outage begins...", sourceId))
 	o.clusterStatus.SetNodeStatus(sourceId, "STOPPING", false)
-	o.stopService(fmt.Sprintf("node%d", sourceId))
+	o.stopService(o.cluster.NodeName(sourceId))
 	o.waitForNodeStopped(log, sourceId, 15*time.Second)
 	o.clusterStatus.SetNodeStatus(sourceId, "OFFLINE", false)
 
@@ -85,7 +85,7 @@ func (o *OperationsService) doReseedNode(targetId, sourceId, leader int) {
 	restartSource := func() {
 		o.progress.Update(6, fmt.Sprintf("Starting node%d (source)...", sourceId))
 		o.clusterStatus.SetNodeStatus(sourceId, "STARTING", true)
-		o.startService(fmt.Sprintf("node%d", sourceId))
+		o.startService(o.cluster.NodeName(sourceId))
 	}
 
 	// Step 3: wipe the target's state, keeping its identity files
@@ -120,7 +120,7 @@ func (o *OperationsService) doReseedNode(targetId, sourceId, leader int) {
 
 	o.progress.Update(6, fmt.Sprintf("Starting node%d (reseeded target)...", targetId))
 	o.clusterStatus.SetNodeStatus(targetId, "STARTING", true)
-	o.startService(fmt.Sprintf("node%d", targetId))
+	o.startService(o.cluster.NodeName(targetId))
 
 	// Step 7: wait for the reseeded member to catch up
 	o.progress.Update(7, fmt.Sprintf("Waiting for node%d to catch up...", targetId))

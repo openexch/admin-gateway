@@ -256,10 +256,10 @@ func waitForTCP(hostport string, timeout time.Duration) bool {
 // already Finished the slot).
 func (o *OperationsService) rollNodesOntoProfile(log *slog.Logger, toName string, changed map[string]bool, startStep int) (int, bool) {
 	nodeChanged := func(i int) bool {
-		return changed[fmt.Sprintf("node%d", i)] || changed[fmt.Sprintf("driver%d", i)]
+		return changed[o.cluster.NodeName(i)] || (!o.cluster.Embedded && changed[o.cluster.DriverName(i)])
 	}
 	any := false
-	for i := 0; i < 3; i++ {
+	for i := 0; i < o.cluster.NodeCount; i++ {
 		if nodeChanged(i) {
 			any = true
 		}
@@ -283,7 +283,7 @@ func (o *OperationsService) rollNodesOntoProfile(log *slog.Logger, toName string
 	// The leader is fixed for this phase (we never touch it here), so pass it
 	// down as the catch-up target rather than re-detecting per node — a transient
 	// DetectLeader() failure must NOT silently skip the catch-up gate.
-	for i := 0; i < 3; i++ {
+	for i := 0; i < o.cluster.NodeCount; i++ {
 		if i == leader || !nodeChanged(i) {
 			continue
 		}
@@ -299,7 +299,7 @@ func (o *OperationsService) rollNodesOntoProfile(log *slog.Logger, toName string
 	if nodeChanged(leader) {
 		o.progress.Update(step, fmt.Sprintf("Stopping Node %d (leader) for profile roll...", leader))
 		o.clusterStatus.SetNodeStatus(leader, "STOPPING", false)
-		o.stopService(fmt.Sprintf("node%d", leader))
+		o.stopService(o.cluster.NodeName(leader))
 		o.waitForNodeStopped(log, leader, 15*time.Second)
 		o.clusterStatus.SetNodeStatus(leader, "OFFLINE", false)
 
@@ -340,7 +340,7 @@ func (o *OperationsService) rollOneNode(log *slog.Logger, toName string, nodeId 
 	label := fmt.Sprintf("Node %d", nodeId)
 	o.progress.Update(step, "Stopping "+label+" for profile roll...")
 	o.clusterStatus.SetNodeStatus(nodeId, "STOPPING", false)
-	o.stopService(fmt.Sprintf("node%d", nodeId))
+	o.stopService(o.cluster.NodeName(nodeId))
 	o.waitForNodeStopped(log, nodeId, 15*time.Second)
 	o.clusterStatus.SetNodeStatus(nodeId, "OFFLINE", false)
 
@@ -354,19 +354,21 @@ func (o *OperationsService) rollOneNode(log *slog.Logger, toName string, nodeId 
 func (o *OperationsService) rollOneNodeStart(log *slog.Logger, toName string, nodeId int, changed map[string]bool, step, catchUpLeader int) bool {
 	label := fmt.Sprintf("Node %d", nodeId)
 
-	if changed[fmt.Sprintf("driver%d", nodeId)] {
-		o.progress.Update(step, label+": restarting media driver onto "+toName+"...")
-		o.restartService(fmt.Sprintf("driver%d", nodeId))
+	if !o.cluster.Embedded {
+		if changed[o.cluster.DriverName(nodeId)] {
+			o.progress.Update(step, label+": restarting media driver onto "+toName+"...")
+			o.restartService(o.cluster.DriverName(nodeId))
+		}
+		o.cleanNodeMediaDriver(log, nodeId)
 	}
-	o.cleanNodeMediaDriver(log, nodeId)
 
 	o.progress.Update(step, "Starting "+label+" on "+toName+"...")
 	o.clusterStatus.SetNodeStatus(nodeId, "STARTING", false)
-	o.startService(fmt.Sprintf("node%d", nodeId))
+	o.startService(o.cluster.NodeName(nodeId))
 
 	o.progress.Update(step, label+": waiting to rejoin the cluster...")
 	o.clusterStatus.SetNodeStatus(nodeId, "REJOINING", true)
-	ingressPort := 9000 + nodeId*100 + 2
+	ingressPort := o.cluster.IngressPort(nodeId)
 	if !o.waitForPort("127.0.0.1", ingressPort, 60*time.Second) {
 		o.clusterStatus.SetNodeStatus(nodeId, "OFFLINE", false)
 		o.progress.Finish(false, fmt.Sprintf("%s did not rejoin within 60s — ABORTED before touching more nodes; "+

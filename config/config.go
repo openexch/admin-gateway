@@ -12,20 +12,22 @@ import (
 )
 
 type Config struct {
-	Port          string
-	BindAddr      string // listen address; loopback by default (admin-gateway#11)
-	AuthToken     string // bearer token for the admin API; empty = loopback-only dev mode
-	ProjectDir    string
-	AdminDir      string // this repo's checkout (admin-gateway source + live binary)
-	OmsProjectDir string
-	JarPath       string // Cluster JAR (for ClusterTool operations)
-	GatewayJar    string // Gateway JAR
-	OmsJar        string // OMS uber JAR
-	LogDir        string
-	ClusterDir    string
-	LogFormat     string // "json" (default) or "text" (ADMIN_LOG_FORMAT)
-	GoBin         string // go binary for rebuild-admin (ADMIN_GO_BIN; see resolveGoBin)
-	SimBinary     string // market simulator binary (SIM_BINARY; openexch/tools market-sim)
+	Port             string
+	BindAddr         string // listen address; loopback by default (admin-gateway#11)
+	AuthToken        string // bearer token for the admin API; empty = loopback-only dev mode
+	ProjectDir       string
+	AdminDir         string // this repo's checkout (admin-gateway source + live binary)
+	OmsProjectDir    string
+	JarPath          string // Cluster JAR (for ClusterTool operations)
+	GatewayJar       string // Gateway JAR
+	OmsJar           string // OMS uber JAR
+	AssetsProjectDir string // Assets Engine repo checkout
+	AssetsJar        string // Assets Engine cluster uber JAR (ae0 node)
+	LogDir           string
+	ClusterDir       string
+	LogFormat        string // "json" (default) or "text" (ADMIN_LOG_FORMAT)
+	GoBin            string // go binary for rebuild-admin (ADMIN_GO_BIN; see resolveGoBin)
+	SimBinary        string // market simulator binary (SIM_BINARY; openexch/tools market-sim)
 
 	// Pre-flight invariant thresholds (services/preflight.go, #42/#43/#45).
 	// Defaults sized for the 31G demo box: steady-state MemAvailable there is
@@ -130,6 +132,12 @@ func Load() *Config {
 		omsProjectDir = filepath.Join(filepath.Dir(projectDir), "order-management")
 	}
 
+	// Assets Engine (money ledger) repo; sibling of match/order-management.
+	assetsProjectDir := os.Getenv("ASSETS_PROJECT_DIR")
+	if assetsProjectDir == "" {
+		assetsProjectDir = filepath.Join(filepath.Dir(projectDir), "assets")
+	}
+
 	// admin-gateway lives in its OWN repo since the split; it is NOT under
 	// MATCH_PROJECT_DIR anymore. Default to the running binary's directory,
 	// which is the repo checkout in every deploy mode we have.
@@ -174,19 +182,21 @@ func Load() *Config {
 	}
 
 	return &Config{
-		Port:          getEnvOrDefault("ADMIN_PORT", "8082"),
-		BindAddr:      getEnvOrDefault("ADMIN_BIND", "127.0.0.1"),
-		AuthToken:     loadAuthToken(),
-		ProjectDir:    projectDir,
-		AdminDir:      adminDir,
-		OmsProjectDir: omsProjectDir,
-		JarPath:       filepath.Join(projectDir, "match-cluster/target/match-cluster.jar"),
-		GatewayJar:    filepath.Join(projectDir, "match-gateway/target/match-gateway.jar"),
-		OmsJar:        filepath.Join(omsProjectDir, "oms-app/target/oms-app.jar"),
-		LogDir:        filepath.Join(homeDir, ".local/log/cluster"),
-		ClusterDir:    "/dev/shm/aeron-cluster",
-		LogFormat:     getEnvOrDefault("ADMIN_LOG_FORMAT", "json"),
-		GoBin:         resolveGoBin(),
+		Port:             getEnvOrDefault("ADMIN_PORT", "8082"),
+		BindAddr:         getEnvOrDefault("ADMIN_BIND", "127.0.0.1"),
+		AuthToken:        loadAuthToken(),
+		ProjectDir:       projectDir,
+		AdminDir:         adminDir,
+		OmsProjectDir:    omsProjectDir,
+		JarPath:          filepath.Join(projectDir, "match-cluster/target/match-cluster.jar"),
+		GatewayJar:       filepath.Join(projectDir, "match-gateway/target/match-gateway.jar"),
+		OmsJar:           filepath.Join(omsProjectDir, "oms-app/target/oms-app.jar"),
+		AssetsProjectDir: assetsProjectDir,
+		AssetsJar:        filepath.Join(assetsProjectDir, "assets-cluster/target/assets-cluster.jar"),
+		LogDir:           filepath.Join(homeDir, ".local/log/cluster"),
+		ClusterDir:       "/dev/shm/aeron-cluster",
+		LogFormat:        getEnvOrDefault("ADMIN_LOG_FORMAT", "json"),
+		GoBin:            resolveGoBin(),
 		// tools is a sibling repo of match/order-management; build with
 		// `cd tools/market-sim && go build -o market-sim .`
 		SimBinary: getEnvOrDefault("SIM_BINARY",

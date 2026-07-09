@@ -80,8 +80,8 @@ func TestReseedWipeAndCopyRespectIdentityFiles(t *testing.T) {
 }
 
 func TestReseedNodeValidation(t *testing.T) {
-	// No cluster access needed for the pure-input failures.
-	ops := &OperationsService{progress: NewProgress()}
+	// Reseed validates node ids against the cluster descriptor, so give it one.
+	ops := &OperationsService{progress: NewProgress(), cluster: &Cluster{NodeCount: 3}}
 	if err := ops.ReseedNode(0, 0, true); err == nil {
 		t.Fatal("same source and target must be rejected")
 	}

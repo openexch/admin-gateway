@@ -19,9 +19,16 @@ func NewLogService(cfg *config.Config) *LogService {
 	return &LogService{logDir: cfg.LogDir}
 }
 
-// GetNodeLogs returns the last N lines from a node's log file
+// GetNodeLogs returns the last N lines from a matching-engine node's log file.
 func (l *LogService) GetNodeLogs(nodeId, lines int) map[string]interface{} {
-	return l.getLogFile(fmt.Sprintf("node%d", nodeId), lines, map[string]interface{}{"node": nodeId})
+	return l.GetNodeLogsNamed(fmt.Sprintf("node%d", nodeId), nodeId, lines)
+}
+
+// GetNodeLogsNamed returns a cluster node's log by its process-manager name
+// (node0.. for the matching engine, ae0 for the assets engine), so the log
+// viewer resolves the right file per cluster. nodeId is echoed for the client.
+func (l *LogService) GetNodeLogsNamed(name string, nodeId, lines int) map[string]interface{} {
+	return l.getLogFile(name, lines, map[string]interface{}{"node": nodeId})
 }
 
 // GetServiceLogs returns the last N lines from a service's log file

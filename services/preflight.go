@@ -332,6 +332,7 @@ func (p *Preflight) checkArtifacts() InvariantResult {
 		{p.cfg.GatewayJar, "market"},
 		{p.cfg.OmsJar, "oms"},
 		{p.cfg.SimBinary, "sim"},
+		{p.cfg.AssetsJar, "ae0"},
 	}
 	var missing []string
 	for _, a := range artifacts {

@@ -94,7 +94,7 @@ func TestCheckArtifacts(t *testing.T) {
 	}
 	missing := filepath.Join(dir, "missing.jar")
 
-	cfg := &config.Config{JarPath: present, GatewayJar: present, OmsJar: present, SimBinary: present}
+	cfg := &config.Config{JarPath: present, GatewayJar: present, OmsJar: present, SimBinary: present, AssetsJar: present}
 	p := newTestPreflight(cfg)
 	if r := p.checkArtifacts(); !r.OK {
 		t.Fatalf("all present should pass, got %+v", r)
