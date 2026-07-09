@@ -26,6 +26,7 @@ type OperationsService struct {
 	cfg           *config.Config
 	systemd       *Systemd
 	cluster       *Cluster
+	peers         []*Cluster // OTHER registered clusters; their dirs are off-limits to this cluster's cleanup
 	progress      *Progress
 	clusterStatus *ClusterStatus
 	procMgr       agent.ProcessAgent
@@ -53,6 +54,10 @@ func NewOperationsService(cfg *config.Config, systemd *Systemd, cluster *Cluster
 	}
 	return o
 }
+
+// SetPeerClusters registers the OTHER clusters on this box, whose state/driver
+// dirs this service's cleanup must never touch.
+func (o *OperationsService) SetPeerClusters(peers []*Cluster) { o.peers = peers }
 
 // Cluster returns the descriptor this ops service manages. Cluster-scoped handlers
 // resolve the ops via ?cluster= (opsFor) and read the descriptor from here, so one
@@ -888,12 +893,16 @@ type CleanupOptions struct {
 const archiveLossConfirmation = "DELETE-CLUSTER-STATE"
 
 // cleanupSweep removes Aeron IPC dirs, mark files, and locks under shmDir and
-// tmpDir. Cluster archives (shmDir/aeron-cluster) are PRESERVED unless
-// includeArchive: /cleanup used to run `rm -rf /dev/shm/aeron-*`, and that
+// tmpDir FOR ONE CLUSTER. stateBase is that cluster's state-dir base name
+// (aeron-cluster / aeron-assets): its archives are PRESERVED unless
+// includeArchive — /cleanup used to run `rm -rf /dev/shm/aeron-*`, and that
 // glob matches aeron-cluster — nuking the very archives P1.3 makes durable
-// (#10). apply=false only reports. Factored out with configurable roots so the
-// preserve guarantee is unit-testable.
-func cleanupSweep(shmDir, tmpDir string, includeArchive, apply bool) (cleaned, preserved, errs []string) {
+// (#10). exclude lists OTHER clusters' dir base names (state dirs + driver
+// dirs): a match cleanup must never touch /dev/shm/aeron-assets and vice versa
+// (the 2026-07-09 clean-slate wiped the assets engine's state under a live
+// ae0 before this scoping existed). apply=false only reports. Factored out
+// with configurable roots so both guarantees are unit-testable.
+func cleanupSweep(shmDir, tmpDir, stateBase string, exclude map[string]bool, includeArchive, apply bool) (cleaned, preserved, errs []string) {
 	remove := func(path string, all bool) {
 		cleaned = append(cleaned, path)
 		if !apply {
@@ -910,11 +919,13 @@ func cleanupSweep(shmDir, tmpDir string, includeArchive, apply bool) (cleaned, p
 		}
 	}
 
-	// 1. Aeron IPC dirs (drivers, clients) — everything aeron-* EXCEPT the
-	// cluster state dir, which the old glob wrongly swallowed.
+	// 1. Aeron IPC dirs (drivers, clients) — everything aeron-* EXCEPT this
+	// cluster's state dir (the old glob wrongly swallowed it) and every other
+	// cluster's dirs (state + drivers), which are not ours to touch.
 	entries, _ := filepath.Glob(filepath.Join(shmDir, "aeron-*"))
 	for _, e := range entries {
-		if filepath.Base(e) == "aeron-cluster" {
+		base := filepath.Base(e)
+		if base == stateBase || exclude[base] {
 			continue
 		}
 		remove(e, true)
@@ -922,9 +933,9 @@ func cleanupSweep(shmDir, tmpDir string, includeArchive, apply bool) (cleaned, p
 
 	// 2. Stale mark/lock files inside the cluster state dirs (node*, backup)
 	for _, pattern := range []string{
-		"aeron-cluster/*/cluster/cluster-mark*.dat",
-		"aeron-cluster/*/cluster/*.lck",
-		"aeron-cluster/*/archive/archive-mark.dat",
+		stateBase + "/*/cluster/cluster-mark*.dat",
+		stateBase + "/*/cluster/*.lck",
+		stateBase + "/*/archive/archive-mark.dat",
 	} {
 		matches, _ := filepath.Glob(filepath.Join(shmDir, pattern))
 		for _, m := range matches {
@@ -933,8 +944,8 @@ func cleanupSweep(shmDir, tmpDir string, includeArchive, apply bool) (cleaned, p
 	}
 
 	// 3. The archives themselves: preserved unless explicitly included
-	recordings, _ := filepath.Glob(filepath.Join(shmDir, "aeron-cluster/*/archive/*.rec"))
-	clusterDir := filepath.Join(shmDir, "aeron-cluster")
+	recordings, _ := filepath.Glob(filepath.Join(shmDir, stateBase+"/*/archive/*.rec"))
+	clusterDir := filepath.Join(shmDir, stateBase)
 	if includeArchive {
 		if _, err := os.Stat(clusterDir); err == nil {
 			cleaned = append(cleaned, fmt.Sprintf("%s (FULL WIPE incl. %d recording(s))", clusterDir, len(recordings)))
@@ -950,13 +961,29 @@ func cleanupSweep(shmDir, tmpDir string, includeArchive, apply bool) (cleaned, p
 			len(recordings), clusterDir, archiveLossConfirmation))
 	}
 
-	// 4. Gateway/client Aeron dirs under tmp
+	// 4. Gateway/client Aeron dirs under tmp (same exclusions apply)
 	tmpEntries, _ := filepath.Glob(filepath.Join(tmpDir, "aeron-*"))
 	for _, e := range tmpEntries {
+		if exclude[filepath.Base(e)] {
+			continue
+		}
 		remove(e, true)
 	}
 
 	return cleaned, preserved, errs
+}
+
+// peerClusterDirs is the exclusion set for this cluster's sweep: every OTHER
+// registered cluster's state-dir and per-node driver-dir base names.
+func (o *OperationsService) peerClusterDirs() map[string]bool {
+	exclude := map[string]bool{}
+	for _, p := range o.peers {
+		exclude[filepath.Base(p.StateDir)] = true
+		for i := 0; i < p.NodeCount; i++ {
+			exclude[filepath.Base(p.DriverAeronDir(i))] = true
+		}
+	}
+	return exclude
 }
 
 // Cleanup removes stale Aeron files (requires all nodes stopped and force=true)
@@ -966,7 +993,8 @@ func (o *OperationsService) Cleanup(opts CleanupOptions) map[string]interface{} 
 	// Dry-run changes nothing: allow it anytime (even with nodes running) so
 	// ops can preview the sweep and the archive-preservation notice.
 	if opts.DryRun {
-		wouldClean, preserved, _ := cleanupSweep("/dev/shm", "/tmp", opts.IncludeArchive, false)
+		wouldClean, preserved, _ := cleanupSweep("/dev/shm", "/tmp",
+			filepath.Base(o.cluster.StateDir), o.peerClusterDirs(), opts.IncludeArchive, false)
 		result["success"] = true
 		result["dryRun"] = true
 		result["wouldClean"] = wouldClean
@@ -1021,7 +1049,8 @@ func (o *OperationsService) Cleanup(opts CleanupOptions) map[string]interface{} 
 		result["backupCreated"] = backupPath
 	}
 
-	cleaned, preserved, errors := cleanupSweep("/dev/shm", "/tmp", opts.IncludeArchive, true)
+	cleaned, preserved, errors := cleanupSweep("/dev/shm", "/tmp",
+		filepath.Base(o.cluster.StateDir), o.peerClusterDirs(), opts.IncludeArchive, true)
 
 	result["success"] = len(errors) == 0
 	result["cleaned"] = cleaned

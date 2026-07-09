@@ -63,6 +63,9 @@ func main() {
 	assetsClusterStatus := services.NewClusterStatus()
 	assetsOps := services.NewOperationsService(cfg, systemd, assetsCluster, progress, assetsClusterStatus)
 	assetsOps.SetProcessManager(procMgr)
+	// Each cluster's cleanup must never touch the other's state/driver dirs.
+	opsSvc.SetPeerClusters([]*services.Cluster{assetsCluster})
+	assetsOps.SetPeerClusters([]*services.Cluster{matchCluster})
 	// Surface the AE as a first-class cluster in /status, sharing the assets ops'
 	// transitional-state tracker so node stops/starts show STOPPING/STARTING.
 	statusSvc.SetAssetsCluster(assetsCluster, assetsClusterStatus)

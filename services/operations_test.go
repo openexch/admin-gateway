@@ -61,7 +61,7 @@ func exists(path string) bool {
 func TestCleanupSweepPreservesArchives(t *testing.T) {
 	shm, tmp := cleanupFixture(t)
 
-	_, preserved, errs := cleanupSweep(shm, tmp, false, true)
+	_, preserved, errs := cleanupSweep(shm, tmp, "aeron-cluster", nil, false, true)
 	if len(errs) != 0 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
@@ -100,7 +100,7 @@ func TestCleanupSweepPreservesArchives(t *testing.T) {
 func TestCleanupSweepIncludeArchiveWipes(t *testing.T) {
 	shm, tmp := cleanupFixture(t)
 
-	_, preserved, errs := cleanupSweep(shm, tmp, true, true)
+	_, preserved, errs := cleanupSweep(shm, tmp, "aeron-cluster", nil, true, true)
 	if len(errs) != 0 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
@@ -112,10 +112,62 @@ func TestCleanupSweepIncludeArchiveWipes(t *testing.T) {
 	}
 }
 
+// Multi-cluster scoping: one cluster's sweep must never touch another
+// cluster's state or driver dirs (the 2026-07-09 clean-slate wiped the assets
+// engine's dirs under a live ae0 before this existed), and the assets sweep
+// must clean ONLY its own.
+func TestCleanupSweepScopedPerCluster(t *testing.T) {
+	shm, tmp := cleanupFixture(t)
+	mk := func(rel string) {
+		path := filepath.Join(shm, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The assets engine's dirs, live on the same box.
+	mk("aeron-assets/ae0/cluster/cluster-mark.dat")
+	mk("aeron-assets/ae0/archive/0-0.rec")
+	mk("aeron-emre-assets-0-driver/cnc.dat")
+
+	assetsDirs := map[string]bool{"aeron-assets": true, "aeron-emre-assets-0-driver": true}
+	matchDirs := map[string]bool{
+		"aeron-cluster": true, "aeron-emre-0-driver": true,
+		"aeron-emre-1-driver": true, "aeron-emre-2-driver": true,
+	}
+
+	// Match cleanup (full wipe) with the assets dirs excluded: assets untouched.
+	if _, _, errs := cleanupSweep(shm, tmp, "aeron-cluster", assetsDirs, true, true); len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if exists(filepath.Join(shm, "aeron-cluster")) {
+		t.Fatal("match state dir should be wiped")
+	}
+	for _, kept := range []string{"aeron-assets/ae0/archive/0-0.rec", "aeron-emre-assets-0-driver/cnc.dat"} {
+		if !exists(filepath.Join(shm, kept)) {
+			t.Fatalf("match cleanup must NOT touch the assets engine's %s", kept)
+		}
+	}
+
+	// Assets cleanup (full wipe) with the match dirs excluded: only its own go.
+	mk("aeron-emre-0-driver/cnc.dat") // recreate a match driver dir
+	if _, _, errs := cleanupSweep(shm, tmp, "aeron-assets", matchDirs, true, true); len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if exists(filepath.Join(shm, "aeron-assets")) || exists(filepath.Join(shm, "aeron-emre-assets-0-driver")) {
+		t.Fatal("assets cleanup should wipe its own state + driver dirs")
+	}
+	if !exists(filepath.Join(shm, "aeron-emre-0-driver/cnc.dat")) {
+		t.Fatal("assets cleanup must NOT touch a match driver dir")
+	}
+}
+
 func TestCleanupSweepDryRunTouchesNothing(t *testing.T) {
 	shm, tmp := cleanupFixture(t)
 
-	wouldClean, _, _ := cleanupSweep(shm, tmp, false, false)
+	wouldClean, _, _ := cleanupSweep(shm, tmp, "aeron-cluster", nil, false, false)
 	if len(wouldClean) == 0 {
 		t.Fatal("dry run should report targets")
 	}
