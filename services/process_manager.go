@@ -486,7 +486,10 @@ func (pm *ProcessManager) Shutdown() {
 		if def.Name == "admin" {
 			continue
 		}
-		proc := pm.procs[def.Name]
+		proc := pm.proc(def.Name)
+		if proc == nil {
+			continue
+		}
 		proc.mu.Lock()
 		if proc.stopChan != nil {
 			select {
@@ -540,7 +543,10 @@ func (pm *ProcessManager) Start(name string) error {
 	}
 
 	// Check if already running
-	proc := pm.procs[name]
+	proc := pm.proc(name)
+	if proc == nil {
+		return fmt.Errorf("unknown service: %s", name)
+	}
 	proc.mu.Lock()
 	if proc.running {
 		proc.mu.Unlock()
@@ -550,10 +556,12 @@ func (pm *ProcessManager) Start(name string) error {
 
 	// Check dependencies
 	for _, dep := range def.DependsOn {
-		depProc := pm.procs[dep]
-		depProc.mu.Lock()
-		isRunning := depProc.running
-		depProc.mu.Unlock()
+		isRunning := false
+		if depProc := pm.proc(dep); depProc != nil {
+			depProc.mu.Lock()
+			isRunning = depProc.running
+			depProc.mu.Unlock()
+		}
 		if !isRunning {
 			return fmt.Errorf("dependency %q is not running (required by %s)", dep, name)
 		}
@@ -578,7 +586,10 @@ func (pm *ProcessManager) Stop(name string) error {
 	dependents := pm.findDependents(name)
 	runningDeps := []string{}
 	for _, d := range dependents {
-		dProc := pm.procs[d]
+		dProc := pm.proc(d)
+		if dProc == nil {
+			continue
+		}
 		dProc.mu.Lock()
 		if dProc.running {
 			runningDeps = append(runningDeps, d)
@@ -614,7 +625,10 @@ func (pm *ProcessManager) Restart(name string) error {
 		return fmt.Errorf("admin gateway manages itself via rebuild-admin endpoint")
 	}
 
-	proc := pm.procs[name]
+	proc := pm.proc(name)
+	if proc == nil {
+		return fmt.Errorf("unknown service: %s", name)
+	}
 	proc.mu.Lock()
 	wasRunning := proc.running
 	proc.mu.Unlock()
@@ -648,7 +662,10 @@ func (pm *ProcessManager) StartAll() []ActionResult {
 			continue
 		}
 
-		proc := pm.procs[def.Name]
+		proc := pm.proc(def.Name)
+		if proc == nil {
+			continue
+		}
 		proc.mu.Lock()
 		isRunning := proc.running
 		proc.mu.Unlock()
@@ -681,7 +698,10 @@ func (pm *ProcessManager) StopAll() []ActionResult {
 			continue
 		}
 
-		proc := pm.procs[def.Name]
+		proc := pm.proc(def.Name)
+		if proc == nil {
+			continue
+		}
 		proc.mu.Lock()
 		isRunning := proc.running
 		proc.mu.Unlock()
@@ -725,7 +745,11 @@ func (pm *ProcessManager) Summary() map[string]interface{} {
 	var totalMem int64
 
 	for _, def := range defs {
-		proc := pm.procs[def.Name]
+		proc := pm.proc(def.Name)
+		if proc == nil {
+			stopped++
+			continue
+		}
 		proc.mu.Lock()
 		switch {
 		case proc.running:
@@ -786,7 +810,10 @@ func (pm *ProcessManager) startProcessNoRotate(def ServiceDef) error {
 }
 
 func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) error {
-	proc := pm.procs[def.Name]
+	proc := pm.proc(def.Name)
+	if proc == nil {
+		return fmt.Errorf("unknown service %s (removed by a catalog reload?)", def.Name)
+	}
 
 	// Phase 1: Check state and claim the start (hold lock briefly)
 	proc.mu.Lock()
@@ -1003,7 +1030,10 @@ func (pm *ProcessManager) startProcessInner(def ServiceDef, rotateLogs bool) err
 }
 
 func (pm *ProcessManager) stopProcess(name string, force bool) error {
-	proc := pm.procs[name]
+	proc := pm.proc(name)
+	if proc == nil {
+		return fmt.Errorf("unknown service %s (removed by a catalog reload?)", name)
+	}
 
 	// Force-stopping a driver also kills an orphan aeronmd named by the launch
 	// script's pid file (#42): the orphan state (live driver, tracked stopped)
@@ -1309,10 +1339,13 @@ func (pm *ProcessManager) handleCrash(
 // --- Process Adoption (re-discover after admin restart) ---
 
 func (pm *ProcessManager) adoptExisting() {
-	for _, def := range pm.services {
+	for _, def := range pm.servicesSnapshot() {
 		// Special case: admin is always "us"
 		if def.Name == "admin" {
-			proc := pm.procs[def.Name]
+			proc := pm.proc(def.Name)
+			if proc == nil {
+				continue
+			}
 			proc.mu.Lock()
 			proc.pid = os.Getpid()
 			proc.running = true
@@ -1328,7 +1361,10 @@ func (pm *ProcessManager) adoptExisting() {
 		}
 
 		if isProcessAlive(pid) {
-			proc := pm.procs[def.Name]
+			proc := pm.proc(def.Name)
+			if proc == nil {
+				continue
+			}
 			proc.mu.Lock()
 			proc.pid = pid
 			proc.running = true
@@ -1351,8 +1387,18 @@ func (pm *ProcessManager) adoptExisting() {
 // cleanupOrphansAfterAdoption kills processes holding service ports that aren't the adopted PID.
 // Runs once at startup to catch orphans from the previous admin instance's auto-restart race.
 func (pm *ProcessManager) cleanupOrphansAfterAdoption() {
-	for _, def := range pm.services {
-		if def.Name == "admin" || !pm.procs[def.Name].running {
+	for _, def := range pm.servicesSnapshot() {
+		if def.Name == "admin" {
+			continue
+		}
+		proc := pm.proc(def.Name)
+		if proc == nil {
+			continue
+		}
+		proc.mu.Lock()
+		running := proc.running
+		proc.mu.Unlock()
+		if !running {
 			continue
 		}
 
@@ -1407,7 +1453,7 @@ func (pm *ProcessManager) cleanStaleAeronState(name string) {
 		// adoption gaps, which is how the 2026-07-06 rolling update deleted
 		// node0's live dir (#42) — the pid-file ground truth must agree.
 		driverRunning := false
-		if dproc, ok := pm.procs[fmt.Sprintf("driver%d", nodeId)]; ok {
+		if dproc := pm.proc(fmt.Sprintf("driver%d", nodeId)); dproc != nil {
 			dproc.mu.Lock()
 			driverRunning = dproc.running
 			dproc.mu.Unlock()
@@ -1465,8 +1511,8 @@ func (pm *ProcessManager) cleanStaleAeronState(name string) {
 // crash-looping driver never stays up gateStableFor, so the gate refuses the
 // node instead of letting it write archive state against a flapping driver.
 func (pm *ProcessManager) waitForGate(def ServiceDef) error {
-	gproc, ok := pm.procs[def.GatedBy]
-	if !ok {
+	gproc := pm.proc(def.GatedBy)
+	if gproc == nil {
 		return fmt.Errorf("refusing to start %s: gating service %q is unknown", def.Name, def.GatedBy)
 	}
 	deadline := time.Now().Add(gateTimeout)
@@ -1546,8 +1592,8 @@ func tailLogSnippet(logPath string) string {
 // so a service disarmed by the rapid-restart cap can be brought back once the
 // underlying cause is fixed. Auto-restarts never re-arm (the cap would be moot).
 func (pm *ProcessManager) rearm(name string) {
-	proc, ok := pm.procs[name]
-	if !ok {
+	proc := pm.proc(name)
+	if proc == nil {
 		return
 	}
 	proc.mu.Lock()
@@ -1655,7 +1701,10 @@ func (pm *ProcessManager) killOrphanedPortHolder(port int, serviceName string) {
 	}
 
 	// Check if this PID is the one we're tracking
-	proc := pm.procs[serviceName]
+	proc := pm.proc(serviceName)
+	if proc == nil {
+		return
+	}
 	proc.mu.Lock()
 	trackedPID := proc.pid
 	proc.mu.Unlock()
@@ -1747,7 +1796,10 @@ func (pm *ProcessManager) refreshAdoptedProcesses() {
 			continue
 		}
 
-		proc := pm.procs[def.Name]
+		proc := pm.proc(def.Name)
+		if proc == nil {
+			continue
+		}
 		proc.mu.Lock()
 		adopted := proc.running && proc.pid > 0 && proc.cmd == nil && proc.status == "running"
 		pid := proc.pid
@@ -1778,7 +1830,12 @@ func (pm *ProcessManager) refreshAdoptedProcesses() {
 // --- Info Helpers ---
 
 func (pm *ProcessManager) getInfo(def ServiceDef) ProcessInfo {
-	proc := pm.procs[def.Name]
+	proc := pm.proc(def.Name)
+	if proc == nil {
+		// A caller holding a pre-reload def for a removed service: report it
+		// stopped rather than panic (it is, by the reload's stopped invariant).
+		return ProcessInfo{Name: def.Name, Display: def.Display, Role: def.Role, Port: def.Port, Status: "stopped"}
+	}
 	proc.mu.Lock()
 	defer proc.mu.Unlock()
 
@@ -1820,19 +1877,29 @@ func (pm *ProcessManager) servicesSnapshot() []ServiceDef {
 	return out
 }
 
+// proc returns the state record for a service, or nil if unknown. All procs-map
+// reads go through here (RLock) because ReloadCatalogMembership can re-key the
+// map (services added/removed on a driver-mode or topology change). The returned
+// pointer stays valid across a re-key — surviving services keep their record and
+// per-process state has its own mutex — so holding it after the RLock is safe.
+func (pm *ProcessManager) proc(name string) *managedProcess {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return pm.procs[name]
+}
+
 // ReloadCatalog atomically swaps the managed-service catalog, e.g. after a
 // profile switch rebuilds every ServiceDef's Command/Env. Membership must be
-// identical to the current catalog (same service names): the per-service proc
-// state map is built once at construction and read lock-free everywhere, so
-// adding or removing keys here would race those readers. Callers that change
-// membership (only the embedded↔external driver-mode boundary does) must go
-// through an admin restart instead. A running process keeps its old launch spec
-// until it is explicitly restarted onto the new def.
+// identical to the current catalog (same service names) — membership-changing
+// swaps (the embedded↔external driver-mode boundary, topology changes) go
+// through ReloadCatalogMembership, which requires the affected services to be
+// stopped. A running process keeps its old launch spec until it is explicitly
+// restarted onto the new def.
 func (pm *ProcessManager) ReloadCatalog(newServices []ServiceDef) error {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	if len(newServices) != len(pm.services) {
-		return fmt.Errorf("catalog membership changed (%d→%d services); a driver-mode switch needs an admin restart, not a live reload",
+		return fmt.Errorf("catalog membership changed (%d→%d services); use the membership-aware apply path (services must be stopped)",
 			len(pm.services), len(newServices))
 	}
 	have := make(map[string]bool, len(pm.services))
@@ -1841,10 +1908,54 @@ func (pm *ProcessManager) ReloadCatalog(newServices []ServiceDef) error {
 	}
 	for _, d := range newServices {
 		if !have[d.Name] {
-			return fmt.Errorf("catalog membership changed (new service %q has no proc state); a driver-mode switch needs an admin restart", d.Name)
+			return fmt.Errorf("catalog membership changed (new service %q has no proc state); use the membership-aware apply path", d.Name)
 		}
 	}
 	pm.services = newServices
+	return nil
+}
+
+// ReloadCatalogMembership swaps the catalog INCLUDING membership changes
+// (services added/removed — the embedded↔external driver-mode boundary, and
+// topology changes). Safe only while every removed service is stopped: a
+// stopped service has no monitor goroutine and no in-flight start, so dropping
+// its record cannot orphan a running process. Surviving services keep their
+// *managedProcess (uptime/restart history preserved); added services get fresh
+// records. The re-key happens under the full write lock and every reader goes
+// through proc()/findDef()/servicesSnapshot() (RLock), so nothing races it.
+func (pm *ProcessManager) ReloadCatalogMembership(newServices []ServiceDef) error {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	newSet := make(map[string]bool, len(newServices))
+	for _, d := range newServices {
+		newSet[d.Name] = true
+	}
+	// Removed services must be stopped — a running process must never lose the
+	// record that tracks it.
+	for name, proc := range pm.procs {
+		if newSet[name] {
+			continue
+		}
+		proc.mu.Lock()
+		active := proc.running || proc.starting
+		proc.mu.Unlock()
+		if active {
+			return fmt.Errorf("cannot reload catalog: service %q would be removed but is still running — stop it first", name)
+		}
+	}
+
+	// Re-key: keep survivors' state, fresh records for added services.
+	procs := make(map[string]*managedProcess, len(newServices))
+	for _, d := range newServices {
+		if p, ok := pm.procs[d.Name]; ok {
+			procs[d.Name] = p
+		} else {
+			procs[d.Name] = &managedProcess{status: "stopped"}
+		}
+	}
+	pm.services = newServices
+	pm.procs = procs
 	return nil
 }
 

@@ -11,14 +11,14 @@ import (
 
 // AutoSnapshot manages periodic snapshot scheduling
 type AutoSnapshot struct {
-	mu                sync.RWMutex
-	enabled           bool
-	intervalMinutes   int64
-	lastSnapshotPos   int64
-	snapshotCount     int
-	stopChan          chan struct{}
-	opsSvc            *OperationsService
-	log               *slog.Logger
+	mu              sync.RWMutex
+	enabled         bool
+	intervalMinutes int64
+	lastSnapshotPos int64
+	snapshotCount   int
+	stopChan        chan struct{}
+	opsSvc          *OperationsService
+	log             *slog.Logger
 }
 
 func NewAutoSnapshot(opsSvc *OperationsService) *AutoSnapshot {

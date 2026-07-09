@@ -64,7 +64,7 @@ type StatusService struct {
 	assetsCluster       *Cluster       // optional second cluster, surfaced additively under result["assetsCluster"]
 	clusterStatus       *ClusterStatus // matching-engine transitional-state tracker
 	assetsClusterStatus *ClusterStatus // assets-engine transitional-state tracker (nil until registered)
-	pm            agent.ProcessAgent
+	pm                  agent.ProcessAgent
 	// counters stays service-owned (not routed via the agent): the initial
 	// refreshStatus runs before SetProcessManager, and CnC reads are a
 	// flagged Horizon B seam (docs/AGENT-ARCHITECTURE.md).

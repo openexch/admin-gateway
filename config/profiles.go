@@ -58,8 +58,8 @@ type profileFile struct {
 func fallbackProfiles() map[string]Profile {
 	return map[string]Profile{
 		"demo": {
-			Description:  "built-in fallback (demo)",
-			NodeHeapMB:   1536, OmsHeapMB: 1024, MarketHeapMB: 1024, BackupHeapMB: 768,
+			Description: "built-in fallback (demo)",
+			NodeHeapMB:  1536, OmsHeapMB: 1024, MarketHeapMB: 1024, BackupHeapMB: 768,
 			PreTouch:      true,
 			IdleMode:      "backoff",
 			DriverProfile: "dev",
