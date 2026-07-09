@@ -43,15 +43,18 @@ func NewAeronCounters() *AeronCounters {
 	return &AeronCounters{}
 }
 
-// GetNodeCounters reads counters for a specific node
+// GetNodeCounters reads counters for a matching-engine node (backward-compatible;
+// the ME's external-driver CnC path). Cluster-aware callers use GetNodeCountersAt.
 func (ac *AeronCounters) GetNodeCounters(nodeId int) (*CounterData, error) {
 	if nodeId < 0 || nodeId > 2 {
 		return nil, fmt.Errorf("invalid nodeId: %d", nodeId)
 	}
+	return ac.GetNodeCountersAt(driverDirPath(nodeId) + "/cnc.dat")
+}
 
-	cncPath := driverDirPath(nodeId) + "/cnc.dat"
-
-	// Open file
+// GetNodeCountersAt reads counters from an explicit Aeron CnC file path — the
+// generic, cluster-agnostic entry point (use Cluster.CncPath(nodeId)).
+func (ac *AeronCounters) GetNodeCountersAt(cncPath string) (*CounterData, error) {
 	f, err := os.Open(cncPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open CnC file %s: %w", cncPath, err)

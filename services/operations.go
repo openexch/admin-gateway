@@ -54,6 +54,15 @@ func NewOperationsService(cfg *config.Config, systemd *Systemd, cluster *Cluster
 	return o
 }
 
+// Cluster returns the descriptor this ops service manages. Cluster-scoped handlers
+// resolve the ops via ?cluster= (opsFor) and read the descriptor from here, so one
+// code path serves every cluster (node names, count, capability flags, DetectLeader).
+func (o *OperationsService) Cluster() *Cluster { return o.cluster }
+
+// Status returns this cluster's transitional-state tracker (STOPPING/STARTING/…),
+// written by the node lifecycle handlers and read by the status poller.
+func (o *OperationsService) Status() *ClusterStatus { return o.clusterStatus }
+
 // SetProcessManager injects the process agent (avoids circular init)
 func (o *OperationsService) SetProcessManager(pm agent.ProcessAgent) {
 	o.procMgr = pm
@@ -116,7 +125,7 @@ func (o *OperationsService) isNodeRunning(nodeId int) bool {
 	if o.procMgr == nil {
 		return false // No PM means can't determine state
 	}
-	info := o.procMgr.Get(fmt.Sprintf("node%d", nodeId))
+	info := o.procMgr.Get(o.cluster.NodeName(nodeId))
 	return info != nil && info.Running
 }
 
@@ -297,21 +306,21 @@ func (o *OperationsService) stageModuleJar(srcDir, module, builtJarRel, tempBuil
 
 // stageClusterJar stages the cluster module (rolling-update, rebuild-cluster).
 func (o *OperationsService) stageClusterJar(tempBuildDir, stagingJar string) error {
-	return o.stageModuleJar(o.cfg.ProjectDir, "match-cluster",
-		"match-cluster/target/match-cluster.jar", tempBuildDir, stagingJar)
+	return o.stageModuleJar(o.cluster.ProjectDir, o.cluster.Module,
+		o.cluster.Module+"/target/"+o.cluster.Module+".jar", tempBuildDir, stagingJar)
 }
 
 func (o *OperationsService) doRollingUpdate() {
 	log := o.log.With("op", "rolling-update", "op_id", o.progress.CurrentOpID())
-	jarPath := o.cfg.JarPath
-	stagingDir := filepath.Join(o.cfg.ProjectDir, "match-cluster/target/staging")
-	stagingJar := filepath.Join(stagingDir, "match-cluster.jar")
+	jarPath := o.cluster.Jar
+	stagingDir := filepath.Join(o.cluster.ProjectDir, o.cluster.Module+"/target/staging")
+	stagingJar := filepath.Join(stagingDir, o.cluster.Module+".jar")
 
 	// Step 1: Build in isolated directory (NEVER touch live JAR)
-	// Multi-module: copy entire project tree (excluding target dirs), build match-cluster
+	// Multi-module: copy entire project tree (excluding target dirs), build the cluster module
 	o.progress.Update(1, "Building cluster module in isolated directory...")
 	buildId := fmt.Sprintf("%d", time.Now().UnixMilli())
-	tempBuildDir := "/tmp/match-rolling-build-" + buildId
+	tempBuildDir := "/tmp/" + o.cluster.Name + "-rolling-build-" + buildId
 
 	if err := o.stageClusterJar(tempBuildDir, stagingJar); err != nil {
 		o.progress.Finish(false, "Build failed: "+err.Error())
@@ -338,10 +347,48 @@ func (o *OperationsService) doRollingUpdate() {
 
 	// Get followers
 	followers := []int{}
-	for i := 0; i < 3; i++ {
+	for i := 0; i < o.cluster.NodeCount; i++ {
 		if i != leader {
 			followers = append(followers, i)
 		}
+	}
+
+	// Single-node cluster: there is no quorum to preserve and no follower/leader
+	// handoff — a "rolling" update is just a swap-and-restart of the sole node
+	// (brief downtime, by design; for the assets engine the settlement projector's
+	// gap recovery absorbs it). This never runs for the ≥2-node matching engine.
+	if o.cluster.NodeCount == 1 {
+		node := leader // == 0
+		o.progress.Update(3, "Stopping node (single-node cluster)...")
+		o.clusterStatus.SetNodeStatus(node, "STOPPING", false)
+		o.stopService(o.cluster.NodeName(node))
+		o.waitForNodeStopped(log, node, 15*time.Second)
+		o.clusterStatus.SetNodeStatus(node, "OFFLINE", false)
+
+		o.progress.Update(3, "Deploying new JAR...")
+		if err := o.installStagedJar(stagingJar, jarPath); err != nil {
+			o.progress.Finish(false, "JAR deploy failed: "+err.Error())
+			return
+		}
+		if !o.cluster.Embedded {
+			o.cleanNodeMediaDriver(log, node)
+		}
+
+		o.progress.Update(3, "Starting node with new code...")
+		o.clusterStatus.SetNodeStatus(node, "STARTING", false)
+		o.startService(o.cluster.NodeName(node))
+		o.clusterStatus.SetNodeStatus(node, "REJOINING", true)
+		if !o.waitForPort("127.0.0.1", o.cluster.IngressPort(node), 60*time.Second) {
+			o.clusterStatus.SetNodeStatus(node, "OFFLINE", false)
+			os.RemoveAll(stagingDir)
+			o.progress.Finish(false, "node did not come back within 60s after update")
+			return
+		}
+		o.clusterStatus.SetNodeStatus(node, "LEADER", true)
+		o.clusterStatus.UpdateLeader(node, 0)
+		os.RemoveAll(stagingDir)
+		o.progress.Finish(true, "Single-node cluster updated (restart)")
+		return
 	}
 
 	jarSwapped := false
@@ -354,7 +401,7 @@ func (o *OperationsService) doRollingUpdate() {
 		// Stop follower
 		o.progress.Update(step, "Stopping "+nodeLabel+"...")
 		o.clusterStatus.SetNodeStatus(nodeId, "STOPPING", false)
-		o.stopService(fmt.Sprintf("node%d", nodeId))
+		o.stopService(o.cluster.NodeName(nodeId))
 		o.waitForNodeStopped(log, nodeId, 15*time.Second)
 		o.clusterStatus.SetNodeStatus(nodeId, "OFFLINE", false)
 		step++
@@ -375,13 +422,16 @@ func (o *OperationsService) doRollingUpdate() {
 			time.Sleep(100 * time.Millisecond)
 		}
 
-		// Clean stale MediaDriver directory for this node
-		o.cleanNodeMediaDriver(log, nodeId)
+		// Clean stale MediaDriver directory for this node (external drivers only;
+		// an embedded-driver cluster has no separate driver dir to clean).
+		if !o.cluster.Embedded {
+			o.cleanNodeMediaDriver(log, nodeId)
+		}
 
 		// Start follower with new code
 		o.progress.Update(step, "Starting "+nodeLabel+" with new code...")
 		o.clusterStatus.SetNodeStatus(nodeId, "STARTING", false)
-		o.startService(fmt.Sprintf("node%d", nodeId))
+		o.startService(o.cluster.NodeName(nodeId))
 		step++
 
 		// Wait for the node to actually rejoin — verify via ingress port.
@@ -391,7 +441,7 @@ func (o *OperationsService) doRollingUpdate() {
 		// for the operator to investigate.
 		o.progress.Update(step, nodeLabel+": Waiting to rejoin cluster...")
 		o.clusterStatus.SetNodeStatus(nodeId, "REJOINING", true)
-		ingressPort := 9000 + (nodeId * 100) + 2 // 9002, 9102, 9202
+		ingressPort := o.cluster.IngressPort(nodeId)
 		if !o.waitForPort("127.0.0.1", ingressPort, 60*time.Second) {
 			o.clusterStatus.SetNodeStatus(nodeId, "OFFLINE", false)
 			o.progress.Finish(false, fmt.Sprintf(
@@ -420,12 +470,14 @@ func (o *OperationsService) doRollingUpdate() {
 	for _, nodeId := range followers {
 		o.clusterStatus.SetNodeStatus(nodeId, "ELECTION", true)
 	}
-	o.stopService(fmt.Sprintf("node%d", leader))
+	o.stopService(o.cluster.NodeName(leader))
 	o.waitForNodeStopped(log, leader, 15*time.Second)
 	o.clusterStatus.SetNodeStatus(leader, "OFFLINE", false)
 
-	// Clean stale MediaDriver directory for old leader
-	o.cleanNodeMediaDriver(log, leader)
+	// Clean stale MediaDriver directory for old leader (external drivers only)
+	if !o.cluster.Embedded {
+		o.cleanNodeMediaDriver(log, leader)
+	}
 
 	// Step 10: Wait for new leader election — verify by checking ingress ports
 	o.progress.Update(10, "Waiting for leader election...")
@@ -450,7 +502,7 @@ func (o *OperationsService) doRollingUpdate() {
 	if !electionOk {
 		// Fallback: check if ingress ports are open
 		for _, nodeId := range followers {
-			port := 9000 + (nodeId * 100) + 2
+			port := o.cluster.IngressPort(nodeId)
 			if o.isPortOpen("127.0.0.1", port) {
 				o.clusterStatus.SetNodeStatus(nodeId, "LEADER", true)
 				o.clusterStatus.UpdateLeader(nodeId, 0)
@@ -469,13 +521,13 @@ func (o *OperationsService) doRollingUpdate() {
 	// Step 11: Start old leader as follower
 	o.progress.Update(11, fmt.Sprintf("Starting Node %d as follower...", leader))
 	o.clusterStatus.SetNodeStatus(leader, "STARTING", false)
-	o.startService(fmt.Sprintf("node%d", leader))
+	o.startService(o.cluster.NodeName(leader))
 
 	// Wait for old leader to rejoin AND catch up to new leader's commit position.
 	// HARD-FAIL if it doesn't (#10): the update deployed, but reporting success
 	// with a member down/lagging hides a degraded cluster from the operator.
 	o.clusterStatus.SetNodeStatus(leader, "REJOINING", true)
-	ingressPort := 9000 + (leader * 100) + 2
+	ingressPort := o.cluster.IngressPort(leader)
 	newLeader := o.cluster.DetectLeader()
 	if !o.waitForPort("127.0.0.1", ingressPort, 60*time.Second) {
 		o.clusterStatus.SetNodeStatus(leader, "OFFLINE", false)
@@ -667,7 +719,7 @@ func (o *OperationsService) doSnapshot() {
 	// below its position unnecessary, but Aeron never reclaims automatically —
 	// purge log segments and superseded snapshots while the cluster runs.
 	housekeepingFailures := 0
-	for i := 0; i < 3; i++ {
+	for i := 0; i < o.cluster.NodeCount; i++ {
 		o.progress.Update(5+i, fmt.Sprintf("Reclaiming archive on Node %d...", i))
 		hkOutput, hkErr := o.cluster.ArchiveHousekeeping(i)
 		log.Info("node housekeeping output", "node", i, "output", hkOutput)
@@ -706,7 +758,7 @@ func (o *OperationsService) Housekeeping(force bool) error {
 func (o *OperationsService) doHousekeeping() {
 	log := o.log.With("op", "housekeeping", "op_id", o.progress.CurrentOpID())
 	failures := 0
-	for i := 0; i < 3; i++ {
+	for i := 0; i < o.cluster.NodeCount; i++ {
 		o.progress.Update(1+i, fmt.Sprintf("Reclaiming archive on Node %d...", i))
 		output, err := o.cluster.ArchiveHousekeeping(i)
 		log.Info("node housekeeping output", "node", i, "output", output)
@@ -795,13 +847,13 @@ func (o *OperationsService) RebuildCluster(force bool) error {
 }
 
 func (o *OperationsService) doRebuildCluster() {
-	stagingDir := filepath.Join(o.cfg.ProjectDir, "match-cluster/target/staging")
-	stagingJar := filepath.Join(stagingDir, "match-cluster.jar")
+	stagingDir := filepath.Join(o.cluster.ProjectDir, o.cluster.Module+"/target/staging")
+	stagingJar := filepath.Join(stagingDir, o.cluster.Module+".jar")
 
 	// Step 1: Build cluster module in isolated directory
 	o.progress.Update(1, "Building cluster module in isolated directory...")
 	buildId := fmt.Sprintf("%d", time.Now().UnixMilli())
-	tempBuildDir := "/tmp/match-cluster-build-" + buildId
+	tempBuildDir := "/tmp/" + o.cluster.Module + "-build-" + buildId
 
 	if err := o.stageClusterJar(tempBuildDir, stagingJar); err != nil {
 		o.progress.Finish(false, "Cluster build failed: "+err.Error())
@@ -932,7 +984,7 @@ func (o *OperationsService) Cleanup(opts CleanupOptions) map[string]interface{} 
 	}
 
 	// Check if any nodes are running via ProcessManager
-	for i := 0; i < 3; i++ {
+	for i := 0; i < o.cluster.NodeCount; i++ {
 		if o.isNodeRunning(i) {
 			result["success"] = false
 			result["error"] = fmt.Sprintf("Node %d is still running. Stop all nodes before cleanup.", i)
@@ -941,10 +993,11 @@ func (o *OperationsService) Cleanup(opts CleanupOptions) map[string]interface{} 
 	}
 
 	// External media drivers own /dev/shm/aeron-<user>-N-driver, which the wipe below
-	// deletes — they must be stopped too or their IPC files are pulled out from under them
-	if o.procMgr != nil {
-		for i := 0; i < 3; i++ {
-			if info := o.procMgr.Get(fmt.Sprintf("driver%d", i)); info != nil && info.Running {
+	// deletes — they must be stopped too or their IPC files are pulled out from under them.
+	// An embedded-driver cluster has no separate driver services to check.
+	if o.procMgr != nil && !o.cluster.Embedded {
+		for i := 0; i < o.cluster.NodeCount; i++ {
+			if info := o.procMgr.Get(o.cluster.DriverName(i)); info != nil && info.Running {
 				result["success"] = false
 				result["error"] = fmt.Sprintf("Media driver %d is still running. Stop all drivers before cleanup.", i)
 				return result
@@ -989,9 +1042,9 @@ func (o *OperationsService) Cleanup(opts CleanupOptions) map[string]interface{} 
 func (o *OperationsService) CleanupNode(nodeId int, force, dryRun bool) map[string]interface{} {
 	result := map[string]interface{}{"nodeId": nodeId}
 
-	if nodeId < 0 || nodeId > 2 {
+	if nodeId < 0 || nodeId >= o.cluster.NodeCount {
 		result["success"] = false
-		result["error"] = "Invalid nodeId (must be 0, 1, or 2)"
+		result["error"] = fmt.Sprintf("Invalid nodeId (must be 0..%d)", o.cluster.NodeCount-1)
 		return result
 	}
 
@@ -1007,7 +1060,7 @@ func (o *OperationsService) CleanupNode(nodeId int, force, dryRun bool) map[stri
 		return result
 	}
 
-	nodeDir := fmt.Sprintf("%s/node%d", o.cfg.ClusterDir, nodeId)
+	nodeDir := o.cluster.NodeStateDir(nodeId)
 	files := []string{
 		nodeDir + "/cluster/cluster-mark*.dat",
 		nodeDir + "/cluster/*.lck",
@@ -1096,7 +1149,7 @@ func BackupFreshness(backupDir string) (fresh bool, reason string, hb *BackupHea
 
 // GetBackupInfo returns information about backup data availability
 func (o *OperationsService) GetBackupInfo() BackupInfo {
-	backupDir := filepath.Join(o.cfg.ProjectDir, "backup")
+	backupDir := o.cluster.BackupDir
 	info := BackupInfo{BackupDir: backupDir, CatalogModifiedAgo: -1}
 
 	if st, err := os.Stat(filepath.Join(backupDir, "cluster/recording.log")); err == nil {
@@ -1119,9 +1172,9 @@ func (o *OperationsService) GetBackupInfo() BackupInfo {
 func (o *OperationsService) RecoverFromBackup(nodeId int, force, dryRun bool) map[string]interface{} {
 	result := map[string]interface{}{"nodeId": nodeId}
 
-	if nodeId < 0 || nodeId > 2 {
+	if nodeId < 0 || nodeId >= o.cluster.NodeCount {
 		result["success"] = false
-		result["error"] = "Invalid nodeId (must be 0, 1, or 2)"
+		result["error"] = fmt.Sprintf("Invalid nodeId (must be 0..%d)", o.cluster.NodeCount-1)
 		return result
 	}
 
@@ -1137,8 +1190,8 @@ func (o *OperationsService) RecoverFromBackup(nodeId int, force, dryRun bool) ma
 		return result
 	}
 
-	backupDir := filepath.Join(o.cfg.ProjectDir, "backup")
-	nodeDir := fmt.Sprintf("%s/node%d", o.cfg.ClusterDir, nodeId)
+	backupDir := o.cluster.BackupDir
+	nodeDir := o.cluster.NodeStateDir(nodeId)
 
 	// Check backup exists
 	if _, err := os.Stat(filepath.Join(backupDir, "archive/archive.catalog")); os.IsNotExist(err) {
@@ -1200,12 +1253,12 @@ func (o *OperationsService) RecoverFromBackup(nodeId int, force, dryRun bool) ma
 // backupMarkFiles creates a timestamped backup of mark files before cleanup
 func (o *OperationsService) backupMarkFiles() string {
 	timestamp := time.Now().Format("20060102-150405")
-	backupDir := filepath.Join(o.cfg.ProjectDir, "backup/pre-cleanup", timestamp)
+	backupDir := filepath.Join(o.cluster.BackupDir, "pre-cleanup", timestamp)
 	os.MkdirAll(backupDir, 0755)
 
-	for i := 0; i < 3; i++ {
-		nodeDir := fmt.Sprintf("%s/node%d", o.cfg.ClusterDir, i)
-		nodeBackup := filepath.Join(backupDir, fmt.Sprintf("node%d", i))
+	for i := 0; i < o.cluster.NodeCount; i++ {
+		nodeDir := o.cluster.NodeStateDir(i)
+		nodeBackup := filepath.Join(backupDir, o.cluster.NodeName(i))
 		os.MkdirAll(nodeBackup, 0755)
 
 		files := []string{"cluster/cluster-mark.dat", "cluster/recording.log",
@@ -1269,7 +1322,7 @@ func (o *OperationsService) isPortOpen(host string, port int) bool {
 
 // waitForNodeStopped waits until a node's process is no longer running
 func (o *OperationsService) waitForNodeStopped(log *slog.Logger, nodeId int, timeout time.Duration) {
-	service := fmt.Sprintf("node%d", nodeId)
+	service := o.cluster.NodeName(nodeId)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if !o.isNodeRunning(nodeId) {
@@ -1297,11 +1350,11 @@ func (o *OperationsService) waitForNodeStopped(log *slog.Logger, nodeId int, tim
 func (o *OperationsService) cleanNodeMediaDriver(log *slog.Logger, nodeId int) {
 	trackedRunning := false
 	if o.procMgr != nil {
-		if info := o.procMgr.Get(fmt.Sprintf("driver%d", nodeId)); info != nil && info.Running {
+		if info := o.procMgr.Get(o.cluster.DriverName(nodeId)); info != nil && info.Running {
 			trackedRunning = true
 		}
 	}
-	driverDir := driverDirPath(nodeId)
+	driverDir := o.cluster.DriverAeronDir(nodeId)
 	ok, reason := canDeleteDriverDir(driverDir, trackedRunning)
 	if !ok {
 		if !trackedRunning {

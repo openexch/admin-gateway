@@ -26,11 +26,16 @@ type Handlers struct {
 	metrics      *services.MetricsService
 	preflight    *services.Preflight
 	cfg          *config.Config
+	// clusterOps routes cluster-scoped ops (rolling-update, snapshot) to the
+	// right cluster's OperationsService via the ?cluster= selector; the default
+	// (empty/"match") is opsSvc, so existing callers are unchanged.
+	clusterOps map[string]*services.OperationsService
 }
 
 func New(
 	statusSvc *services.StatusService,
 	opsSvc *services.OperationsService,
+	clusterOps map[string]*services.OperationsService,
 	cluster *services.Cluster,
 	progress *services.Progress,
 	status *services.ClusterStatus,
@@ -44,6 +49,7 @@ func New(
 	return &Handlers{
 		statusSvc:    statusSvc,
 		opsSvc:       opsSvc,
+		clusterOps:   clusterOps,
 		cluster:      cluster,
 		progress:     progress,
 		status:       status,
@@ -228,24 +234,29 @@ func (h *Handlers) handleSetProfile(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Node operations
+// Node operations — cluster-scoped via ?cluster= (default = matching engine, so
+// existing callers are unchanged). The descriptor supplies the node name + count
+// and the ops service supplies the transitional-state tracker, so one code path
+// drives both the matching engine and the assets engine.
 func (h *Handlers) handleRestartNode(w http.ResponseWriter, r *http.Request) {
-	nodeId, err := h.getNodeId(r)
+	ops := h.opsFor(r)
+	c, tracker := ops.Cluster(), ops.Status()
+	nodeId, err := h.getNodeId(r, c.NodeCount)
 	if err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
-	name := "node" + strconv.Itoa(nodeId)
+	name := c.NodeName(nodeId)
 	log := logging.FromRequest(r)
 	go func() {
-		h.status.SetNodeStatus(nodeId, "STOPPING", false)
+		tracker.SetNodeStatus(nodeId, "STOPPING", false)
 		if err := h.procMgr.Restart(name); err != nil {
-			log.Error("restart-node failed", "node", nodeId, "err", err)
-			h.status.SetNodeStatus(nodeId, "OFFLINE", false)
+			log.Error("restart-node failed", "cluster", c.Name, "node", nodeId, "err", err)
+			tracker.SetNodeStatus(nodeId, "OFFLINE", false)
 			return
 		}
-		h.status.SetNodeStatus(nodeId, "FOLLOWER", true)
+		tracker.SetNodeStatus(nodeId, "FOLLOWER", true)
 	}()
 
 	jsonResponse(w, http.StatusAccepted, map[string]string{
@@ -254,20 +265,22 @@ func (h *Handlers) handleRestartNode(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) handleStopNode(w http.ResponseWriter, r *http.Request) {
-	nodeId, err := h.getNodeId(r)
+	ops := h.opsFor(r)
+	c, tracker := ops.Cluster(), ops.Status()
+	nodeId, err := h.getNodeId(r, c.NodeCount)
 	if err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
-	name := "node" + strconv.Itoa(nodeId)
+	name := c.NodeName(nodeId)
 	log := logging.FromRequest(r)
 	go func() {
-		h.status.SetNodeStatus(nodeId, "STOPPING", false)
+		tracker.SetNodeStatus(nodeId, "STOPPING", false)
 		if err := h.procMgr.ForceStop(name); err != nil {
-			log.Error("stop-node failed", "node", nodeId, "err", err)
+			log.Error("stop-node failed", "cluster", c.Name, "node", nodeId, "err", err)
 		}
-		h.status.SetNodeStatus(nodeId, "OFFLINE", false)
+		tracker.SetNodeStatus(nodeId, "OFFLINE", false)
 	}()
 
 	jsonResponse(w, http.StatusAccepted, map[string]string{
@@ -276,22 +289,24 @@ func (h *Handlers) handleStopNode(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) handleStartNode(w http.ResponseWriter, r *http.Request) {
-	nodeId, err := h.getNodeId(r)
+	ops := h.opsFor(r)
+	c, tracker := ops.Cluster(), ops.Status()
+	nodeId, err := h.getNodeId(r, c.NodeCount)
 	if err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
-	name := "node" + strconv.Itoa(nodeId)
+	name := c.NodeName(nodeId)
 	log := logging.FromRequest(r)
 	go func() {
-		h.status.SetNodeStatus(nodeId, "STARTING", false)
+		tracker.SetNodeStatus(nodeId, "STARTING", false)
 		if err := h.procMgr.Start(name); err != nil {
-			log.Error("start-node failed", "node", nodeId, "err", err)
-			h.status.SetNodeStatus(nodeId, "OFFLINE", false)
+			log.Error("start-node failed", "cluster", c.Name, "node", nodeId, "err", err)
+			tracker.SetNodeStatus(nodeId, "OFFLINE", false)
 			return
 		}
-		h.status.SetNodeStatus(nodeId, "FOLLOWER", true)
+		tracker.SetNodeStatus(nodeId, "FOLLOWER", true)
 	}()
 
 	jsonResponse(w, http.StatusAccepted, map[string]string{
@@ -300,15 +315,17 @@ func (h *Handlers) handleStartNode(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) handleStopAllNodes(w http.ResponseWriter, r *http.Request) {
+	ops := h.opsFor(r)
+	c, tracker := ops.Cluster(), ops.Status()
 	log := logging.FromRequest(r)
 	go func() {
-		for i := 0; i < 3; i++ {
-			name := "node" + strconv.Itoa(i)
-			h.status.SetNodeStatus(i, "STOPPING", false)
+		for i := 0; i < c.NodeCount; i++ {
+			name := c.NodeName(i)
+			tracker.SetNodeStatus(i, "STOPPING", false)
 			if err := h.procMgr.ForceStop(name); err != nil {
-				log.Error("stop-all-nodes: node stop failed", "node", i, "err", err)
+				log.Error("stop-all-nodes: node stop failed", "cluster", c.Name, "node", i, "err", err)
 			}
-			h.status.SetNodeStatus(i, "OFFLINE", false)
+			tracker.SetNodeStatus(i, "OFFLINE", false)
 		}
 	}()
 
@@ -318,22 +335,24 @@ func (h *Handlers) handleStopAllNodes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) handleStartAllNodes(w http.ResponseWriter, r *http.Request) {
+	ops := h.opsFor(r)
+	c, tracker := ops.Cluster(), ops.Status()
 	log := logging.FromRequest(r)
 	go func() {
-		for i := 0; i < 3; i++ {
-			name := "node" + strconv.Itoa(i)
-			h.status.SetNodeStatus(i, "STARTING", false)
+		for i := 0; i < c.NodeCount; i++ {
+			name := c.NodeName(i)
+			tracker.SetNodeStatus(i, "STARTING", false)
 			if err := h.procMgr.Start(name); err != nil {
-				log.Error("start-all-nodes: node start failed", "node", i, "err", err)
+				log.Error("start-all-nodes: node start failed", "cluster", c.Name, "node", i, "err", err)
 			}
 		}
 		// Wait and detect leader
-		leader := h.cluster.DetectLeader()
-		for i := 0; i < 3; i++ {
+		leader := c.DetectLeader()
+		for i := 0; i < c.NodeCount; i++ {
 			if i == leader {
-				h.status.SetNodeStatus(i, "LEADER", true)
+				tracker.SetNodeStatus(i, "LEADER", true)
 			} else {
-				h.status.SetNodeStatus(i, "FOLLOWER", true)
+				tracker.SetNodeStatus(i, "FOLLOWER", true)
 			}
 		}
 	}()
@@ -344,10 +363,23 @@ func (h *Handlers) handleStartAllNodes(w http.ResponseWriter, r *http.Request) {
 }
 
 // Complex operations
+// opsFor selects the OperationsService for the ?cluster= query param (default =
+// the matching engine, so existing callers are unchanged). The same code path
+// serves every registered cluster.
+func (h *Handlers) opsFor(r *http.Request) *services.OperationsService {
+	name := r.URL.Query().Get("cluster")
+	if name != "" && h.clusterOps != nil {
+		if ops, ok := h.clusterOps[name]; ok {
+			return ops
+		}
+	}
+	return h.opsSvc
+}
+
 func (h *Handlers) handleRollingUpdate(w http.ResponseWriter, r *http.Request) {
 	// {"force": true} overrides pre-flight blocking failures (#43), the same
 	// escape hatch as the snapshot/housekeeping lag guard.
-	if err := h.opsSvc.RollingUpdate(parseForce(r)); err != nil {
+	if err := h.opsFor(r).RollingUpdate(parseForce(r)); err != nil {
 		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
@@ -357,7 +389,7 @@ func (h *Handlers) handleRollingUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) handleSnapshot(w http.ResponseWriter, r *http.Request) {
-	if err := h.opsSvc.Snapshot(parseForce(r)); err != nil {
+	if err := h.opsFor(r).Snapshot(parseForce(r)); err != nil {
 		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
@@ -407,7 +439,7 @@ func (h *Handlers) handleRebuildOms(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) handleRebuildCluster(w http.ResponseWriter, r *http.Request) {
-	if err := h.opsSvc.RebuildCluster(parseForce(r)); err != nil {
+	if err := h.opsFor(r).RebuildCluster(parseForce(r)); err != nil {
 		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
@@ -426,7 +458,16 @@ func parseForce(r *http.Request) bool {
 }
 
 func (h *Handlers) handleHousekeeping(w http.ResponseWriter, r *http.Request) {
-	if err := h.opsSvc.Housekeeping(parseForce(r)); err != nil {
+	ops := h.opsFor(r)
+	// Capability refusal BEFORE the shared operation slot is claimed: a cluster with
+	// no housekeeping tool must not wedge the global Progress (the #26 lesson).
+	if ops.Cluster().HousekeepingMain == "" {
+		jsonResponse(w, http.StatusBadRequest, map[string]string{
+			"error": "cluster '" + ops.Cluster().Name + "' has no archive housekeeping",
+		})
+		return
+	}
+	if err := ops.Housekeeping(parseForce(r)); err != nil {
 		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
@@ -493,14 +534,17 @@ func (h *Handlers) handleLogs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	jsonResponse(w, http.StatusOK, h.logSvc.GetNodeLogs(nodeId, lines))
+	// Cluster-aware node log file: node<id> for the matching engine (default),
+	// ae<id> for the assets engine, resolved from the ?cluster= descriptor.
+	name := h.opsFor(r).Cluster().NodeName(nodeId)
+	jsonResponse(w, http.StatusOK, h.logSvc.GetNodeLogsNamed(name, nodeId, lines))
 }
 
 // Cleanup handler
 func (h *Handlers) handleCleanup(w http.ResponseWriter, r *http.Request) {
 	var opts services.CleanupOptions
 	json.NewDecoder(r.Body).Decode(&opts) // ignore error - defaults to false values
-	result := h.opsSvc.Cleanup(opts)
+	result := h.opsFor(r).Cleanup(opts)
 	status := http.StatusOK
 	if success, ok := result["success"].(bool); ok && !success {
 		status = http.StatusBadRequest
@@ -516,7 +560,7 @@ func (h *Handlers) handleCleanupNode(w http.ResponseWriter, r *http.Request) {
 		DryRun bool `json:"dryRun"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
-	result := h.opsSvc.CleanupNode(req.NodeId, req.Force, req.DryRun)
+	result := h.opsFor(r).CleanupNode(req.NodeId, req.Force, req.DryRun)
 	status := http.StatusOK
 	if success, ok := result["success"].(bool); ok && !success {
 		status = http.StatusBadRequest
@@ -526,18 +570,32 @@ func (h *Handlers) handleCleanupNode(w http.ResponseWriter, r *http.Request) {
 
 // BackupInfo handler
 func (h *Handlers) handleBackupInfo(w http.ResponseWriter, r *http.Request) {
-	jsonResponse(w, http.StatusOK, h.opsSvc.GetBackupInfo())
+	ops := h.opsFor(r)
+	if ops.Cluster().BackupDir == "" {
+		jsonResponse(w, http.StatusBadRequest, map[string]string{
+			"error": "cluster '" + ops.Cluster().Name + "' has no backup",
+		})
+		return
+	}
+	jsonResponse(w, http.StatusOK, ops.GetBackupInfo())
 }
 
 // RecoverFromBackup handler
 func (h *Handlers) handleRecoverFromBackup(w http.ResponseWriter, r *http.Request) {
+	ops := h.opsFor(r)
+	if ops.Cluster().BackupDir == "" {
+		jsonResponse(w, http.StatusBadRequest, map[string]string{
+			"error": "cluster '" + ops.Cluster().Name + "' has no backup to recover from",
+		})
+		return
+	}
 	var req struct {
 		NodeId int  `json:"nodeId"`
 		Force  bool `json:"force"`
 		DryRun bool `json:"dryRun"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
-	result := h.opsSvc.RecoverFromBackup(req.NodeId, req.Force, req.DryRun)
+	result := ops.RecoverFromBackup(req.NodeId, req.Force, req.DryRun)
 	status := http.StatusOK
 	if success, ok := result["success"].(bool); ok && !success {
 		status = http.StatusBadRequest
@@ -652,6 +710,16 @@ func (h *Handlers) handleRebuildAdmin(w http.ResponseWriter, r *http.Request) {
 // handleReseedNode launches the stranded-member reseed: copy a healthy
 // follower's state over a corrupt member's (match#35 procedure, automated).
 func (h *Handlers) handleReseedNode(w http.ResponseWriter, r *http.Request) {
+	ops := h.opsFor(r)
+	// Reseed copies a healthy follower's state over a stranded member: it needs a
+	// distinct source, so a single-node cluster has nothing to reseed from. Refuse
+	// before the shared operation slot is claimed.
+	if ops.Cluster().NodeCount < 2 {
+		jsonResponse(w, http.StatusBadRequest, map[string]string{
+			"error": "cluster '" + ops.Cluster().Name + "' is single-node; reseed needs a source follower",
+		})
+		return
+	}
 	var req struct {
 		NodeId       *int `json:"nodeId"`
 		SourceNodeId *int `json:"sourceNodeId"`
@@ -663,7 +731,7 @@ func (h *Handlers) handleReseedNode(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if err := h.opsSvc.ReseedNode(*req.NodeId, *req.SourceNodeId, req.Force); err != nil {
+	if err := ops.ReseedNode(*req.NodeId, *req.SourceNodeId, req.Force); err != nil {
 		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
@@ -681,23 +749,23 @@ func (h *Handlers) handleRebuildStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // Helpers
-func (h *Handlers) getNodeId(r *http.Request) (int, error) {
+func (h *Handlers) getNodeId(r *http.Request, nodeCount int) (int, error) {
 	var req struct {
 		NodeId int `json:"nodeId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		return 0, err
 	}
-	if req.NodeId < 0 || req.NodeId > 2 {
-		return 0, &InvalidNodeError{}
+	if req.NodeId < 0 || req.NodeId >= nodeCount {
+		return 0, &InvalidNodeError{max: nodeCount - 1}
 	}
 	return req.NodeId, nil
 }
 
-type InvalidNodeError struct{}
+type InvalidNodeError struct{ max int }
 
 func (e *InvalidNodeError) Error() string {
-	return "Invalid nodeId. Must be 0, 1, or 2"
+	return fmt.Sprintf("Invalid nodeId. Must be 0..%d", e.max)
 }
 
 func jsonResponse(w http.ResponseWriter, status int, data interface{}) {

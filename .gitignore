@@ -34,3 +34,6 @@ admin-gateway.staging
 rebuild-pending.json
 rebuild-result.json
 .tools/
+
+# Runtime state (live active profile, written by profile switch)
+active-profile.json

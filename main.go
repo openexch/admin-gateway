@@ -35,8 +35,14 @@ func main() {
 	services.ApplyProfileOSKnobs(cfg.Profile)
 
 	// Initialize services
-	systemd := services.NewSystemd()   // only used by OperationsService for admin gateway self-restart
-	cluster := services.NewCluster(cfg)
+	systemd := services.NewSystemd() // only used by OperationsService for admin gateway self-restart
+	// Cluster descriptors: the matching engine (existing) + the assets engine. Every
+	// management op runs against one of these via the same code path. The existing
+	// singletons stay bound to the matching engine so its behavior is unchanged;
+	// the assets descriptor is registered for cluster-scoped management.
+	matchCluster := services.NewMatchCluster(cfg)
+	assetsCluster := services.NewAssetsCluster(cfg)
+	cluster := matchCluster
 	progress := services.NewProgress()
 	clusterStatus := services.NewClusterStatus()
 	// The in-process LocalAgent. Everything downstream depends only on the
@@ -49,6 +55,21 @@ func main() {
 	opsSvc := services.NewOperationsService(cfg, systemd, cluster, progress, clusterStatus)
 	opsSvc.SetProcessManager(procMgr)
 	opsSvc.SetStatusService(statusSvc)
+
+	// Assets Engine ops: the SAME OperationsService code, bound to the assets
+	// descriptor + its own status tracker. Intentionally no preflight/statusSvc —
+	// a single-node cluster has no quorum to gate, so its "rolling update"
+	// degenerates to a swap-and-restart (see doRollingUpdate's NodeCount==1 path).
+	assetsClusterStatus := services.NewClusterStatus()
+	assetsOps := services.NewOperationsService(cfg, systemd, assetsCluster, progress, assetsClusterStatus)
+	assetsOps.SetProcessManager(procMgr)
+	// Surface the AE as a first-class cluster in /status, sharing the assets ops'
+	// transitional-state tracker so node stops/starts show STOPPING/STARTING.
+	statusSvc.SetAssetsCluster(assetsCluster, assetsClusterStatus)
+	clusterOps := map[string]*services.OperationsService{
+		matchCluster.Name:  opsSvc,
+		assetsCluster.Name: assetsOps,
+	}
 	preflight := services.NewPreflight(cfg)
 	preflight.SetProcessManager(procMgr)
 	preflight.SetStatusService(statusSvc)
@@ -61,7 +82,7 @@ func main() {
 	metricsSvc := services.NewMetricsService(statusSvc, opsSvc, procMgr, progress, preflight)
 
 	// Initialize handlers
-	h := handlers.New(statusSvc, opsSvc, cluster, progress, clusterStatus, autoSnapshot, logSvc, procMgr, metricsSvc, preflight, cfg)
+	h := handlers.New(statusSvc, opsSvc, clusterOps, cluster, progress, clusterStatus, autoSnapshot, logSvc, procMgr, metricsSvc, preflight, cfg)
 
 	// Setup router
 	r := chi.NewRouter()
