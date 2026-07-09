@@ -33,6 +33,11 @@ type Handlers struct {
 	// right cluster's OperationsService via the ?cluster= selector; the default
 	// (empty/"match") is opsSvc, so existing callers are unchanged.
 	clusterOps map[string]*services.OperationsService
+
+	// journalRunner runs the per-node JournalRetention CLI. nil = the real
+	// cluster exec (cluster.JournalRetention); tests override it to assert the
+	// per-node fan-out without spawning java.
+	journalRunner func(c *services.Cluster, nodeId int, journalRoot string, safeEgressSeq int64) (string, error)
 }
 
 func New(
@@ -99,6 +104,12 @@ func (h *Handlers) RegisterRoutes(r chi.Router) {
 	// (Aeron offline ArchiveTool compaction was removed — running it against a
 	// live node corrupts snapshot recordings and breaks recover-from-snapshot.)
 	r.Post("/api/admin/housekeeping", h.handleHousekeeping)
+
+	// Settlement-journal retention: purge journal-archive segments strictly below
+	// a safeEgressSeq watermark, per match-cluster node. Synchronous — returns
+	// per-node CLI results — because the caller wants the outcome, not a
+	// fire-and-forget progress op.
+	r.Post("/api/admin/journal-retention", h.handleJournalRetention)
 
 	// Auto-snapshot (GET/POST/DELETE)
 	r.Get("/api/admin/auto-snapshot", h.handleAutoSnapshotGet)
@@ -569,6 +580,70 @@ func (h *Handlers) handleHousekeeping(w http.ResponseWriter, r *http.Request) {
 	}
 	jsonResponse(w, http.StatusAccepted, map[string]string{
 		"message": "Archive housekeeping initiated",
+	})
+}
+
+// handleJournalRetention purges settlement-journal archive segments strictly
+// below a caller-supplied safeEgressSeq watermark, per match-cluster node. It
+// execs the match-cluster JournalRetention CLI on each node (live-safe, mirroring
+// the housekeeping fan-out) and returns the per-node CLI output as JSON.
+//
+// The watermark is the egressSeq up to which settlement has been durably applied
+// downstream (the Assets Engine); nothing at or above it is reclaimed. There is
+// NO automatic scheduling here on purpose — the auto-hook that feeds this the
+// AE-snapshot watermark arrives with the settlement bridge; until then this
+// endpoint is operator-driven.
+func (h *Handlers) handleJournalRetention(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SafeEgressSeq int64 `json:"safeEgressSeq"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	// Nothing is provably safe to purge below a non-positive watermark; refuse
+	// before touching any node (the CLI enforces this too, defence in depth).
+	if req.SafeEgressSeq <= 0 {
+		jsonResponse(w, http.StatusBadRequest, map[string]string{
+			"error": "safeEgressSeq must be > 0",
+		})
+		return
+	}
+	journalRoot := h.cfg.SettlementJournalDir
+	if journalRoot == "" {
+		jsonResponse(w, http.StatusConflict, map[string]string{
+			"error": "journal not configured (SETTLEMENT_JOURNAL_DIR unset — feature off)",
+		})
+		return
+	}
+
+	c := h.cluster // the settlement journal is a match-cluster feature
+	run := h.journalRunner
+	if run == nil {
+		run = func(cl *services.Cluster, nodeId int, root string, seq int64) (string, error) {
+			return cl.JournalRetention(nodeId, root, seq)
+		}
+	}
+
+	log := logging.FromRequest(r)
+	results := make([]map[string]interface{}, 0, c.NodeCount())
+	failures := 0
+	for i := 0; i < c.NodeCount(); i++ {
+		output, err := run(c, i, journalRoot, req.SafeEgressSeq)
+		entry := map[string]interface{}{"node": i, "output": output}
+		if err != nil {
+			failures++
+			entry["error"] = err.Error()
+			log.Warn("journal-retention failed on node", "cluster", c.Name, "node", i, "err", err)
+		}
+		log.Info("journal-retention node output", "cluster", c.Name, "node", i, "output", output)
+		results = append(results, entry)
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]interface{}{
+		"safeEgressSeq": req.SafeEgressSeq,
+		"results":       results,
+		"failures":      failures,
 	})
 }
 

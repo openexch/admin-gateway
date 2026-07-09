@@ -25,9 +25,14 @@ type Config struct {
 	AssetsJar        string // Assets Engine cluster uber JAR (ae0 node)
 	LogDir           string
 	ClusterDir       string
-	LogFormat        string // "json" (default) or "text" (ADMIN_LOG_FORMAT)
-	GoBin            string // go binary for rebuild-admin (ADMIN_GO_BIN; see resolveGoBin)
-	SimBinary        string // market simulator binary (SIM_BINARY; openexch/tools market-sim)
+	// SettlementJournalDir is the settlement-journal root (env SETTLEMENT_JOURNAL_DIR),
+	// matching the cluster's SETTLEMENT_JOURNAL_DIR. Empty = the journal feature is off,
+	// so /api/admin/journal-retention refuses with 409 rather than purging an unknown dir.
+	// The per-node journal lives at <SettlementJournalDir>/node<N>.
+	SettlementJournalDir string
+	LogFormat            string // "json" (default) or "text" (ADMIN_LOG_FORMAT)
+	GoBin                string // go binary for rebuild-admin (ADMIN_GO_BIN; see resolveGoBin)
+	SimBinary            string // market simulator binary (SIM_BINARY; openexch/tools market-sim)
 
 	// Pre-flight invariant thresholds (services/preflight.go, #42/#43/#45).
 	// Defaults sized for the 31G demo box: steady-state MemAvailable there is
@@ -310,21 +315,22 @@ func Load() *Config {
 	}
 
 	return &Config{
-		Port:             getEnvOrDefault("ADMIN_PORT", "8082"),
-		BindAddr:         getEnvOrDefault("ADMIN_BIND", "127.0.0.1"),
-		AuthToken:        loadAuthToken(),
-		ProjectDir:       projectDir,
-		AdminDir:         adminDir,
-		OmsProjectDir:    omsProjectDir,
-		JarPath:          filepath.Join(projectDir, "match-cluster/target/match-cluster.jar"),
-		GatewayJar:       filepath.Join(projectDir, "match-gateway/target/match-gateway.jar"),
-		OmsJar:           filepath.Join(omsProjectDir, "oms-app/target/oms-app.jar"),
-		AssetsProjectDir: assetsProjectDir,
-		AssetsJar:        filepath.Join(assetsProjectDir, "assets-cluster/target/assets-cluster.jar"),
-		LogDir:           filepath.Join(homeDir, ".local/log/cluster"),
-		ClusterDir:       "/dev/shm/aeron-cluster",
-		LogFormat:        getEnvOrDefault("ADMIN_LOG_FORMAT", "json"),
-		GoBin:            resolveGoBin(),
+		Port:                 getEnvOrDefault("ADMIN_PORT", "8082"),
+		BindAddr:             getEnvOrDefault("ADMIN_BIND", "127.0.0.1"),
+		AuthToken:            loadAuthToken(),
+		ProjectDir:           projectDir,
+		AdminDir:             adminDir,
+		OmsProjectDir:        omsProjectDir,
+		JarPath:              filepath.Join(projectDir, "match-cluster/target/match-cluster.jar"),
+		GatewayJar:           filepath.Join(projectDir, "match-gateway/target/match-gateway.jar"),
+		OmsJar:               filepath.Join(omsProjectDir, "oms-app/target/oms-app.jar"),
+		AssetsProjectDir:     assetsProjectDir,
+		AssetsJar:            filepath.Join(assetsProjectDir, "assets-cluster/target/assets-cluster.jar"),
+		LogDir:               filepath.Join(homeDir, ".local/log/cluster"),
+		ClusterDir:           "/dev/shm/aeron-cluster",
+		SettlementJournalDir: os.Getenv("SETTLEMENT_JOURNAL_DIR"),
+		LogFormat:            getEnvOrDefault("ADMIN_LOG_FORMAT", "json"),
+		GoBin:                resolveGoBin(),
 		// tools is a sibling repo of match/order-management; build with
 		// `cd tools/market-sim && go build -o market-sim .`
 		SimBinary: getEnvOrDefault("SIM_BINARY",

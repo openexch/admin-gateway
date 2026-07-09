@@ -20,6 +20,16 @@ const (
 	archiveToolMain = "io.aeron.archive.ArchiveTool"
 )
 
+// Settlement-journal retention main class (match-cluster) + its archive control
+// port offset. The offset mirrors match-common
+// InfrastructureConstants.JOURNAL_ARCHIVE_CONTROL_PORT_OFFSET: the journal
+// archive's control channel sits at PortBase + node*100 + 10, distinct from the
+// consensus archive's +1 offset.
+const (
+	journalRetentionMain            = "com.match.infrastructure.journal.JournalRetention"
+	journalArchiveControlPortOffset = 10
+)
+
 // Cluster is the descriptor + tooling wrapper for ONE Aeron cluster. Every
 // per-cluster identity (node count, ports, dirs, jar, driver topology, tooling)
 // lives here, so a single set of management operations (rolling update, restart,
@@ -456,6 +466,33 @@ func (c *Cluster) ArchiveHousekeeping(nodeId int) (string, error) {
 		"-cp", c.Jar,
 		c.HousekeepingMain,
 		c.clusterSubDir(nodeId), c.DriverAeronDir(nodeId), "2")
+
+	output, err := cmd.CombinedOutput()
+	return string(output), err
+}
+
+// JournalRetention reclaims disk on a node's LIVE settlement-journal archive by
+// purging journal segments strictly below the safeEgressSeq watermark. It execs
+// the match-cluster JournalRetention CLI — live-safe, no downtime — mirroring
+// ArchiveHousekeeping's per-node java invocation. journalRoot is the settlement
+// journal root (config.SettlementJournalDir); the per-node dir is
+// journalRoot/node<N>, and the journal archive's control port is
+// PortBase + N*100 + journalArchiveControlPortOffset.
+//
+// TODO(settlement-bridge): the safeEgressSeq is the Assets Engine's
+// applied-settlement watermark. This method is operator-driven for now; when the
+// settlement bridge lands, an auto-hook will call it after each AE snapshot.
+func (c *Cluster) JournalRetention(nodeId int, journalRoot string, safeEgressSeq int64) (string, error) {
+	journalNodeDir := filepath.Join(journalRoot, fmt.Sprintf("node%d", nodeId))
+	controlPort := c.PortBase + nodeId*100 + journalArchiveControlPortOffset
+	cmd := exec.Command("java",
+		"--add-opens", "java.base/jdk.internal.misc=ALL-UNNAMED",
+		"-cp", c.Jar,
+		journalRetentionMain,
+		journalNodeDir,
+		c.DriverAeronDir(nodeId),
+		strconv.Itoa(controlPort),
+		strconv.FormatInt(safeEgressSeq, 10))
 
 	output, err := cmd.CombinedOutput()
 	return string(output), err
