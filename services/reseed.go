@@ -33,8 +33,8 @@ func reseedExcluded(name string) bool {
 
 // ReseedNode validates and launches the reseed operation.
 func (o *OperationsService) ReseedNode(targetId, sourceId int, force bool) error {
-	if targetId < 0 || targetId >= o.cluster.NodeCount || sourceId < 0 || sourceId >= o.cluster.NodeCount {
-		return fmt.Errorf("nodeId and sourceNodeId must be 0..%d", o.cluster.NodeCount-1)
+	if targetId < 0 || targetId >= o.cluster.NodeCount() || sourceId < 0 || sourceId >= o.cluster.NodeCount() {
+		return fmt.Errorf("nodeId and sourceNodeId must be 0..%d", o.cluster.NodeCount()-1)
 	}
 	if targetId == sourceId {
 		return fmt.Errorf("sourceNodeId must differ from nodeId")

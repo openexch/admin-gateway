@@ -352,7 +352,7 @@ func (o *OperationsService) doRollingUpdate() {
 
 	// Get followers
 	followers := []int{}
-	for i := 0; i < o.cluster.NodeCount; i++ {
+	for i := 0; i < o.cluster.NodeCount(); i++ {
 		if i != leader {
 			followers = append(followers, i)
 		}
@@ -362,7 +362,7 @@ func (o *OperationsService) doRollingUpdate() {
 	// handoff — a "rolling" update is just a swap-and-restart of the sole node
 	// (brief downtime, by design; for the assets engine the settlement projector's
 	// gap recovery absorbs it). This never runs for the ≥2-node matching engine.
-	if o.cluster.NodeCount == 1 {
+	if o.cluster.NodeCount() == 1 {
 		node := leader // == 0
 		o.progress.Update(3, "Stopping node (single-node cluster)...")
 		o.clusterStatus.SetNodeStatus(node, "STOPPING", false)
@@ -724,7 +724,7 @@ func (o *OperationsService) doSnapshot() {
 	// below its position unnecessary, but Aeron never reclaims automatically —
 	// purge log segments and superseded snapshots while the cluster runs.
 	housekeepingFailures := 0
-	for i := 0; i < o.cluster.NodeCount; i++ {
+	for i := 0; i < o.cluster.NodeCount(); i++ {
 		o.progress.Update(5+i, fmt.Sprintf("Reclaiming archive on Node %d...", i))
 		hkOutput, hkErr := o.cluster.ArchiveHousekeeping(i)
 		log.Info("node housekeeping output", "node", i, "output", hkOutput)
@@ -763,7 +763,7 @@ func (o *OperationsService) Housekeeping(force bool) error {
 func (o *OperationsService) doHousekeeping() {
 	log := o.log.With("op", "housekeeping", "op_id", o.progress.CurrentOpID())
 	failures := 0
-	for i := 0; i < o.cluster.NodeCount; i++ {
+	for i := 0; i < o.cluster.NodeCount(); i++ {
 		o.progress.Update(1+i, fmt.Sprintf("Reclaiming archive on Node %d...", i))
 		output, err := o.cluster.ArchiveHousekeeping(i)
 		log.Info("node housekeeping output", "node", i, "output", output)
@@ -979,7 +979,7 @@ func (o *OperationsService) peerClusterDirs() map[string]bool {
 	exclude := map[string]bool{}
 	for _, p := range o.peers {
 		exclude[filepath.Base(p.StateDir)] = true
-		for i := 0; i < p.NodeCount; i++ {
+		for i := 0; i < p.NodeCount(); i++ {
 			exclude[filepath.Base(p.DriverAeronDir(i))] = true
 		}
 	}
@@ -1012,7 +1012,7 @@ func (o *OperationsService) Cleanup(opts CleanupOptions) map[string]interface{} 
 	}
 
 	// Check if any nodes are running via ProcessManager
-	for i := 0; i < o.cluster.NodeCount; i++ {
+	for i := 0; i < o.cluster.NodeCount(); i++ {
 		if o.isNodeRunning(i) {
 			result["success"] = false
 			result["error"] = fmt.Sprintf("Node %d is still running. Stop all nodes before cleanup.", i)
@@ -1024,7 +1024,7 @@ func (o *OperationsService) Cleanup(opts CleanupOptions) map[string]interface{} 
 	// deletes — they must be stopped too or their IPC files are pulled out from under them.
 	// An embedded-driver cluster has no separate driver services to check.
 	if o.procMgr != nil && !o.cluster.Embedded {
-		for i := 0; i < o.cluster.NodeCount; i++ {
+		for i := 0; i < o.cluster.NodeCount(); i++ {
 			if info := o.procMgr.Get(o.cluster.DriverName(i)); info != nil && info.Running {
 				result["success"] = false
 				result["error"] = fmt.Sprintf("Media driver %d is still running. Stop all drivers before cleanup.", i)
@@ -1071,9 +1071,9 @@ func (o *OperationsService) Cleanup(opts CleanupOptions) map[string]interface{} 
 func (o *OperationsService) CleanupNode(nodeId int, force, dryRun bool) map[string]interface{} {
 	result := map[string]interface{}{"nodeId": nodeId}
 
-	if nodeId < 0 || nodeId >= o.cluster.NodeCount {
+	if nodeId < 0 || nodeId >= o.cluster.NodeCount() {
 		result["success"] = false
-		result["error"] = fmt.Sprintf("Invalid nodeId (must be 0..%d)", o.cluster.NodeCount-1)
+		result["error"] = fmt.Sprintf("Invalid nodeId (must be 0..%d)", o.cluster.NodeCount()-1)
 		return result
 	}
 
@@ -1201,9 +1201,9 @@ func (o *OperationsService) GetBackupInfo() BackupInfo {
 func (o *OperationsService) RecoverFromBackup(nodeId int, force, dryRun bool) map[string]interface{} {
 	result := map[string]interface{}{"nodeId": nodeId}
 
-	if nodeId < 0 || nodeId >= o.cluster.NodeCount {
+	if nodeId < 0 || nodeId >= o.cluster.NodeCount() {
 		result["success"] = false
-		result["error"] = fmt.Sprintf("Invalid nodeId (must be 0..%d)", o.cluster.NodeCount-1)
+		result["error"] = fmt.Sprintf("Invalid nodeId (must be 0..%d)", o.cluster.NodeCount()-1)
 		return result
 	}
 
@@ -1285,7 +1285,7 @@ func (o *OperationsService) backupMarkFiles() string {
 	backupDir := filepath.Join(o.cluster.BackupDir, "pre-cleanup", timestamp)
 	os.MkdirAll(backupDir, 0755)
 
-	for i := 0; i < o.cluster.NodeCount; i++ {
+	for i := 0; i < o.cluster.NodeCount(); i++ {
 		nodeDir := o.cluster.NodeStateDir(i)
 		nodeBackup := filepath.Join(backupDir, o.cluster.NodeName(i))
 		os.MkdirAll(nodeBackup, 0755)

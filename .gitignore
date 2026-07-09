@@ -37,3 +37,6 @@ rebuild-result.json
 
 # Runtime state (live active profile, written by profile switch)
 active-profile.json
+
+# Runtime state (per-cluster node counts, written by the topology op)
+cluster-topology.json

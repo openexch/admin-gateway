@@ -124,6 +124,7 @@ func (h *Handlers) RegisterRoutes(r chi.Router) {
 	r.Get("/api/admin/backup-info", h.handleBackupInfo)
 	r.Post("/api/admin/recover-from-backup", h.handleRecoverFromBackup)
 	r.Post("/api/admin/reseed-node", h.handleReseedNode)
+	r.Post("/api/admin/cluster-topology", h.handleClusterTopology)
 
 	// Health check
 	r.Get("/health", h.handleHealth)
@@ -241,7 +242,7 @@ func (h *Handlers) handleSetProfile(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) handleRestartNode(w http.ResponseWriter, r *http.Request) {
 	ops := h.opsFor(r)
 	c, tracker := ops.Cluster(), ops.Status()
-	nodeId, err := h.getNodeId(r, c.NodeCount)
+	nodeId, err := h.getNodeId(r, c.NodeCount())
 	if err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -267,7 +268,7 @@ func (h *Handlers) handleRestartNode(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) handleStopNode(w http.ResponseWriter, r *http.Request) {
 	ops := h.opsFor(r)
 	c, tracker := ops.Cluster(), ops.Status()
-	nodeId, err := h.getNodeId(r, c.NodeCount)
+	nodeId, err := h.getNodeId(r, c.NodeCount())
 	if err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -291,7 +292,7 @@ func (h *Handlers) handleStopNode(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) handleStartNode(w http.ResponseWriter, r *http.Request) {
 	ops := h.opsFor(r)
 	c, tracker := ops.Cluster(), ops.Status()
-	nodeId, err := h.getNodeId(r, c.NodeCount)
+	nodeId, err := h.getNodeId(r, c.NodeCount())
 	if err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
@@ -319,7 +320,7 @@ func (h *Handlers) handleStopAllNodes(w http.ResponseWriter, r *http.Request) {
 	c, tracker := ops.Cluster(), ops.Status()
 	log := logging.FromRequest(r)
 	go func() {
-		for i := 0; i < c.NodeCount; i++ {
+		for i := 0; i < c.NodeCount(); i++ {
 			name := c.NodeName(i)
 			tracker.SetNodeStatus(i, "STOPPING", false)
 			if err := h.procMgr.ForceStop(name); err != nil {
@@ -339,7 +340,7 @@ func (h *Handlers) handleStartAllNodes(w http.ResponseWriter, r *http.Request) {
 	c, tracker := ops.Cluster(), ops.Status()
 	log := logging.FromRequest(r)
 	go func() {
-		for i := 0; i < c.NodeCount; i++ {
+		for i := 0; i < c.NodeCount(); i++ {
 			name := c.NodeName(i)
 			tracker.SetNodeStatus(i, "STARTING", false)
 			if err := h.procMgr.Start(name); err != nil {
@@ -348,7 +349,7 @@ func (h *Handlers) handleStartAllNodes(w http.ResponseWriter, r *http.Request) {
 		}
 		// Wait and detect leader
 		leader := c.DetectLeader()
-		for i := 0; i < c.NodeCount; i++ {
+		for i := 0; i < c.NodeCount(); i++ {
 			if i == leader {
 				tracker.SetNodeStatus(i, "LEADER", true)
 			} else {
@@ -714,7 +715,7 @@ func (h *Handlers) handleReseedNode(w http.ResponseWriter, r *http.Request) {
 	// Reseed copies a healthy follower's state over a stranded member: it needs a
 	// distinct source, so a single-node cluster has nothing to reseed from. Refuse
 	// before the shared operation slot is claimed.
-	if ops.Cluster().NodeCount < 2 {
+	if ops.Cluster().NodeCount() < 2 {
 		jsonResponse(w, http.StatusBadRequest, map[string]string{
 			"error": "cluster '" + ops.Cluster().Name + "' is single-node; reseed needs a source follower",
 		})
@@ -738,6 +739,45 @@ func (h *Handlers) handleReseedNode(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusAccepted, map[string]string{
 		"message": fmt.Sprintf("Reseeding node%d from node%d — the source follower stops during the copy "+
 			"(brief quorum outage). Poll /api/admin/progress.", *req.NodeId, *req.SourceNodeId),
+	})
+}
+
+// handleClusterTopology changes a cluster's node count — a GENESIS RE-FORM
+// (stop → wipe state → fresh member list), the only correct path with Aeron's
+// static membership. Data loss by design, so it demands the typed confirmation
+// phrase in the body; for the matching engine the wipe is coordinated across
+// Redis/Postgres/Timescale (users + risk config preserved). ?cluster= selects
+// the target like every other cluster-scoped op.
+func (h *Handlers) handleClusterTopology(w http.ResponseWriter, r *http.Request) {
+	ops := h.opsFor(r)
+	var req struct {
+		NodeCount int    `json:"nodeCount"`
+		Confirm   string `json:"confirm"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.NodeCount == 0 {
+		jsonResponse(w, http.StatusBadRequest, map[string]string{
+			"error": `body must be {"nodeCount": <1|3|5|7>, "confirm": "DELETE-CLUSTER-STATE"}`,
+		})
+		return
+	}
+	if req.Confirm != "DELETE-CLUSTER-STATE" {
+		scope := "its cluster + archive state"
+		if ops.Cluster().Name == "match" {
+			scope = "its cluster + archive state AND all orders/trades/balances in Redis, Postgres and Timescale (users + risk config preserved)"
+		}
+		jsonResponse(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("changing node count re-forms cluster %q from genesis and WIPES %s; set confirm=\"DELETE-CLUSTER-STATE\" to proceed",
+				ops.Cluster().Name, scope),
+		})
+		return
+	}
+	if err := ops.ChangeTopology(req.NodeCount); err != nil {
+		jsonResponse(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusAccepted, map[string]string{
+		"message": fmt.Sprintf("Re-forming cluster %q with %d node(s) from genesis. Poll GET /api/admin/progress.",
+			ops.Cluster().Name, req.NodeCount),
 	})
 }
 

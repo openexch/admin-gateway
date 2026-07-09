@@ -81,7 +81,9 @@ func TestReseedWipeAndCopyRespectIdentityFiles(t *testing.T) {
 
 func TestReseedNodeValidation(t *testing.T) {
 	// Reseed validates node ids against the cluster descriptor, so give it one.
-	ops := &OperationsService{progress: NewProgress(), cluster: &Cluster{NodeCount: 3}}
+	c := &Cluster{}
+	c.SetNodeCount(3)
+	ops := &OperationsService{progress: NewProgress(), cluster: c}
 	if err := ops.ReseedNode(0, 0, true); err == nil {
 		t.Fatal("same source and target must be rejected")
 	}

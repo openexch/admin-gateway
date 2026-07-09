@@ -280,7 +280,7 @@ func TestReloadCatalogMembershipConcurrentReadersNoRace(t *testing.T) {
 // claims the progress slot or spawns the roll.
 func TestApplyProfileValidation(t *testing.T) {
 	cfg := testProfileCfg(t) // active = demo
-	o := &OperationsService{cfg: cfg, progress: NewProgress(), log: logging.Component("test")}
+	o := &OperationsService{cfg: cfg, cluster: NewMatchCluster(cfg), progress: NewProgress(), log: logging.Component("test")}
 	o.SetProcessManager(newFakeAgent())
 
 	if err := o.ApplyProfile("nope", false); err == nil || !strings.Contains(err.Error(), "unknown profile") {

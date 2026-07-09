@@ -300,9 +300,14 @@ func (p *Preflight) checkDriverDirs() InvariantResult {
 		return InvariantResult{Name: name, OK: true, Detail: "process agent not wired"}
 	}
 	var failures []string
-	for i := 0; i < 3; i++ {
+	// Driver services are named driver<i> contiguously from 0 for the current
+	// topology; stop at the first unknown name so any node count works.
+	for i := 0; ; i++ {
 		info := p.pm.Get(fmt.Sprintf("driver%d", i))
-		if info == nil || !info.Running || !isProcessAlive(info.PID) {
+		if info == nil {
+			break
+		}
+		if !info.Running || !isProcessAlive(info.PID) {
 			continue
 		}
 		cnc := p.driverDir(i) + "/cnc.dat"
