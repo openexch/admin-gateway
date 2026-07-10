@@ -60,6 +60,14 @@ func (p *Progress) CurrentOpID() string {
 	return p.OperationID
 }
 
+// CurrentOperation returns the name of the operation holding the slot (empty
+// when idle). Read by recoverOp to attribute a panic to the op that died.
+func (p *Progress) CurrentOperation() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.Operation
+}
+
 func (p *Progress) Update(step int, status string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

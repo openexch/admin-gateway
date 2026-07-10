@@ -123,6 +123,10 @@ func (h *Handlers) RegisterRoutes(r chi.Router) {
 	r.Post("/api/admin/rebuild-admin", h.handleRebuildAdmin)
 	r.Get("/api/admin/rebuild-status", h.handleRebuildStatus)
 
+	// Durable record of the last op goroutine that died unexpectedly (ag#67):
+	// survives the panic/restart that erases the in-memory Progress slot.
+	r.Get("/api/admin/last-op-failure", h.handleLastOpFailure)
+
 	// Process manager
 	r.Get("/api/admin/processes", h.handleProcessList)
 	r.Get("/api/admin/processes/summary", h.handleProcessSummary)
@@ -956,6 +960,14 @@ func (h *Handlers) handleClusterTopology(w http.ResponseWriter, r *http.Request)
 // its own binary), or none.
 func (h *Handlers) handleRebuildStatus(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, h.opsSvc.RebuildStatus())
+}
+
+// handleLastOpFailure reports the durable record of the last operation goroutine
+// that died unexpectedly (a panic, or an admin restart mid-op) — the failure the
+// in-memory Progress slot loses when its goroutine dies (ag#67). state="none"
+// when no op has died since the record was last cleared.
+func (h *Handlers) handleLastOpFailure(w http.ResponseWriter, r *http.Request) {
+	jsonResponse(w, http.StatusOK, h.opsSvc.LastOpFailure())
 }
 
 // Helpers

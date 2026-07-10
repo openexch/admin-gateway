@@ -68,24 +68,82 @@ func TestCanDeleteDriverDir(t *testing.T) {
 	dir := tempDriverDir(t)
 
 	// Tracked running always refuses, whatever the pid file says.
-	if ok, reason := canDeleteDriverDir(dir, true); ok || reason == "" {
+	if ok, reason := canDeleteDriverDir(dir, true, false); ok || reason == "" {
 		t.Fatalf("tracked running must refuse with a reason, got ok=%v reason=%q", ok, reason)
 	}
 
-	// Tracked stopped + no live pid: deletable (the legitimate stale case).
-	if ok, _ := canDeleteDriverDir(dir, false); !ok {
+	// Tracked stopped + no pid file + node down + no cnc: deletable (stale case).
+	if ok, _ := canDeleteDriverDir(dir, false, false); !ok {
 		t.Fatal("stale dir with no live driver should be deletable")
 	}
 
 	// Tracked stopped + live pid file: the #42 state — never deletable.
 	writeDriverPid(t, dir, os.Getpid())
-	ok, reason := canDeleteDriverDir(dir, false)
+	ok, reason := canDeleteDriverDir(dir, false, false)
 	if ok {
 		t.Fatal("live pid file must refuse deletion despite tracked stopped")
 	}
 	if !strings.Contains(reason, strconv.Itoa(os.Getpid())) {
 		t.Fatalf("reason should name the live pid, got %q", reason)
 	}
+
+	// A pid file present but naming a DEAD process is the legitimate stale
+	// external-driver case: still deletable (the primary path is unchanged).
+	writeDriverPid(t, dir, reapedPid(t))
+	if ok, _ := canDeleteDriverDir(dir, false, false); !ok {
+		t.Fatal("present-but-dead pid file should be the deletable stale case")
+	}
+}
+
+// ag#68: embedded-driver mode has NO external driver process and NO <dir>.pid
+// file, so the pid-file guard is vacuous. Deletion must instead be blocked by
+// either the owning node being tracked-running or a freshly-written cnc.dat.
+func TestCanDeleteDriverDirEmbedded(t *testing.T) {
+	t.Run("owning node running blocks", func(t *testing.T) {
+		dir := tempDriverDir(t) // no .pid sibling written
+		ok, reason := canDeleteDriverDir(dir, false, true)
+		if ok {
+			t.Fatal("no pid file but the owning node runs must refuse (embedded driver)")
+		}
+		if !strings.Contains(reason, "node") {
+			t.Fatalf("reason should cite the owning node, got %q", reason)
+		}
+	})
+
+	t.Run("fresh cnc.dat blocks even with node down", func(t *testing.T) {
+		dir := tempDriverDir(t)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "cnc.dat"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		ok, reason := canDeleteDriverDir(dir, false, false)
+		if ok {
+			t.Fatal("a freshly-written cnc.dat must refuse deletion (a live embedded driver maps it)")
+		}
+		if !strings.Contains(reason, "cnc.dat") {
+			t.Fatalf("reason should cite cnc.dat freshness, got %q", reason)
+		}
+	})
+
+	t.Run("stale cnc.dat + node down is deletable", func(t *testing.T) {
+		dir := tempDriverDir(t)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cnc := filepath.Join(dir, "cnc.dat")
+		if err := os.WriteFile(cnc, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		old := time.Now().Add(-2 * driverCncFreshWindow)
+		if err := os.Chtimes(cnc, old, old); err != nil {
+			t.Fatal(err)
+		}
+		if ok, reason := canDeleteDriverDir(dir, false, false); !ok {
+			t.Fatalf("a stale cnc.dat with node down should be deletable, got refused: %q", reason)
+		}
+	})
 }
 
 func TestOrphanDriverStartRefused(t *testing.T) {

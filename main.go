@@ -57,9 +57,16 @@ func main() {
 	opsSvc.SetStatusService(statusSvc)
 
 	// Assets Engine ops: the SAME OperationsService code, bound to the assets
-	// descriptor + its own status tracker. Intentionally no preflight/statusSvc —
-	// a single-node cluster has no quorum to gate, so its "rolling update"
-	// degenerates to a swap-and-restart (see doRollingUpdate's NodeCount==1 path).
+	// descriptor + its own status tracker. It shares the preflight instance so its
+	// destructive ops are gated by the GLOBAL, box-wide invariants (mem-available,
+	// disk-space) exactly like the matching engine's — starting an assets rolling
+	// update on an OOM/full box is just as dangerous (ag#83). SetPreflight is wired
+	// below, after preflight is constructed. The match-SPECIFIC checks
+	// (cluster-quorum over the 3-node ME, driver-dirs over the ME's external
+	// drivers) are scoped out for the assets cluster by Preflight.GateForCluster,
+	// so a single-node embedded cluster is never gated on the ME's quorum. It still
+	// intentionally has no statusSvc (its own health tracker feeds /status, not the
+	// gate).
 	assetsClusterStatus := services.NewClusterStatusSized(assetsCluster.NodeCount())
 	assetsOps := services.NewOperationsService(cfg, systemd, assetsCluster, progress, assetsClusterStatus)
 	assetsOps.SetProcessManager(procMgr)
@@ -78,6 +85,10 @@ func main() {
 	preflight.SetStatusService(statusSvc)
 	statusSvc.SetPreflight(preflight)
 	opsSvc.SetPreflight(preflight)
+	// Gate the assets cluster's destructive ops too (ag#83). The shared preflight
+	// scopes out the match-specific checks for the assets cluster (see
+	// Preflight.GateForCluster); the global mem/disk gates still apply.
+	assetsOps.SetPreflight(preflight)
 	autoSnapshot := services.NewAutoSnapshot(opsSvc)
 	statusSvc.SetAutoSnapshot(autoSnapshot)
 	autoSnapshot.Start(5) // Auto-snapshot every 5 minutes to prevent unbounded log growth

@@ -227,6 +227,7 @@ func (o *OperationsService) ApplyProfile(name string, force bool) error {
 }
 
 func (o *OperationsService) doApplyProfile(fromName, toName string, toProf config.Profile, newCatalog []ServiceDef, changed map[string]bool) {
+	defer o.recoverOp() // ag#67: contain+record a panic, free the slot
 	log := o.log.With("op", "apply-profile", "op_id", o.progress.CurrentOpID(), "from", fromName, "to", toName)
 	log.Info("applying stack profile", "changed", len(changed))
 
@@ -314,6 +315,7 @@ func (o *OperationsService) doApplyProfile(fromName, toName string, toProf confi
 // state either: the fix is re-applying the target (or the previous profile to
 // roll back) with force — the sequence tolerates already-stopped services.
 func (o *OperationsService) doApplyProfileMembership(fromName, toName string, toProf config.Profile, newCatalog []ServiceDef, diff membershipDiff, gwChanged []string) {
+	defer o.recoverOp() // ag#67: contain+record a panic, free the slot
 	log := o.log.With("op", "apply-profile", "op_id", o.progress.CurrentOpID(), "from", fromName, "to", toName, "tier", "membership")
 	log.Info("applying stack profile across the driver-mode boundary",
 		"added", diff.added, "removed", diff.removed, "gateways", gwChanged)

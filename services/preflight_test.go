@@ -316,6 +316,34 @@ func TestGate(t *testing.T) {
 	}
 }
 
+// GateForCluster scopes the match-specific checks (cluster-quorum, driver-dirs)
+// out for any non-match cluster, while the box-global checks (mem, disk) still
+// apply (ag#83). A degraded matching engine must not refuse an assets op.
+func TestGateForClusterScoping(t *testing.T) {
+	cfg := &config.Config{MinMemMB: 4096, MinRootDiskGB: 0, MaxShmUsedPct: 100}
+	p := newTestPreflight(cfg)
+	p.meminfoPath = writeMeminfo(t, 8192) // mem fine
+	p.status = &fakeStatus{statusWithHealth(HealthHealthy, HealthHealthy, HealthDead)}
+
+	// Matching engine: the quorum check applies and refuses.
+	if err := p.GateForCluster("rolling-update", "match", false); err == nil || !strings.Contains(err.Error(), "cluster-quorum") {
+		t.Fatalf("match op must be gated by quorum, got %v", err)
+	}
+	// Gate() is the match-scoped alias, so it refuses identically.
+	if err := p.Gate("rolling-update", false); err == nil || !strings.Contains(err.Error(), "cluster-quorum") {
+		t.Fatalf("Gate must behave as the match-scoped GateForCluster, got %v", err)
+	}
+	// Assets: quorum + driver-dirs scoped out, so the degraded ME does not gate it.
+	if err := p.GateForCluster("rolling-update", "assets", false); err != nil {
+		t.Fatalf("assets op must not be gated by the match-specific quorum check, got %v", err)
+	}
+	// The global mem check still gates the assets op.
+	p.meminfoPath = writeMeminfo(t, 1000)
+	if err := p.GateForCluster("rolling-update", "assets", false); err == nil || !strings.Contains(err.Error(), "mem-available") {
+		t.Fatalf("assets op must still be gated by the global mem check, got %v", err)
+	}
+}
+
 func TestInvariantsOK(t *testing.T) {
 	if !InvariantsOK([]InvariantResult{{OK: true}, {OK: true}}) {
 		t.Fatal("all ok should be true")

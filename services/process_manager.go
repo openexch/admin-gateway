@@ -1532,8 +1532,16 @@ func (pm *ProcessManager) cleanStaleAeronState(name string) {
 			driverRunning = dproc.running
 			dproc.mu.Unlock()
 		}
+		// Embedded-mode fallback (ag#68): with no external driver there is no pid
+		// file, so canDeleteDriverDir also refuses while the owning node runs.
+		nodeRunning := false
+		if nproc := pm.proc(name); nproc != nil {
+			nproc.mu.Lock()
+			nodeRunning = nproc.running
+			nproc.mu.Unlock()
+		}
 		driverDir := driverDirPath(nodeId)
-		if ok, reason := canDeleteDriverDir(driverDir, driverRunning); ok {
+		if ok, reason := canDeleteDriverDir(driverDir, driverRunning, nodeRunning); ok {
 			if _, err := os.Stat(driverDir); err == nil {
 				os.RemoveAll(driverDir)
 				pm.log.Info("cleaned stale media driver dir", "dir", driverDir)
@@ -2099,16 +2107,59 @@ func driverPidFileAlive(driverDir string) (int, bool) {
 	return pid, isProcessAlive(pid)
 }
 
-// canDeleteDriverDir is the #42 guard shared by every deleter of a media
-// driver dir: deletion needs BOTH the tracked state stopped AND no live
-// process named by the dir's pid file. An absent procs entry or a
-// crash-looped tracked state must never default to "safe to delete".
-func canDeleteDriverDir(driverDir string, trackedRunning bool) (ok bool, reason string) {
+// driverCncFreshWindow: a cnc.dat modified more recently than this means a live
+// media driver is still mapping/writing it. The Aeron driver conductor touches
+// cnc.dat continuously; 30s is comfortably longer than its heartbeat, so a stale
+// (crashed-driver) dir ages out of the window quickly while a live one never does.
+const driverCncFreshWindow = 30 * time.Second
+
+// cncModifiedWithin reports whether <driverDir>/cnc.dat exists and was modified
+// within window. Absent/unstattable cnc.dat reads as "not fresh".
+func cncModifiedWithin(driverDir string, window time.Duration) (fresh bool, age time.Duration) {
+	st, err := os.Stat(filepath.Join(driverDir, "cnc.dat"))
+	if err != nil {
+		return false, 0
+	}
+	age = time.Since(st.ModTime())
+	return age >= 0 && age < window, age
+}
+
+// canDeleteDriverDir is the #42 guard shared by every deleter of a media driver
+// dir: deletion needs the tracked state stopped AND no live process holding it.
+//
+// The <driverDir>.pid file was the ground truth (external-driver mode, where
+// launch-driver.sh writes it). But the cluster now also runs EMBEDDED drivers
+// (the media driver inside the node JVM: the assets engine always, and the
+// matching engine on the light profile) — there is NO external driver process
+// and NO pid file, so the pid-file check is vacuous and defaulted to "safe to
+// delete". That is how node0's live driver dir was deleted on 2026-07-08 and
+// again 2026-07-10 02:47 (the 02:47 deleter is still UNATTRIBUTED — an external
+// process is suspected; this guard closes every in-repo deleter regardless).
+//
+// So: when the pid file is ABSENT, two embedded-mode liveness signals gate the
+// delete, and EITHER blocks — the owning NODE process being tracked-running
+// (nodeRunning, supplied by the caller that owns the process registry), and a
+// freshly-written cnc.dat. The pid-file path stays the primary check when a pid
+// file is present (present-but-dead = the legitimate stale external case).
+func canDeleteDriverDir(driverDir string, trackedRunning, nodeRunning bool) (ok bool, reason string) {
 	if trackedRunning {
 		return false, "driver tracked running"
 	}
-	if pid, alive := driverPidFileAlive(driverDir); alive {
-		return false, fmt.Sprintf("live driver (pid %d) holds it per %s.pid despite tracked stopped", pid, driverDir)
+	if _, err := os.Stat(driverDir + ".pid"); err == nil {
+		// External-driver mode: the pid file is ground truth.
+		if pid, alive := driverPidFileAlive(driverDir); alive {
+			return false, fmt.Sprintf("live driver (pid %d) holds it per %s.pid despite tracked stopped", pid, driverDir)
+		}
+		return true, "" // pid file present but dead: the legitimate stale case
+	}
+	// No pid file: embedded-driver mode. The pid-file guard cannot fire, so fall
+	// back to the node process and a live cnc.dat; either blocks the delete.
+	if nodeRunning {
+		return false, "owning node process is tracked running and there is no driver pid file (embedded driver)"
+	}
+	if fresh, age := cncModifiedWithin(driverDir, driverCncFreshWindow); fresh {
+		return false, fmt.Sprintf("cnc.dat modified %v ago (< %v): a live embedded driver is mapping it",
+			age.Truncate(time.Millisecond), driverCncFreshWindow)
 	}
 	return true, ""
 }
