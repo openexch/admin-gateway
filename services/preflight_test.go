@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/match/admin-gateway/agent"
@@ -107,6 +108,107 @@ func TestCheckArtifacts(t *testing.T) {
 	}
 	if !strings.Contains(r.Detail, "missing.jar") || !strings.Contains(r.Detail, "oms") {
 		t.Fatalf("detail should name path and dependents, got %q", r.Detail)
+	}
+}
+
+// TestIsTmpfsMagic exercises the pure magic-number comparison directly, with
+// no filesystem/statfs involved at all, so it can never be flaky regardless
+// of what the build/test sandbox's /tmp or /dev/shm happen to be backed by.
+func TestIsTmpfsMagic(t *testing.T) {
+	if !isTmpfsMagic(0x01021994) {
+		t.Fatal("TMPFS_MAGIC must report tmpfs")
+	}
+	cases := []int64{
+		0xEF53,     // ext4
+		0x58465342, // xfs
+		0,
+		-1,
+	}
+	for _, magic := range cases {
+		if isTmpfsMagic(magic) {
+			t.Fatalf("magic %#x must not report tmpfs", magic)
+		}
+	}
+}
+
+// TestCheckAssetsStateOnDisk_NotTmpfs uses t.TempDir(), which on this box (and
+// most CI/dev boxes: no TMPDIR override) resolves under the OS temp dir on a
+// real disk filesystem, not tmpfs. Confirmed for this environment via `stat -f`
+// before writing this test. Guarded regardless: if the temp dir turns out to
+// be tmpfs-backed here, the test skips rather than asserting a false failure.
+func TestCheckAssetsStateOnDisk_NotTmpfs(t *testing.T) {
+	dir := t.TempDir()
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(dir, &st); err == nil && isTmpfsMagic(int64(st.Type)) {
+		t.Skip("t.TempDir() is tmpfs-backed in this environment; the pure isTmpfsMagic test covers the comparison logic")
+	}
+
+	p := newTestPreflight(&config.Config{AssetsStateDir: dir})
+	r := p.checkAssetsStateOnDisk()
+	if !r.OK {
+		t.Fatalf("a non-tmpfs dir must not trigger the finding, got %+v", r)
+	}
+}
+
+// TestCheckAssetsStateOnDisk_Tmpfs uses /dev/shm directly, which exists and is
+// tmpfs on Linux dev/CI boxes; skips gracefully if it is absent or turns out
+// not to be tmpfs in some sandbox.
+func TestCheckAssetsStateOnDisk_Tmpfs(t *testing.T) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs("/dev/shm", &st); err != nil {
+		t.Skip("/dev/shm not present in this sandbox")
+	}
+	if !isTmpfsMagic(int64(st.Type)) {
+		t.Skip("/dev/shm is not tmpfs-backed in this sandbox")
+	}
+
+	t.Run("default is warn", func(t *testing.T) {
+		p := newTestPreflight(&config.Config{AssetsStateDir: "/dev/shm"})
+		r := p.checkAssetsStateOnDisk()
+		if r.OK || r.Severity != SeverityWarn {
+			t.Fatalf("tmpfs must warn by default, got %+v", r)
+		}
+		if !strings.Contains(r.Detail, "ASSETS_STATE_DIR") {
+			t.Fatalf("detail should name the fix knob, got %q", r.Detail)
+		}
+		if strings.Contains(r.Detail, "—") {
+			t.Fatalf("detail must not contain an em-dash, got %q", r.Detail)
+		}
+	})
+
+	t.Run("escalates to block under ASSETS_REQUIRE_DISK", func(t *testing.T) {
+		t.Setenv("ASSETS_REQUIRE_DISK", "true")
+		p := newTestPreflight(&config.Config{AssetsStateDir: "/dev/shm"})
+		r := p.checkAssetsStateOnDisk()
+		if r.OK || r.Severity != SeverityBlock {
+			t.Fatalf("tmpfs with ASSETS_REQUIRE_DISK=true must block, got %+v", r)
+		}
+	})
+}
+
+func TestCheckAssetsStateOnDisk_UnstatableDir(t *testing.T) {
+	p := newTestPreflight(&config.Config{AssetsStateDir: "/nonexistent/assets-state-dir"})
+	r := p.checkAssetsStateOnDisk()
+	if r.OK || r.Severity != SeverityWarn {
+		t.Fatalf("an unstatable dir should warn (never silently pass, never block), got %+v", r)
+	}
+}
+
+func TestCheckAssetsStateFreeSpace(t *testing.T) {
+	dir := t.TempDir()
+	p := newTestPreflight(&config.Config{AssetsStateDir: dir})
+	r := p.checkAssetsStateFreeSpace()
+	// This box's temp filesystem is assumed to have >5GB free; assert the
+	// invariant this check must always uphold (never blocking) rather than the
+	// numeric threshold, which would be flaky across environments.
+	if r.Severity == SeverityBlock {
+		t.Fatalf("ae-state-free-space must never block, got %+v", r)
+	}
+
+	unstatable := newTestPreflight(&config.Config{AssetsStateDir: "/nonexistent/assets-state-dir"})
+	r2 := unstatable.checkAssetsStateFreeSpace()
+	if r2.OK || r2.Severity != SeverityWarn {
+		t.Fatalf("an unstatable dir should warn, got %+v", r2)
 	}
 }
 
