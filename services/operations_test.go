@@ -61,7 +61,7 @@ func exists(path string) bool {
 func TestCleanupSweepPreservesArchives(t *testing.T) {
 	shm, tmp := cleanupFixture(t)
 
-	_, preserved, errs := cleanupSweep(shm, tmp, "aeron-cluster", nil, false, true)
+	_, preserved, errs, _ := cleanupSweep(shm, tmp, "aeron-cluster", nil, nil, false, true)
 	if len(errs) != 0 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
@@ -100,7 +100,7 @@ func TestCleanupSweepPreservesArchives(t *testing.T) {
 func TestCleanupSweepIncludeArchiveWipes(t *testing.T) {
 	shm, tmp := cleanupFixture(t)
 
-	_, preserved, errs := cleanupSweep(shm, tmp, "aeron-cluster", nil, true, true)
+	_, preserved, errs, _ := cleanupSweep(shm, tmp, "aeron-cluster", nil, nil, true, true)
 	if len(errs) != 0 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
@@ -139,7 +139,7 @@ func TestCleanupSweepScopedPerCluster(t *testing.T) {
 	}
 
 	// Match cleanup (full wipe) with the assets dirs excluded: assets untouched.
-	if _, _, errs := cleanupSweep(shm, tmp, "aeron-cluster", assetsDirs, true, true); len(errs) != 0 {
+	if _, _, errs, _ := cleanupSweep(shm, tmp, "aeron-cluster", assetsDirs, nil, true, true); len(errs) != 0 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
 	if exists(filepath.Join(shm, "aeron-cluster")) {
@@ -153,7 +153,7 @@ func TestCleanupSweepScopedPerCluster(t *testing.T) {
 
 	// Assets cleanup (full wipe) with the match dirs excluded: only its own go.
 	mk("aeron-emre-0-driver/cnc.dat") // recreate a match driver dir
-	if _, _, errs := cleanupSweep(shm, tmp, "aeron-assets", matchDirs, true, true); len(errs) != 0 {
+	if _, _, errs, _ := cleanupSweep(shm, tmp, "aeron-assets", matchDirs, nil, true, true); len(errs) != 0 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
 	if exists(filepath.Join(shm, "aeron-assets")) || exists(filepath.Join(shm, "aeron-emre-assets-0-driver")) {
@@ -167,7 +167,7 @@ func TestCleanupSweepScopedPerCluster(t *testing.T) {
 func TestCleanupSweepDryRunTouchesNothing(t *testing.T) {
 	shm, tmp := cleanupFixture(t)
 
-	wouldClean, _, _ := cleanupSweep(shm, tmp, "aeron-cluster", nil, false, false)
+	wouldClean, _, _, _ := cleanupSweep(shm, tmp, "aeron-cluster", nil, nil, false, false)
 	if len(wouldClean) == 0 {
 		t.Fatal("dry run should report targets")
 	}

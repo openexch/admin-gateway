@@ -60,6 +60,26 @@ var opGates = map[string][]string{
 	"apply-profile": {"mem-available", "cluster-quorum", "driver-dirs"},
 }
 
+// clusterScopedChecks name the opGates checks that observe ONE specific cluster —
+// the matching engine, whose 3-node status and external media drivers this
+// Preflight instance is wired to (SetStatusService + driverDirPath). They are
+// meaningless for other clusters and MUST NOT gate their ops: the single-node,
+// embedded-driver assets engine has no ME quorum to lose and no driverN
+// services, so gating an assets op on the ME's health would refuse it for a
+// reason that has nothing to do with the assets cluster. GateForCluster skips
+// these unless the op targets the matching engine. The remaining gated checks
+// (mem-available, disk-space) are box-global and apply to every cluster. When a
+// non-match cluster gains its own quorum concern, give it its own preflight
+// wiring rather than widening these.
+var clusterScopedChecks = map[string]bool{
+	"cluster-quorum": true,
+	"driver-dirs":    true,
+}
+
+// matchClusterName is the Name of the cluster this Preflight instance observes
+// (NewMatchCluster). Cluster-scoped checks apply only to it.
+const matchClusterName = "match"
+
 // statusReader is the slice of StatusService the quorum check needs.
 type statusReader interface {
 	GetStatus() map[string]interface{}
@@ -122,8 +142,19 @@ func (p *Preflight) RunCheap() []InvariantResult {
 
 // Gate refuses a gated operation when any of its checks fails at block
 // severity. force overrides blocking failures (they are still logged), the
-// same escape hatch as the match#35 archive-lag guard.
+// same escape hatch as the match#35 archive-lag guard. Runs every check the op
+// gates on (matching-engine semantics); cluster-scoped callers use
+// GateForCluster.
 func (p *Preflight) Gate(op string, force bool) error {
+	return p.GateForCluster(op, matchClusterName, force)
+}
+
+// GateForCluster is Gate scoped to the cluster the op targets: for any cluster
+// other than the matching engine it skips the cluster-scoped checks
+// (cluster-quorum, driver-dirs) that observe only the ME, so e.g. the
+// single-node assets engine's ops are still gated by the box-global mem/disk
+// invariants but never by the ME's quorum (ag#83).
+func (p *Preflight) GateForCluster(op, clusterName string, force bool) error {
 	names, ok := opGates[op]
 	if !ok {
 		return nil
@@ -134,6 +165,9 @@ func (p *Preflight) Gate(op string, force bool) error {
 	}
 	var blocked []string
 	for _, name := range names {
+		if clusterName != matchClusterName && clusterScopedChecks[name] {
+			continue // match-specific check; not applicable to this cluster
+		}
 		r, ok := byName[name]
 		if !ok || r.OK {
 			continue
@@ -343,28 +377,24 @@ const assetsRequireDiskEnv = "ASSETS_REQUIRE_DISK"
 //
 // Severity is WARN by default and only escalates to BLOCK when
 // ASSETS_REQUIRE_DISK=true is set. This is a deliberate choice, not an
-// oversight: preflight's Gate()/opGates mechanism (this file, near the top)
-// is GLOBAL, not per-cluster. There is no way today to make a check block
-// only "operations targeting the assets cluster": opGates keys are bare
-// operation names (rolling-update, rebuild-cluster, ...) shared by every
-// cluster's OperationsService, and in fact only the matching engine's
-// OperationsService is even wired to a Preflight instance today (see
-// main.go: assetsOps never receives SetPreflight, so assets-cluster
-// operations are not gated by preflight at all yet). Given that, adding this
-// check to opGates would only ever block MATCHING-ENGINE operations over an
-// ASSETS-only durability concern: exactly the "block unrelated operations
-// too broadly" failure mode this design avoids. /dev/shm is also today's
-// known/expected dev default, so failing this loudly out of the box would be
-// noise, not signal.
+// oversight. The assets cluster's OperationsService IS now wired to this
+// Preflight instance (main.go: assetsOps.SetPreflight), and GateForCluster
+// scopes the match-specific checks out for it — but this check is deliberately
+// NOT added to opGates, so it never gates any op regardless. opGates keys are
+// bare operation names (rolling-update, rebuild-cluster, ...) shared by every
+// cluster, so adding ae-state-on-disk there would ALSO block matching-engine
+// operations over an assets-only durability concern: exactly the "block
+// unrelated operations too broadly" failure mode this design avoids. /dev/shm
+// is also today's known/expected dev default, so failing this loudly out of the
+// box would be noise, not signal.
 //
-// So: by default this is informational (WARN, surfaced in
-// GET /api/admin/preflight, the status poller, and the admin_invariant_ok
-// metric, never gates anything). Set ASSETS_REQUIRE_DISK=true once
-// ASSETS_STATE_DIR has been pointed at real disk to escalate a regression
-// back to tmpfs to a BLOCKING finding: the intended "cutover to production
-// disk requirement" switch. Wiring that BLOCK into opGates (so it can
-// actually refuse an operation, not just report) is a follow-up once the
-// assets cluster's OperationsService is itself wired to preflight.
+// So: this stays informational (WARN, surfaced in GET /api/admin/preflight, the
+// status poller, and the admin_invariant_ok metric, never gates anything). Set
+// ASSETS_REQUIRE_DISK=true once ASSETS_STATE_DIR has been pointed at real disk
+// to escalate a regression back to tmpfs to a BLOCKING finding: the intended
+// "cutover to production disk requirement" switch. Actually gating an op on it
+// (a per-cluster opGates entry, so it refuses assets ops without touching ME
+// ops) is the follow-up once opGates itself is cluster-scoped.
 func (p *Preflight) checkAssetsStateOnDisk() InvariantResult {
 	const name = "ae-state-on-disk"
 	dir := p.cfg.AssetsStateDir

@@ -91,7 +91,15 @@ func (o *OperationsService) gate(op string, force bool) error {
 	if o.preflight == nil {
 		return nil
 	}
-	if err := o.preflight.Gate(op, force); err != nil {
+	// Cluster-scoped: the match-specific checks (quorum, driver-dirs) are skipped
+	// for other clusters (e.g. the single-node assets engine) while the global
+	// mem/disk gates still apply — see Preflight.GateForCluster (ag#83). A nil
+	// cluster (some unit tests) defaults to the matching-engine semantics.
+	clusterName := matchClusterName
+	if o.cluster != nil {
+		clusterName = o.cluster.Name
+	}
+	if err := o.preflight.GateForCluster(op, clusterName, force); err != nil {
 		o.progress.Finish(false, "refused: "+err.Error())
 		return err
 	}
@@ -316,6 +324,7 @@ func (o *OperationsService) stageClusterJar(tempBuildDir, stagingJar string) err
 }
 
 func (o *OperationsService) doRollingUpdate() {
+	defer o.recoverOp() // ag#67: contain+record a panic, free the slot
 	log := o.log.With("op", "rolling-update", "op_id", o.progress.CurrentOpID())
 	jarPath := o.cluster.Jar
 	stagingDir := filepath.Join(o.cluster.ProjectDir, o.cluster.Module+"/target/staging")
@@ -572,6 +581,7 @@ func (o *OperationsService) RebuildAdmin() error {
 }
 
 func (o *OperationsService) doRebuildAdmin() {
+	defer o.recoverOp() // ag#67: contain+record a panic, free the slot
 	// AdminDir, not ProjectDir/admin-gateway: this repo split out of match, so the
 	// old path builds a checkout that no longer exists.
 	adminDir := o.cfg.AdminDir
@@ -690,6 +700,7 @@ func (o *OperationsService) Snapshot(force bool) error {
 }
 
 func (o *OperationsService) doSnapshot() {
+	defer o.recoverOp() // ag#67: contain+record a panic, free the slot
 	log := o.log.With("op", "snapshot", "op_id", o.progress.CurrentOpID())
 	// Step 1: Find leader
 	o.progress.Update(1, "Finding cluster leader...")
@@ -761,6 +772,7 @@ func (o *OperationsService) Housekeeping(force bool) error {
 }
 
 func (o *OperationsService) doHousekeeping() {
+	defer o.recoverOp() // ag#67: contain+record a panic, free the slot
 	log := o.log.With("op", "housekeeping", "op_id", o.progress.CurrentOpID())
 	failures := 0
 	for i := 0; i < o.cluster.NodeCount(); i++ {
@@ -799,6 +811,7 @@ func (o *OperationsService) RebuildGateway(restart, force bool) error {
 }
 
 func (o *OperationsService) doRebuildGateway(restart bool) {
+	defer o.recoverOp() // ag#67: contain+record a panic, free the slot
 	stagingJar := filepath.Join(o.cfg.ProjectDir, "match-gateway/target/staging/match-gateway.jar")
 
 	// Step 1: Build in an isolated tree — NEVER mvn against the live tree.
@@ -852,6 +865,7 @@ func (o *OperationsService) RebuildCluster(force bool) error {
 }
 
 func (o *OperationsService) doRebuildCluster() {
+	defer o.recoverOp() // ag#67: contain+record a panic, free the slot
 	stagingDir := filepath.Join(o.cluster.ProjectDir, o.cluster.Module+"/target/staging")
 	stagingJar := filepath.Join(stagingDir, o.cluster.Module+".jar")
 
@@ -900,9 +914,14 @@ const archiveLossConfirmation = "DELETE-CLUSTER-STATE"
 // (#10). exclude lists OTHER clusters' dir base names (state dirs + driver
 // dirs): a match cleanup must never touch /dev/shm/aeron-assets and vice versa
 // (the 2026-07-09 clean-slate wiped the assets engine's state under a live
-// ae0 before this scoping existed). apply=false only reports. Factored out
-// with configurable roots so both guarantees are unit-testable.
-func cleanupSweep(shmDir, tmpDir, stateBase string, exclude map[string]bool, includeArchive, apply bool) (cleaned, preserved, errs []string) {
+// ae0 before this scoping existed). driverGuard vets each aeron-* entry that IS
+// one of THIS cluster's node media-driver dirs through canDeleteDriverDir (the
+// #42/ag#68 guard) so the sweep can never delete a driver dir out from under a
+// live driver — it was the only unguarded /dev/shm driver-dir deleter before
+// ag#68 (nil = vet nothing, used by the pure archive/scoping unit tests).
+// Refused entries are returned in refused, not deleted. apply=false only
+// reports. Factored out with configurable roots so every guarantee is unit-testable.
+func cleanupSweep(shmDir, tmpDir, stateBase string, exclude map[string]bool, driverGuard func(base, path string) (ok bool, reason string), includeArchive, apply bool) (cleaned, preserved, errs, refused []string) {
 	remove := func(path string, all bool) {
 		cleaned = append(cleaned, path)
 		if !apply {
@@ -921,12 +940,19 @@ func cleanupSweep(shmDir, tmpDir, stateBase string, exclude map[string]bool, inc
 
 	// 1. Aeron IPC dirs (drivers, clients) — everything aeron-* EXCEPT this
 	// cluster's state dir (the old glob wrongly swallowed it) and every other
-	// cluster's dirs (state + drivers), which are not ours to touch.
+	// cluster's dirs (state + drivers), which are not ours to touch. A node
+	// media-driver dir is deleted only if driverGuard clears it (ag#68).
 	entries, _ := filepath.Glob(filepath.Join(shmDir, "aeron-*"))
 	for _, e := range entries {
 		base := filepath.Base(e)
 		if base == stateBase || exclude[base] {
 			continue
+		}
+		if driverGuard != nil {
+			if ok, reason := driverGuard(base, e); !ok {
+				refused = append(refused, e+": "+reason)
+				continue
+			}
 		}
 		remove(e, true)
 	}
@@ -970,7 +996,43 @@ func cleanupSweep(shmDir, tmpDir, stateBase string, exclude map[string]bool, inc
 		remove(e, true)
 	}
 
-	return cleaned, preserved, errs
+	return cleaned, preserved, errs, refused
+}
+
+// driverDirGuard returns the per-entry deletion guard cleanupSweep applies to
+// aeron-* entries that are THIS cluster's node media-driver dirs (ag#68). It
+// maps the driver-dir base name back to the owning node/driver services and
+// routes the delete decision through canDeleteDriverDir with their live state,
+// so the sweep can never delete a dir out from under a live driver — including
+// the embedded-driver case (assets always, matching engine on the light
+// profile) where there is no external driver pid file to trust. Entries that
+// are NOT this cluster's driver dirs (client/gateway IPC dirs, etc.) always
+// clear (ok=true), preserving the existing stale-IPC reclaim.
+func (o *OperationsService) driverDirGuard() func(base, path string) (bool, string) {
+	type owner struct{ node, driver string }
+	owners := map[string]owner{}
+	for i := 0; i < o.cluster.NodeCount(); i++ {
+		b := filepath.Base(o.cluster.DriverAeronDir(i))
+		owners[b] = owner{node: o.cluster.NodeName(i), driver: o.cluster.DriverName(i)}
+	}
+	return func(base, path string) (bool, string) {
+		ow, ok := owners[base]
+		if !ok {
+			return true, "" // not one of this cluster's driver dirs
+		}
+		driverTracked, nodeRunning := false, false
+		if o.procMgr != nil {
+			if ow.driver != "" {
+				if info := o.procMgr.Get(ow.driver); info != nil && info.Running {
+					driverTracked = true
+				}
+			}
+			if info := o.procMgr.Get(ow.node); info != nil && info.Running {
+				nodeRunning = true
+			}
+		}
+		return canDeleteDriverDir(path, driverTracked, nodeRunning)
+	}
 }
 
 // peerClusterDirs is the exclusion set for this cluster's sweep: every OTHER
@@ -993,13 +1055,16 @@ func (o *OperationsService) Cleanup(opts CleanupOptions) map[string]interface{} 
 	// Dry-run changes nothing: allow it anytime (even with nodes running) so
 	// ops can preview the sweep and the archive-preservation notice.
 	if opts.DryRun {
-		wouldClean, preserved, _ := cleanupSweep("/dev/shm", "/tmp",
-			filepath.Base(o.cluster.StateDir), o.peerClusterDirs(), opts.IncludeArchive, false)
+		wouldClean, preserved, _, refused := cleanupSweep("/dev/shm", "/tmp",
+			filepath.Base(o.cluster.StateDir), o.peerClusterDirs(), o.driverDirGuard(), opts.IncludeArchive, false)
 		result["success"] = true
 		result["dryRun"] = true
 		result["wouldClean"] = wouldClean
 		if len(preserved) > 0 {
 			result["preserved"] = preserved
+		}
+		if len(refused) > 0 {
+			result["refused"] = refused
 		}
 		return result
 	}
@@ -1049,13 +1114,26 @@ func (o *OperationsService) Cleanup(opts CleanupOptions) map[string]interface{} 
 		result["backupCreated"] = backupPath
 	}
 
-	cleaned, preserved, errors := cleanupSweep("/dev/shm", "/tmp",
-		filepath.Base(o.cluster.StateDir), o.peerClusterDirs(), opts.IncludeArchive, true)
+	cleaned, preserved, errors, refused := cleanupSweep("/dev/shm", "/tmp",
+		filepath.Base(o.cluster.StateDir), o.peerClusterDirs(), o.driverDirGuard(), opts.IncludeArchive, true)
+
+	// Log every deletion and every refusal to the admin log (component=ops), not
+	// just the API response, so a destructive sweep leaves an audit trail even if
+	// the caller never reads the body (ag#68).
+	for _, path := range cleaned {
+		o.log.Info("cleanup removed", "cluster", o.cluster.Name, "path", path)
+	}
+	for _, r := range refused {
+		o.log.Warn("cleanup refused driver dir (ag#68 guard)", "cluster", o.cluster.Name, "detail", r)
+	}
 
 	result["success"] = len(errors) == 0
 	result["cleaned"] = cleaned
 	if len(preserved) > 0 {
 		result["preserved"] = preserved
+	}
+	if len(refused) > 0 {
+		result["refused"] = refused
 	}
 	if len(errors) > 0 {
 		result["errors"] = errors
@@ -1378,13 +1456,19 @@ func (o *OperationsService) waitForNodeStopped(log *slog.Logger, nodeId int, tim
 // the 2026-07-06 rolling update deleted node0's live dir (#42).
 func (o *OperationsService) cleanNodeMediaDriver(log *slog.Logger, nodeId int) {
 	trackedRunning := false
+	nodeRunning := false
 	if o.procMgr != nil {
 		if info := o.procMgr.Get(o.cluster.DriverName(nodeId)); info != nil && info.Running {
 			trackedRunning = true
 		}
+		// Embedded-mode fallback (ag#68): the owning node's liveness blocks the
+		// delete when there is no external driver pid file to trust.
+		if info := o.procMgr.Get(o.cluster.NodeName(nodeId)); info != nil && info.Running {
+			nodeRunning = true
+		}
 	}
 	driverDir := o.cluster.DriverAeronDir(nodeId)
-	ok, reason := canDeleteDriverDir(driverDir, trackedRunning)
+	ok, reason := canDeleteDriverDir(driverDir, trackedRunning, nodeRunning)
 	if !ok {
 		if !trackedRunning {
 			log.Error("refusing to delete media driver dir (#42 guard)", "dir", driverDir, "reason", reason)

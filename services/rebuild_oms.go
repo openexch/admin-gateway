@@ -28,6 +28,7 @@ func (o *OperationsService) RebuildOms(restart, force bool) error {
 }
 
 func (o *OperationsService) doRebuildOms(restart bool) {
+	defer o.recoverOp() // ag#67: contain+record a panic, free the slot
 	stagingJar := filepath.Join(o.cfg.OmsProjectDir, "oms-app/target/staging/oms-app.jar")
 
 	// Step 1: isolated-tree build (#45 pattern — mvn never runs in the live

@@ -58,6 +58,7 @@ func (o *OperationsService) ReseedNode(targetId, sourceId int, force bool) error
 }
 
 func (o *OperationsService) doReseedNode(targetId, sourceId, leader int) {
+	defer o.recoverOp() // ag#67: contain+record a panic, free the slot
 	log := o.log.With("op", "reseed-node", "op_id", o.progress.CurrentOpID(),
 		"target", targetId, "source", sourceId)
 	targetDir := o.cluster.NodeStateDir(targetId)

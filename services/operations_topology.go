@@ -69,6 +69,7 @@ func (o *OperationsService) ChangeTopology(newCount int) error {
 }
 
 func (o *OperationsService) doChangeTopology(oldCount, newCount int) {
+	defer o.recoverOp() // ag#67: contain+record a panic, free the slot
 	log := o.log.With("op", "cluster-topology", "op_id", o.progress.CurrentOpID(),
 		"cluster", o.cluster.Name, "from", oldCount, "to", newCount)
 	log.Info("genesis re-form starting")
