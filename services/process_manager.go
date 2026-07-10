@@ -495,6 +495,30 @@ func buildServiceCatalog(cfg *config.Config, prof config.Profile) []ServiceDef {
 		},
 	)...)
 
+	// Settlement Bridge: ME settlement journal -> Assets Engine ingress
+	// (assets/assets-bridge). A plain infra service like sim/driver — not part
+	// of either Aeron cluster. Stateless: every epoch resumes from the AE's own
+	// FeedPositionReport, so DependsOn only gates the FIRST start attempt
+	// against a not-yet-up AE node; the bridge retries its own connections on
+	// every subsequent failure without help from the process manager.
+	const bridgeMetricsPort = 9600
+	services = append(services, ServiceDef{
+		Name: "bridge", Display: "Settlement Bridge", Role: RoleInfra, Port: bridgeMetricsPort,
+		Command: []string{"/usr/bin/java", "-Xmx256m", "-jar", cfg.AssetsBridgeJar},
+		Env: map[string]string{
+			"BRIDGE_ME_JOURNAL_ARCHIVES":  cfg.BridgeJournalArchives,
+			"BRIDGE_AE_CLUSTER_ADDRESSES": aeAddresses,
+			"BRIDGE_AE_PORT_BASE":         strconv.Itoa(assetsCluster.PortBase),
+			"BRIDGE_AE_EGRESS_ENDPOINT":   "127.0.0.1:9394",
+			"BRIDGE_HALT_ON_GAP":          "true",
+			"BRIDGE_METRICS_PORT":         strconv.Itoa(bridgeMetricsPort),
+		},
+		WorkDir:     cfg.AssetsProjectDir,
+		DependsOn:   nodeNames(assetsCluster),
+		AutoRestart: true, RestartSec: 10, StopTimeout: 10,
+		Artifact: cfg.AssetsBridgeJar,
+	})
+
 	services = append(services, ServiceDef{
 		Name: "admin", Display: "Admin Gateway", Role: RoleGateway, Port: 8082,
 		// Admin is self — we don't manage ourselves, just report status
