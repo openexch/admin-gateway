@@ -23,8 +23,13 @@ type Config struct {
 	OmsJar           string // OMS uber JAR
 	AssetsProjectDir string // Assets Engine repo checkout
 	AssetsJar        string // Assets Engine cluster uber JAR (ae0 node)
-	LogDir           string
-	ClusterDir       string
+	AssetsBridgeJar  string // Settlement bridge uber JAR (ME journal -> AE ingress; env ASSETS_BRIDGE_JAR)
+	// BridgeJournalArchives is the settlement bridge's ME journal archive control
+	// endpoint list (env BRIDGE_ME_JOURNAL_ARCHIVES), forwarded verbatim as the
+	// bridge process's own env var of the same name.
+	BridgeJournalArchives string
+	LogDir                string
+	ClusterDir            string
 	// SettlementJournalDir is the settlement-journal root (env SETTLEMENT_JOURNAL_DIR),
 	// matching the cluster's SETTLEMENT_JOURNAL_DIR. Empty = the journal feature is off,
 	// so /api/admin/journal-retention refuses with 409 rather than purging an unknown dir.
@@ -315,17 +320,21 @@ func Load() *Config {
 	}
 
 	return &Config{
-		Port:                 getEnvOrDefault("ADMIN_PORT", "8082"),
-		BindAddr:             getEnvOrDefault("ADMIN_BIND", "127.0.0.1"),
-		AuthToken:            loadAuthToken(),
-		ProjectDir:           projectDir,
-		AdminDir:             adminDir,
-		OmsProjectDir:        omsProjectDir,
-		JarPath:              filepath.Join(projectDir, "match-cluster/target/match-cluster.jar"),
-		GatewayJar:           filepath.Join(projectDir, "match-gateway/target/match-gateway.jar"),
-		OmsJar:               filepath.Join(omsProjectDir, "oms-app/target/oms-app.jar"),
-		AssetsProjectDir:     assetsProjectDir,
-		AssetsJar:            filepath.Join(assetsProjectDir, "assets-cluster/target/assets-cluster.jar"),
+		Port:             getEnvOrDefault("ADMIN_PORT", "8082"),
+		BindAddr:         getEnvOrDefault("ADMIN_BIND", "127.0.0.1"),
+		AuthToken:        loadAuthToken(),
+		ProjectDir:       projectDir,
+		AdminDir:         adminDir,
+		OmsProjectDir:    omsProjectDir,
+		JarPath:          filepath.Join(projectDir, "match-cluster/target/match-cluster.jar"),
+		GatewayJar:       filepath.Join(projectDir, "match-gateway/target/match-gateway.jar"),
+		OmsJar:           filepath.Join(omsProjectDir, "oms-app/target/oms-app.jar"),
+		AssetsProjectDir: assetsProjectDir,
+		AssetsJar:        filepath.Join(assetsProjectDir, "assets-cluster/target/assets-cluster.jar"),
+		AssetsBridgeJar: getEnvOrDefault("ASSETS_BRIDGE_JAR",
+			filepath.Join(assetsProjectDir, "assets-bridge/target/assets-bridge.jar")),
+		BridgeJournalArchives: getEnvOrDefault("BRIDGE_ME_JOURNAL_ARCHIVES",
+			"localhost:9010,localhost:9110,localhost:9210"),
 		LogDir:               filepath.Join(homeDir, ".local/log/cluster"),
 		ClusterDir:           "/dev/shm/aeron-cluster",
 		SettlementJournalDir: os.Getenv("SETTLEMENT_JOURNAL_DIR"),
