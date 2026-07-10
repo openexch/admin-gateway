@@ -286,6 +286,15 @@ func buildServiceCatalog(cfg *config.Config, prof config.Profile) []ServiceDef {
 			env["TRANSPORT_DRIVER_MODE"] = "external"
 			env["AERON_DIR"] = driverDir(nodeId)
 		}
+		// Settlement journal (dark by default): pass the switch + base dir through when the
+		// admin has them; the node resolves its own <dir>/node<N> subdir. Enabling is a
+		// one-line admin drop-in (SETTLEMENT_JOURNAL_ENABLED=true) + node roll.
+		if cfg.SettlementJournalDir != "" {
+			env["SETTLEMENT_JOURNAL_DIR"] = cfg.SettlementJournalDir
+			if os.Getenv("SETTLEMENT_JOURNAL_ENABLED") == "true" {
+				env["SETTLEMENT_JOURNAL_ENABLED"] = "true"
+			}
+		}
 		return env
 	}
 
