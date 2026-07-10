@@ -30,6 +30,13 @@ type Config struct {
 	BridgeJournalArchives string
 	LogDir                string
 	ClusterDir            string
+	// AssetsStateDir is the Assets Engine's (money ledger) cluster+archive
+	// state root (env ASSETS_STATE_DIR). Defaults to the historical tmpfs
+	// path (/dev/shm/aeron-assets) so behavior is unchanged when the env var
+	// is unset. A power loss wipes a tmpfs-backed ledger; see the
+	// ae-state-on-disk preflight check (services/preflight.go) for the
+	// invariant that surfaces this before it bites in production.
+	AssetsStateDir string
 	// SettlementJournalDir is the settlement-journal root (env SETTLEMENT_JOURNAL_DIR),
 	// matching the cluster's SETTLEMENT_JOURNAL_DIR. Empty = the journal feature is off,
 	// so /api/admin/journal-retention refuses with 409 rather than purging an unknown dir.
@@ -337,6 +344,7 @@ func Load() *Config {
 			"localhost:9010,localhost:9110,localhost:9210"),
 		LogDir:               filepath.Join(homeDir, ".local/log/cluster"),
 		ClusterDir:           "/dev/shm/aeron-cluster",
+		AssetsStateDir:       getEnvOrDefault("ASSETS_STATE_DIR", "/dev/shm/aeron-assets"),
 		SettlementJournalDir: os.Getenv("SETTLEMENT_JOURNAL_DIR"),
 		LogFormat:            getEnvOrDefault("ADMIN_LOG_FORMAT", "json"),
 		GoBin:                resolveGoBin(),

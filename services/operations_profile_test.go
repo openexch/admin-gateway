@@ -20,7 +20,8 @@ func testProfileCfg(t *testing.T) *config.Config {
 	cfg := &config.Config{
 		ProjectDir: "/tmp/proj", OmsJar: "/tmp/oms.jar",
 		SimBinary: "/tmp/market-sim", JarPath: "/tmp/cluster.jar", GatewayJar: "/tmp/gw.jar",
-		Profiles: profiles,
+		AssetsStateDir: "/dev/shm/aeron-assets", // mirrors config.Load()'s default
+		Profiles:       profiles,
 	}
 	cfg.SetActive("demo", profiles["demo"])
 	return cfg

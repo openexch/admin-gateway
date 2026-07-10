@@ -113,6 +113,8 @@ func (p *Preflight) RunCheap() []InvariantResult {
 	return []InvariantResult{
 		p.checkMemAvailable(),
 		p.checkDiskSpace(),
+		p.checkAssetsStateOnDisk(),
+		p.checkAssetsStateFreeSpace(),
 		p.checkDriverDirs(),
 		p.checkArtifacts(),
 	}
@@ -310,6 +312,110 @@ func statfsUsedPct(path string) (int, error) {
 	}
 	used := st.Blocks - st.Bavail
 	return int(used * 100 / st.Blocks), nil
+}
+
+// ---- ae-state-on-disk ----
+
+// tmpfsMagic is the Linux statfs f_type value for tmpfs (linux/magic.h
+// TMPFS_MAGIC). The Assets Engine (the money ledger) defaults its state dir
+// to /dev/shm, a tmpfs: a power loss silently wipes the money record, no
+// crash, no error, just gone on reboot. This check exists to catch that
+// footgun before it bites in production.
+const tmpfsMagic = 0x01021994
+
+// isTmpfsMagic reports whether a statfs Type value identifies a tmpfs mount.
+// Pulled out as a small pure function so the magic-number comparison has a
+// unit test that never depends on a live tmpfs mount being present in the
+// build/test sandbox. syscall.Statfs_t.Type is int64 on linux/amd64 (the
+// target platform here; confirmed via `go doc syscall.Statfs_t`), so this
+// takes int64 directly with no unsafe cast.
+func isTmpfsMagic(t int64) bool { return t == tmpfsMagic }
+
+// assetsRequireDiskEnv is the operator's production cutover switch. See
+// checkAssetsStateOnDisk's doc comment for what flipping it does and why.
+const assetsRequireDiskEnv = "ASSETS_REQUIRE_DISK"
+
+// checkAssetsStateOnDisk guards the AE money-ledger durability footgun
+// directly: it statfs's the assets StateDir and checks the filesystem type,
+// rather than pattern-matching the path, so it still catches a tmpfs mounted
+// at a non-/dev/shm path and never false-positives on a disk path that
+// happens to contain "shm".
+//
+// Severity is WARN by default and only escalates to BLOCK when
+// ASSETS_REQUIRE_DISK=true is set. This is a deliberate choice, not an
+// oversight: preflight's Gate()/opGates mechanism (this file, near the top)
+// is GLOBAL, not per-cluster. There is no way today to make a check block
+// only "operations targeting the assets cluster": opGates keys are bare
+// operation names (rolling-update, rebuild-cluster, ...) shared by every
+// cluster's OperationsService, and in fact only the matching engine's
+// OperationsService is even wired to a Preflight instance today (see
+// main.go: assetsOps never receives SetPreflight, so assets-cluster
+// operations are not gated by preflight at all yet). Given that, adding this
+// check to opGates would only ever block MATCHING-ENGINE operations over an
+// ASSETS-only durability concern: exactly the "block unrelated operations
+// too broadly" failure mode this design avoids. /dev/shm is also today's
+// known/expected dev default, so failing this loudly out of the box would be
+// noise, not signal.
+//
+// So: by default this is informational (WARN, surfaced in
+// GET /api/admin/preflight, the status poller, and the admin_invariant_ok
+// metric, never gates anything). Set ASSETS_REQUIRE_DISK=true once
+// ASSETS_STATE_DIR has been pointed at real disk to escalate a regression
+// back to tmpfs to a BLOCKING finding: the intended "cutover to production
+// disk requirement" switch. Wiring that BLOCK into opGates (so it can
+// actually refuse an operation, not just report) is a follow-up once the
+// assets cluster's OperationsService is itself wired to preflight.
+func (p *Preflight) checkAssetsStateOnDisk() InvariantResult {
+	const name = "ae-state-on-disk"
+	dir := p.cfg.AssetsStateDir
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(dir, &st); err != nil {
+		// Cannot determine the answer (e.g. the dir does not exist yet on a
+		// fresh box before the assets cluster's first start). Warn rather than
+		// silently pass or falsely block, mirroring checkMemAvailable's
+		// unreadable-input handling below.
+		return InvariantResult{Name: name, OK: false, Severity: SeverityWarn,
+			Detail: fmt.Sprintf("cannot statfs %s: %s", dir, err.Error())}
+	}
+	if isTmpfsMagic(int64(st.Type)) {
+		severity := SeverityWarn
+		if strings.EqualFold(os.Getenv(assetsRequireDiskEnv), "true") {
+			severity = SeverityBlock
+		}
+		return InvariantResult{Name: name, OK: false, Severity: severity,
+			Detail: fmt.Sprintf(
+				"%s is on tmpfs. A power loss wipes the Assets Engine money ledger. "+
+					"Set ASSETS_STATE_DIR to an NVMe or other disk-backed path and restart the assets cluster.",
+				dir)}
+	}
+	return InvariantResult{Name: name, OK: true, Detail: fmt.Sprintf("%s is not tmpfs", dir)}
+}
+
+// assetsStateMinFreeGB is the free-space floor for checkAssetsStateFreeSpace.
+const assetsStateMinFreeGB = 5
+
+// checkAssetsStateFreeSpace is an independent, ALWAYS-non-blocking warning:
+// low free space on the assets StateDir's filesystem, whatever that
+// filesystem is (tmpfs or disk). Kept separate from checkAssetsStateOnDisk
+// on purpose. Filesystem type and free space are different failure modes,
+// and unlike the tmpfs check this one never escalates: it is purely
+// informational, same spirit as checkArtifacts.
+func (p *Preflight) checkAssetsStateFreeSpace() InvariantResult {
+	const name = "ae-state-free-space"
+	dir := p.cfg.AssetsStateDir
+	freeGB, totalGB, err := statfsGB(dir)
+	if err != nil {
+		return InvariantResult{Name: name, OK: false, Severity: SeverityWarn,
+			Detail: fmt.Sprintf("cannot statfs %s: %s", dir, err.Error())}
+	}
+	if freeGB < assetsStateMinFreeGB {
+		return InvariantResult{Name: name, OK: false, Severity: SeverityWarn,
+			Detail: fmt.Sprintf(
+				"%s has %dGB free of %dGB total: below the %dGB floor. "+
+					"The Assets Engine risks running out of room for its cluster and archive state.",
+				dir, freeGB, totalGB, assetsStateMinFreeGB)}
+	}
+	return InvariantResult{Name: name, OK: true, Detail: fmt.Sprintf("%s %d/%dGB free", dir, freeGB, totalGB)}
 }
 
 // ---- driver-dirs (#42) ----

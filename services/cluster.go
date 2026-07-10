@@ -55,7 +55,7 @@ type Cluster struct {
 	nodeCount atomic.Int32
 
 	PortBase int    // 9000 | 9300; ingress = PortBase + node*100 + 2
-	StateDir string // cluster+archive state root: /dev/shm/aeron-cluster | /dev/shm/aeron-assets
+	StateDir string // cluster+archive state root: cfg.ClusterDir (/dev/shm/aeron-cluster) | cfg.AssetsStateDir (default /dev/shm/aeron-assets, configurable via ASSETS_STATE_DIR)
 
 	NodePrefix   string // node service + state-dir name prefix: "node" -> node0, "ae" -> ae0
 	DriverPrefix string // external driver service prefix: "driver" -> driver0; "" when embedded
@@ -146,7 +146,10 @@ func NewMatchCluster(cfg *config.Config) *Cluster {
 
 // NewAssetsCluster is the money-ledger descriptor: embedded-driver nodes on
 // disjoint ports/dirs. Node count comes from the topology store (default 1) —
-// flip to a multi-node cluster with no code change.
+// flip to a multi-node cluster with no code change. StateDir comes from
+// cfg.AssetsStateDir (env ASSETS_STATE_DIR, default /dev/shm/aeron-assets):
+// an operator moving the money ledger off tmpfs onto real disk changes only
+// that env var; see the ae-state-on-disk preflight check.
 func NewAssetsCluster(cfg *config.Config) *Cluster {
 	c := &Cluster{
 		cfg:              cfg,
@@ -154,7 +157,7 @@ func NewAssetsCluster(cfg *config.Config) *Cluster {
 		Display:          "Assets Engine",
 		Kind:             "assets",
 		PortBase:         9300,
-		StateDir:         "/dev/shm/aeron-assets",
+		StateDir:         cfg.AssetsStateDir,
 		NodePrefix:       "ae",
 		DriverPrefix:     "", // embedded: no external driver service
 		NodeDisplay:      "Assets Engine",
