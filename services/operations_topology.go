@@ -229,7 +229,7 @@ func (o *OperationsService) wipeOwnClusterState(count int) (errs []string) {
 // external stores (the proven 2026-07-09 procedure): Redis db0 (bal:/holds:/
 // processed: — the idempotency markers MUST die with the cluster ids or stale
 // processed: keys suppress real settlements), Postgres order/trade state
-// (users + risk_config_* PRESERVED), Timescale market history. Shells out to
+// (users + risk_config PRESERVED), Timescale market history. Shells out to
 // redis-cli/psql exactly like the rest of the gateway's ops tooling; the DB
 // passwords come from the admin service environment (systemd drop-ins).
 func wipeMatchStores(log interface{ Error(string, ...any) }) error {
@@ -239,7 +239,7 @@ func wipeMatchStores(log interface{ Error(string, ...any) }) error {
 	}
 
 	// OMS Postgres: order/trade state only; users and risk config untouched.
-	omsSQL := "TRUNCATE orders, executions, account_balances, balance_snapshots RESTART IDENTITY CASCADE;"
+	omsSQL := "TRUNCATE orders, executions, account_balances RESTART IDENTITY CASCADE;"
 	if err := runPSQL("oms", "oms", os.Getenv("OMS_POSTGRES_PASSWORD"), omsSQL); err != nil {
 		return fmt.Errorf("oms postgres: %w", err)
 	}
