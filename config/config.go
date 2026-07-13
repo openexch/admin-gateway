@@ -29,7 +29,12 @@ type Config struct {
 	// bridge process's own env var of the same name.
 	BridgeJournalArchives string
 	LogDir                string
-	ClusterDir            string
+	// ClusterDir is the matching engine's cluster+archive state root (env
+	// MATCH_STATE_DIR). Defaults to the historical tmpfs path
+	// (/dev/shm/aeron-cluster) so behavior is unchanged when the env var is
+	// unset. Same durability caveat as AssetsStateDir: tmpfs state does not
+	// survive a reboot; all three replicas share this box.
+	ClusterDir string
 	// AssetsStateDir is the Assets Engine's (money ledger) cluster+archive
 	// state root (env ASSETS_STATE_DIR). Defaults to the historical tmpfs
 	// path (/dev/shm/aeron-assets) so behavior is unchanged when the env var
@@ -343,7 +348,7 @@ func Load() *Config {
 		BridgeJournalArchives: getEnvOrDefault("BRIDGE_ME_JOURNAL_ARCHIVES",
 			"localhost:9010,localhost:9110,localhost:9210"),
 		LogDir:               filepath.Join(homeDir, ".local/log/cluster"),
-		ClusterDir:           "/dev/shm/aeron-cluster",
+		ClusterDir:           getEnvOrDefault("MATCH_STATE_DIR", "/dev/shm/aeron-cluster"),
 		AssetsStateDir:       getEnvOrDefault("ASSETS_STATE_DIR", "/dev/shm/aeron-assets"),
 		SettlementJournalDir: os.Getenv("SETTLEMENT_JOURNAL_DIR"),
 		LogFormat:            getEnvOrDefault("ADMIN_LOG_FORMAT", "json"),

@@ -101,12 +101,13 @@ type ProcessManager struct {
 	services []ServiceDef
 	procs    map[string]*managedProcess // name → process state
 
-	mu         sync.RWMutex
-	pidDir     string
-	logDir     string
-	projectDir string // backup-node state root (cleanStaleAeronState); empty = no backup cleanup
-	stopChan   chan struct{}
-	log        *slog.Logger
+	mu            sync.RWMutex
+	pidDir        string
+	logDir        string
+	projectDir    string // backup-node state root (cleanStaleAeronState); empty = no backup cleanup
+	matchStateDir string // ME state root for stale-mark cleanup (see ProcessManagerOptions)
+	stopChan      chan struct{}
+	log           *slog.Logger
 
 	// LocalAgent surface (process_manager_agent.go)
 	events       eventHub
@@ -124,6 +125,10 @@ type ProcessManagerOptions struct {
 	LogDir     string       // default ~/.local/log/cluster
 	PidDir     string       // default ~/.local/run/match
 	ProjectDir string       // backup-node state root; empty disables backup cleanup
+	// MatchStateDir is the matching-engine cluster+archive state root used by
+	// stale-mark cleanup (cfg.ClusterDir / env MATCH_STATE_DIR). Empty falls
+	// back to the historical tmpfs path.
+	MatchStateDir string
 }
 
 // NewProcessManagerWith builds a ProcessManager from explicit options,
@@ -143,14 +148,19 @@ func NewProcessManagerWith(opts ProcessManagerOptions) *ProcessManager {
 	os.MkdirAll(logDir, 0755)
 	os.MkdirAll(pidDir, 0755)
 
+	msd := opts.MatchStateDir
+	if msd == "" {
+		msd = "/dev/shm/aeron-cluster"
+	}
 	pm := &ProcessManager{
-		logDir:     logDir,
-		pidDir:     pidDir,
-		projectDir: opts.ProjectDir,
-		procs:      make(map[string]*managedProcess),
-		services:   opts.Services,
-		stopChan:   make(chan struct{}),
-		log:        logger,
+		matchStateDir: msd,
+		logDir:        logDir,
+		pidDir:        pidDir,
+		projectDir:    opts.ProjectDir,
+		procs:         make(map[string]*managedProcess),
+		services:      opts.Services,
+		stopChan:      make(chan struct{}),
+		log:           logger,
 	}
 
 	// Initialize process state for each service
@@ -182,8 +192,9 @@ func marketEdgeTokenFile() string {
 func NewProcessManager(cfg *config.Config) *ProcessManager {
 	_, prof := cfg.Active()
 	return NewProcessManagerWith(ProcessManagerOptions{
-		Services:   buildServiceCatalog(cfg, prof),
-		ProjectDir: cfg.ProjectDir,
+		Services:      buildServiceCatalog(cfg, prof),
+		ProjectDir:    cfg.ProjectDir,
+		MatchStateDir: cfg.ClusterDir,
 	})
 }
 
@@ -1553,7 +1564,7 @@ func (pm *ProcessManager) cleanStaleAeronState(name string) {
 		}
 
 		// Clean stale mark files and locks
-		nodeDir := fmt.Sprintf("/dev/shm/aeron-cluster/%s", name)
+		nodeDir := filepath.Join(pm.matchStateDir, name)
 		patterns := []string{
 			nodeDir + "/cluster/cluster-mark*.dat",
 			nodeDir + "/cluster/*.lck",
