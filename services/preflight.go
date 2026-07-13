@@ -134,6 +134,7 @@ func (p *Preflight) RunCheap() []InvariantResult {
 		p.checkMemAvailable(),
 		p.checkDiskSpace(),
 		p.checkAssetsStateOnDisk(),
+		p.checkMatchStateOnDisk(),
 		p.checkAssetsStateFreeSpace(),
 		p.checkDriverDirs(),
 		p.checkArtifacts(),
@@ -369,6 +370,9 @@ func isTmpfsMagic(t int64) bool { return t == tmpfsMagic }
 // checkAssetsStateOnDisk's doc comment for what flipping it does and why.
 const assetsRequireDiskEnv = "ASSETS_REQUIRE_DISK"
 
+// matchRequireDiskEnv is the ME twin of assetsRequireDiskEnv.
+const matchRequireDiskEnv = "MATCH_REQUIRE_DISK"
+
 // checkAssetsStateOnDisk guards the AE money-ledger durability footgun
 // directly: it statfs's the assets StateDir and checks the filesystem type,
 // rather than pattern-matching the path, so it still catches a tmpfs mounted
@@ -416,6 +420,33 @@ func (p *Preflight) checkAssetsStateOnDisk() InvariantResult {
 			Detail: fmt.Sprintf(
 				"%s is on tmpfs. A power loss wipes the Assets Engine money ledger. "+
 					"Set ASSETS_STATE_DIR to an NVMe or other disk-backed path and restart the assets cluster.",
+				dir)}
+	}
+	return InvariantResult{Name: name, OK: true, Detail: fmt.Sprintf("%s is not tmpfs", dir)}
+}
+
+// checkMatchStateOnDisk is the matching-engine twin of checkAssetsStateOnDisk:
+// the ME consensus log + snapshots share the reboot-volatility footgun when
+// MATCH_STATE_DIR is left on the historical tmpfs default. The loss is bounded
+// by the backup observer (60s replica) and the settlement journal, so this
+// warns rather than blocks unless MATCH_REQUIRE_DISK=true.
+func (p *Preflight) checkMatchStateOnDisk() InvariantResult {
+	const name = "me-state-on-disk"
+	dir := p.cfg.ClusterDir
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(dir, &st); err != nil {
+		return InvariantResult{Name: name, OK: false, Severity: SeverityWarn,
+			Detail: fmt.Sprintf("cannot statfs %s: %s", dir, err.Error())}
+	}
+	if isTmpfsMagic(int64(st.Type)) {
+		severity := SeverityWarn
+		if strings.EqualFold(os.Getenv(matchRequireDiskEnv), "true") {
+			severity = SeverityBlock
+		}
+		return InvariantResult{Name: name, OK: false, Severity: severity,
+			Detail: fmt.Sprintf(
+				"%s is on tmpfs. A reboot wipes all matching-engine replicas' logs and snapshots at once. "+
+					"Set MATCH_STATE_DIR to a disk-backed path and roll the cluster onto it.",
 				dir)}
 	}
 	return InvariantResult{Name: name, OK: true, Detail: fmt.Sprintf("%s is not tmpfs", dir)}
