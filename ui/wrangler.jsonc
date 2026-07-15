@@ -25,7 +25,7 @@
   "name": "admin-console",
   "main": "worker/index.ts",
   "compatibility_date": "2025-10-11",
-  "workers_dev": true,
+  "workers_dev": false, // no public workers.dev URL: admin is reachable ONLY via admin.openexch.io behind Access
   "observability": { "enabled": true },
 
   // Serve the Vite build as static assets; run the Worker first so it can
