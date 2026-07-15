@@ -37,3 +37,34 @@ npm test         # vitest run
 served as the admin console; wiring it up as a Cloudflare Worker (and proxying
 `/api/admin` to the gateway) is a separate deployment step, not part of this
 subproject.
+
+## Deployment (admin.openexch.io, behind Cloudflare Access)
+
+This UI deploys as a single Cloudflare Worker (`worker/index.ts`, `wrangler.jsonc`)
+that serves the built assets AND reverse-proxies the two API backends at the SAME
+origin, so there is no CORS.
+
+```
+npm run build     # vite -> ./dist
+npm run deploy    # wrangler deploy (uploads dist + the Worker)
+```
+
+Routes: `/api/admin/*` -> the admin gateway origin; `/api/v1/admin/risk*` -> the OMS
+(with an injected admin bearer, since the console has no login); everything else ->
+the static admin UI.
+
+### One-time Cloudflare setup (dashboard + cloudflared, not in the repo)
+
+1. **Tunnel origins** (cloudflared ingress): `admin-origin.openexch.io -> http://localhost:8082`
+   (the gateway). `oms.openexch.io` is already tunneled.
+2. **Cloudflare Access** (the permanent fix for the admin-exposure P0):
+   - App on **`admin.openexch.io`**: email/SSO policy = the humans who may operate the stack.
+   - App on **`admin-origin.openexch.io`**: **service-token** policy, so ONLY this Worker
+     (presenting the token) can reach the gateway; nothing else can.
+3. **Secrets** (`wrangler secret put ...`): `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`
+   (the service token from step 2), `OMS_ADMIN_TOKEN` (bearer for the OMS risk endpoints).
+4. **Vars** (`wrangler.jsonc`): confirm `ADMIN_GATEWAY_ORIGIN` / `OMS_ORIGIN` match the tunnel
+   hostnames. Enable the `routes` entry once `admin.openexch.io` is on the zone behind Access.
+
+Rollback: remove the `routes` entry and redeploy (or keep admin off the tunnel entirely, as it
+is now post-incident, and reach it via `wrangler dev` / loopback).

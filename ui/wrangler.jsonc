@@ -1,0 +1,50 @@
+// Admin console Worker: serves the built admin UI (ui/dist) and reverse-proxies
+// the API backends at the SAME origin (admin.openexch.io), so there is no CORS.
+// Sits behind Cloudflare Access (human auth) configured in the dashboard.
+//
+// Deploy:
+//   npm run build            # vite -> ./dist
+//   npm run deploy           # wrangler deploy (uploads dist + the Worker)
+//
+// One-time Cloudflare setup (dashboard / cloudflared, NOT in this file):
+//   1. Tunnel: add an ingress hostname for the gateway, e.g.
+//        admin-origin.openexch.io -> http://localhost:8082
+//      and (recommended) an OMS hostname if not already tunneled.
+//   2. Cloudflare Access:
+//        - App on `admin.openexch.io` with an email/SSO policy (humans).  <-- the P0 fix
+//        - App on `admin-origin.openexch.io` with a SERVICE-TOKEN policy;
+//          create the service token and put its id/secret in this Worker's
+//          secrets (CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET) so ONLY this
+//          Worker can reach the gateway origin.
+//   3. Secrets:  wrangler secret put CF_ACCESS_CLIENT_ID
+//                wrangler secret put CF_ACCESS_CLIENT_SECRET
+//                wrangler secret put OMS_ADMIN_TOKEN
+//   4. Point the `routes` below at the zone once the tunnel hostnames exist.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "admin-console",
+  "main": "worker/index.ts",
+  "compatibility_date": "2025-10-11",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+
+  // Serve the Vite build as static assets; run the Worker first so it can
+  // intercept /api/* before the asset router, and fall back to the SPA shell
+  // for client-side routes.
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+
+  // VERIFY: enable once admin.openexch.io is attached to the zone and Access is
+  // in front of it. Until then deploy to workers.dev (workers_dev: true).
+  "routes": [{ "pattern": "admin.openexch.io/*", "zone_name": "openexch.io" }],
+
+  // Non-secret origins. VERIFY the tunnel hostnames match what cloudflared serves.
+  "vars": {
+    "ADMIN_GATEWAY_ORIGIN": "https://admin-origin.openexch.io",
+    "OMS_ORIGIN": "https://oms.openexch.io"
+  }
+}
