@@ -8,11 +8,11 @@
 //
 // One-time Cloudflare setup (dashboard / cloudflared, NOT in this file):
 //   1. Tunnel: add an ingress hostname for the gateway, e.g.
-//        api.admin.openexch.io -> http://localhost:8082
+//        admin-api.openexch.io -> http://localhost:8082
 //      and (recommended) an OMS hostname if not already tunneled.
 //   2. Cloudflare Access:
 //        - App on `admin.openexch.io` with an email/SSO policy (humans).  <-- the P0 fix
-//        - App on `api.admin.openexch.io` with a SERVICE-TOKEN policy;
+//        - App on `admin-api.openexch.io` with a SERVICE-TOKEN policy;
 //          create the service token and put its id/secret in this Worker's
 //          secrets (CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET) so ONLY this
 //          Worker can reach the gateway origin.
@@ -44,7 +44,7 @@
 
   // Non-secret origins. VERIFY the tunnel hostnames match what cloudflared serves.
   "vars": {
-    "ADMIN_GATEWAY_ORIGIN": "https://api.admin.openexch.io",
+    "ADMIN_GATEWAY_ORIGIN": "https://admin-api.openexch.io",
     "OMS_ORIGIN": "https://oms.openexch.io"
   }
 }

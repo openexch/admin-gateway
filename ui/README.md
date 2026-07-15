@@ -55,11 +55,11 @@ the static admin UI.
 
 ### One-time Cloudflare setup (dashboard + cloudflared, not in the repo)
 
-1. **Tunnel origins** (cloudflared ingress): `api.admin.openexch.io -> http://localhost:8082`
+1. **Tunnel origins** (cloudflared ingress): `admin-api.openexch.io -> http://localhost:8082`
    (the gateway). `oms.openexch.io` is already tunneled.
 2. **Cloudflare Access** (the permanent fix for the admin-exposure P0):
    - App on **`admin.openexch.io`**: email/SSO policy = the humans who may operate the stack.
-   - App on **`api.admin.openexch.io`**: **service-token** policy, so ONLY this Worker
+   - App on **`admin-api.openexch.io`**: **service-token** policy, so ONLY this Worker
      (presenting the token) can reach the gateway; nothing else can.
 3. **Secrets** (`wrangler secret put ...`): `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`
    (the service token from step 2), `OMS_ADMIN_TOKEN` (bearer for the OMS risk endpoints).
