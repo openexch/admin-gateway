@@ -18,7 +18,7 @@
 export interface Env {
   ASSETS: Fetcher;
   // Tunneled origins (set as vars in wrangler.jsonc):
-  ADMIN_GATEWAY_ORIGIN: string; // e.g. https://api.admin.openexch.io  -> localhost:8082
+  ADMIN_GATEWAY_ORIGIN: string; // e.g. https://admin-api.openexch.io  -> localhost:8082
   OMS_ORIGIN: string;           // e.g. https://oms.openexch.io
   // Secrets (wrangler secret put):
   CF_ACCESS_CLIENT_ID?: string;     // service token the origins' Access policy trusts
