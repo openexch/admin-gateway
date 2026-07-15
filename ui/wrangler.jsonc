@@ -10,15 +10,12 @@
 //   1. Tunnel: add an ingress hostname for the gateway, e.g.
 //        admin-api.openexch.io -> http://localhost:8082
 //      and (recommended) an OMS hostname if not already tunneled.
-//   2. Cloudflare Access:
-//        - App on `admin.openexch.io` with an email/SSO policy (humans).  <-- the P0 fix
-//        - App on `admin-api.openexch.io` with a SERVICE-TOKEN policy;
-//          create the service token and put its id/secret in this Worker's
-//          secrets (CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET) so ONLY this
-//          Worker can reach the gateway origin.
-//   3. Secrets:  wrangler secret put CF_ACCESS_CLIENT_ID
-//                wrangler secret put CF_ACCESS_CLIENT_SECRET
-//                wrangler secret put OMS_ADMIN_TOKEN
+//   2. Cloudflare Access: App on `admin.openexch.io` with an email/SSO policy
+//      (humans).  <-- the P0 fix. The gateway origin is protected by the
+//      gateway's OWN bearer token (ADMIN_AUTH_TOKEN), presented by this Worker,
+//      so it needs no Access policy of its own.
+//   3. Secrets:  wrangler secret put ADMIN_API_TOKEN   # = the gateway's ADMIN_AUTH_TOKEN
+//                wrangler secret put OMS_ADMIN_TOKEN    # = OMS bearer for the risk tab
 //   4. Point the `routes` below at the zone once the tunnel hostnames exist.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
