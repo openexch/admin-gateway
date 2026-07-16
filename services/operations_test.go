@@ -61,7 +61,7 @@ func exists(path string) bool {
 func TestCleanupSweepPreservesArchives(t *testing.T) {
 	shm, tmp := cleanupFixture(t)
 
-	_, preserved, errs, _ := cleanupSweep(shm, tmp, "aeron-cluster", nil, nil, false, true)
+	_, preserved, errs, _ := cleanupSweep(shm, tmp, filepath.Join(shm, "aeron-cluster"), nil, nil, false, true)
 	if len(errs) != 0 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
@@ -100,7 +100,7 @@ func TestCleanupSweepPreservesArchives(t *testing.T) {
 func TestCleanupSweepIncludeArchiveWipes(t *testing.T) {
 	shm, tmp := cleanupFixture(t)
 
-	_, preserved, errs, _ := cleanupSweep(shm, tmp, "aeron-cluster", nil, nil, true, true)
+	_, preserved, errs, _ := cleanupSweep(shm, tmp, filepath.Join(shm, "aeron-cluster"), nil, nil, true, true)
 	if len(errs) != 0 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
@@ -109,6 +109,42 @@ func TestCleanupSweepIncludeArchiveWipes(t *testing.T) {
 	}
 	if len(preserved) != 0 {
 		t.Fatalf("nothing should be reported preserved on a full wipe: %v", preserved)
+	}
+}
+
+// Regression for the 2026-07-15 bridge-halt incident: when the ME state root is
+// on disk (env MATCH_STATE_DIR), NOT under /dev/shm, the sweep must still wipe
+// its archives. The old code derived the archive path from shmDir/<basename> and
+// silently missed the disk state — a stale ME snapshot survived every wipe,
+// restored at a tradeId mismatched with the genesis AE, and HALTED the
+// settlement bridge (no money settled, all holds leaked).
+func TestCleanupSweepWipesOffShmStateRoot(t *testing.T) {
+	shm, tmp := t.TempDir(), t.TempDir()
+	// A driver IPC dir lives under /dev/shm...
+	if err := os.MkdirAll(filepath.Join(shm, "aeron-emre-0-driver"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	// ...but the ME cluster state+archive lives on disk elsewhere (MATCH_STATE_DIR).
+	stateRoot := filepath.Join(t.TempDir(), "aeron-cluster")
+	for _, rel := range []string{"node0/archive/0-0.rec", "node0/cluster/cluster-mark.dat", "node1/archive/5-0.rec"} {
+		full := filepath.Join(stateRoot, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, _, errs, _ := cleanupSweep(shm, tmp, stateRoot, nil, nil, true, true); len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if exists(stateRoot) {
+		t.Fatal("includeArchive must wipe the disk-based ME state root (the bridge-halt bug)")
+	}
+	// The /dev/shm IPC dir is still swept.
+	if exists(filepath.Join(shm, "aeron-emre-0-driver")) {
+		t.Fatal("driver IPC dir under /dev/shm should still be cleaned")
 	}
 }
 
@@ -139,7 +175,7 @@ func TestCleanupSweepScopedPerCluster(t *testing.T) {
 	}
 
 	// Match cleanup (full wipe) with the assets dirs excluded: assets untouched.
-	if _, _, errs, _ := cleanupSweep(shm, tmp, "aeron-cluster", assetsDirs, nil, true, true); len(errs) != 0 {
+	if _, _, errs, _ := cleanupSweep(shm, tmp, filepath.Join(shm, "aeron-cluster"), assetsDirs, nil, true, true); len(errs) != 0 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
 	if exists(filepath.Join(shm, "aeron-cluster")) {
@@ -153,7 +189,7 @@ func TestCleanupSweepScopedPerCluster(t *testing.T) {
 
 	// Assets cleanup (full wipe) with the match dirs excluded: only its own go.
 	mk("aeron-emre-0-driver/cnc.dat") // recreate a match driver dir
-	if _, _, errs, _ := cleanupSweep(shm, tmp, "aeron-assets", matchDirs, nil, true, true); len(errs) != 0 {
+	if _, _, errs, _ := cleanupSweep(shm, tmp, filepath.Join(shm, "aeron-assets"), matchDirs, nil, true, true); len(errs) != 0 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
 	if exists(filepath.Join(shm, "aeron-assets")) || exists(filepath.Join(shm, "aeron-emre-assets-0-driver")) {
@@ -167,7 +203,7 @@ func TestCleanupSweepScopedPerCluster(t *testing.T) {
 func TestCleanupSweepDryRunTouchesNothing(t *testing.T) {
 	shm, tmp := cleanupFixture(t)
 
-	wouldClean, _, _, _ := cleanupSweep(shm, tmp, "aeron-cluster", nil, nil, false, false)
+	wouldClean, _, _, _ := cleanupSweep(shm, tmp, filepath.Join(shm, "aeron-cluster"), nil, nil, false, false)
 	if len(wouldClean) == 0 {
 		t.Fatal("dry run should report targets")
 	}
