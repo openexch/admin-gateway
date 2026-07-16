@@ -906,22 +906,34 @@ type CleanupOptions struct {
 // The second confirmation required to wipe cluster archives via /cleanup.
 const archiveLossConfirmation = "DELETE-CLUSTER-STATE"
 
-// cleanupSweep removes Aeron IPC dirs, mark files, and locks under shmDir and
-// tmpDir FOR ONE CLUSTER. stateBase is that cluster's state-dir base name
-// (aeron-cluster / aeron-assets): its archives are PRESERVED unless
-// includeArchive — /cleanup used to run `rm -rf /dev/shm/aeron-*`, and that
-// glob matches aeron-cluster — nuking the very archives P1.3 makes durable
-// (#10). exclude lists OTHER clusters' dir base names (state dirs + driver
-// dirs): a match cleanup must never touch /dev/shm/aeron-assets and vice versa
-// (the 2026-07-09 clean-slate wiped the assets engine's state under a live
-// ae0 before this scoping existed). driverGuard vets each aeron-* entry that IS
-// one of THIS cluster's node media-driver dirs through canDeleteDriverDir (the
-// #42/ag#68 guard) so the sweep can never delete a driver dir out from under a
-// live driver — it was the only unguarded /dev/shm driver-dir deleter before
-// ag#68 (nil = vet nothing, used by the pure archive/scoping unit tests).
-// Refused entries are returned in refused, not deleted. apply=false only
-// reports. Factored out with configurable roots so every guarantee is unit-testable.
-func cleanupSweep(shmDir, tmpDir, stateBase string, exclude map[string]bool, driverGuard func(base, path string) (ok bool, reason string), includeArchive, apply bool) (cleaned, preserved, errs, refused []string) {
+// cleanupSweep removes Aeron IPC dirs (under shmDir/tmpDir) and this cluster's
+// mark files, locks, and archives (under stateRoot) FOR ONE CLUSTER. stateRoot
+// is that cluster's ACTUAL state+archive root (o.cluster.StateDir): its archives
+// are PRESERVED unless includeArchive — /cleanup used to run `rm -rf
+// /dev/shm/aeron-*`, and that glob matches aeron-cluster — nuking the very
+// archives P1.3 makes durable (#10).
+//
+// stateRoot is used DIRECTLY (not shmDir/<basename>): the ME state root moved
+// off /dev/shm to disk on 2026-07-13 (env MATCH_STATE_DIR), so deriving the
+// archive path from shmDir silently missed it — the ME restored a stale snapshot
+// while the AE reset to genesis, and the tradeId mismatch HALTED the settlement
+// bridge (no money settles, all holds leak). The /dev/shm IPC/driver sweep
+// (steps 1,4) still uses shmDir, excluding THIS cluster's dir by basename.
+//
+// exclude lists OTHER clusters' dir base names (state dirs + driver dirs): a
+// match cleanup must never touch /dev/shm/aeron-assets and vice versa (the
+// 2026-07-09 clean-slate wiped the assets engine's state under a live ae0 before
+// this scoping existed). driverGuard vets each aeron-* entry that IS one of THIS
+// cluster's node media-driver dirs through canDeleteDriverDir (the #42/ag#68
+// guard) so the sweep can never delete a driver dir out from under a live driver
+// — it was the only unguarded /dev/shm driver-dir deleter before ag#68 (nil =
+// vet nothing, used by the pure archive/scoping unit tests). Refused entries are
+// returned in refused, not deleted. apply=false only reports. Factored out with
+// configurable roots so every guarantee is unit-testable.
+func cleanupSweep(shmDir, tmpDir, stateRoot string, exclude map[string]bool, driverGuard func(base, path string) (ok bool, reason string), includeArchive, apply bool) (cleaned, preserved, errs, refused []string) {
+	// Basename is used only to exclude THIS cluster's dir from the /dev/shm IPC
+	// glob (step 1); the archive/mark wipe (steps 2-3) targets stateRoot directly.
+	stateBase := filepath.Base(stateRoot)
 	remove := func(path string, all bool) {
 		cleaned = append(cleaned, path)
 		if !apply {
@@ -957,21 +969,24 @@ func cleanupSweep(shmDir, tmpDir, stateBase string, exclude map[string]bool, dri
 		remove(e, true)
 	}
 
-	// 2. Stale mark/lock files inside the cluster state dirs (node*, backup)
+	// 2. Stale mark/lock files inside the cluster state dirs (node*, backup),
+	// under the REAL state root (disk or /dev/shm), not shmDir/<basename>.
 	for _, pattern := range []string{
-		stateBase + "/*/cluster/cluster-mark*.dat",
-		stateBase + "/*/cluster/*.lck",
-		stateBase + "/*/archive/archive-mark.dat",
+		"*/cluster/cluster-mark*.dat",
+		"*/cluster/*.lck",
+		"*/archive/archive-mark.dat",
 	} {
-		matches, _ := filepath.Glob(filepath.Join(shmDir, pattern))
+		matches, _ := filepath.Glob(filepath.Join(stateRoot, pattern))
 		for _, m := range matches {
 			remove(m, false)
 		}
 	}
 
-	// 3. The archives themselves: preserved unless explicitly included
-	recordings, _ := filepath.Glob(filepath.Join(shmDir, stateBase+"/*/archive/*.rec"))
-	clusterDir := filepath.Join(shmDir, stateBase)
+	// 3. The archives themselves: preserved unless explicitly included. Target
+	// stateRoot directly so a disk-based ME state (MATCH_STATE_DIR) is actually
+	// wiped — the bug that left a stale ME snapshot and halted the bridge.
+	recordings, _ := filepath.Glob(filepath.Join(stateRoot, "*/archive/*.rec"))
+	clusterDir := stateRoot
 	if includeArchive {
 		if _, err := os.Stat(clusterDir); err == nil {
 			cleaned = append(cleaned, fmt.Sprintf("%s (FULL WIPE incl. %d recording(s))", clusterDir, len(recordings)))
@@ -1056,7 +1071,7 @@ func (o *OperationsService) Cleanup(opts CleanupOptions) map[string]interface{} 
 	// ops can preview the sweep and the archive-preservation notice.
 	if opts.DryRun {
 		wouldClean, preserved, _, refused := cleanupSweep("/dev/shm", "/tmp",
-			filepath.Base(o.cluster.StateDir), o.peerClusterDirs(), o.driverDirGuard(), opts.IncludeArchive, false)
+			o.cluster.StateDir, o.peerClusterDirs(), o.driverDirGuard(), opts.IncludeArchive, false)
 		result["success"] = true
 		result["dryRun"] = true
 		result["wouldClean"] = wouldClean
@@ -1115,7 +1130,7 @@ func (o *OperationsService) Cleanup(opts CleanupOptions) map[string]interface{} 
 	}
 
 	cleaned, preserved, errors, refused := cleanupSweep("/dev/shm", "/tmp",
-		filepath.Base(o.cluster.StateDir), o.peerClusterDirs(), o.driverDirGuard(), opts.IncludeArchive, true)
+		o.cluster.StateDir, o.peerClusterDirs(), o.driverDirGuard(), opts.IncludeArchive, true)
 
 	// Log every deletion and every refusal to the admin log (component=ops), not
 	// just the API response, so a destructive sweep leaves an audit trail even if
