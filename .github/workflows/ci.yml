@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           # Follow go.mod so dependency bumps that raise the Go requirement
           # (like chi 5.3.0 -> go 1.23) can't drift from the workflow
@@ -58,7 +58,7 @@ jobs:
       # go >= 1.25, ahead of this module's go.mod); it still analyzes the
       # module at its own language version. Pinned like the Trivy action.
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: stable
 
