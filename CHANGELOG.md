@@ -2,10 +2,62 @@
 
 All notable changes to `admin-gateway` (the Open Exchange process manager
 and operations API) are documented here. The stack (`match`, `oms`,
-`admin-gateway`, `trading-ui`) is versioned together; one version spans all
-four repos.
+`admin-gateway`, `trading-ui`, `assets`) is versioned together; one version spans all
+five repos.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## [0.4.0-beta] - 2026-07-22
+
+From process manager to control plane: agentd, multi-cluster management,
+runtime profiles, and the admin console comes home.
+
+### Added
+- Control plane: `agenthub` + per-host `agentd` + `agentwire` wire protocol
+  (#55, #57, #58); opt-in agent hub listener with secure defaults (#59);
+  `GET /api/admin/events` — SSE feed of agent events + operation progress
+  (#52).
+- Multi-cluster management: cluster descriptors, generic clusters[],
+  cluster-scoped ops (#74); per-cluster node count — topology store + genesis
+  re-form op (#79).
+- Runtime profiles: stack-wide light/dev/demo/performance/ultra (#72); live
+  switching (#73), including across the driver-mode boundary (#75); custom
+  profiles — writable store, CRUD, strict validation (#80).
+- Admin console: extracted from trading-ui into a standalone Vite subproject
+  (#91), served by a same-origin edge Worker at `admin-api.openexch.io`
+  (#92, #94, #95, #96).
+- Pre-flight invariant engine with `/preflight`, status + metrics surfacing
+  (#46).
+- Settlement/assets wiring: settlement-bridge ServiceDef, PM-managed (#82);
+  journal-retention endpoint — per-node, watermark-gated (#81);
+  `ASSETS_STATE_DIR` + `MATCH_STATE_DIR` on-disk preflights (#83, #89);
+  settlement-journal env passthrough to ME node defs (#84).
+- Demo plumbing: market simulator managed as `sim` + demo health surfaced
+  (#40); market gateway wired to the edge relay (#65); sim canary points at
+  the edge-relay viewer path (#66); market gateway TimescaleDB env (#41).
+
+### Fixed
+- Rolling updates gated on memory/quorum pre-flight with truthful abort state
+  (#48); pre-start artifact check + nice'd builds (#49); rebuild-gateway and
+  rebuild-oms build in isolated trees (#50, #51); rebuild-admin resolves an
+  explicit Go toolchain and persists failures (#39).
+- Never delete a live media-driver dir; refuse orphan-driver starts (#47);
+  Aeron cleanup sweep scoped to the target cluster (#77); cluster archive
+  wiped at the real StateDir, not /dev/shm (#97).
+- Durable op-failure records, cleanup driver-dir guard, assets ops gated
+  (#85); balance_snapshots no longer TRUNCATEd (dropped by oms V004) (#88).
+- Negative TailLog line count no longer panics the agent (#70); agent hub
+  bind failures degrade instead of killing the gateway (#60); SSE stream
+  works behind middleware wrappers, auth is header-only (#53).
+
+### Changed
+- ProcessManager becomes the LocalAgent behind the extracted ProcessAgent
+  contract, with a conformance suite (#38, #54).
+- `OMS_AUTH_MODE=demo` public demo auth (#44); demo UI origin allowlisted for
+  OMS CORS (#35); light profile simGlobalOps 5 → 60 (#76, #78).
+- grpc 1.82.1 (GHSA-hrxh-6v49-42gf), chi 5.3.1, protobuf 1.36.11; x/net +
+  grpc CVE bumps (#56, #61, #62, #63, #99).
+- Contact email is info@openexch.io (#64).
 
 ## [Unreleased]
 
