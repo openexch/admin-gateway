@@ -168,6 +168,15 @@ func main() {
 		}
 	}()
 
+	// Desired-state reconcile: restore the operator's last intent after a
+	// reboot or an admin-gateway restart. Runs in the background so a slow
+	// stack bring-up never blocks the gateway from serving. Local-agent only
+	// (the concrete ProcessManager owns the desired-state file); a remote
+	// agentd would reconcile on its own host.
+	if pm, ok := procMgr.(*services.ProcessManager); ok {
+		go pm.ReconcileDesired()
+	}
+
 	go func() {
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
