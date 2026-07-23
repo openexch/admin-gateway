@@ -109,6 +109,12 @@ type ProcessManager struct {
 	stopChan      chan struct{}
 	log           *slog.Logger
 
+	// adminDir is where desired-state.json lives (next to the admin binary);
+	// empty disables desired-state persistence (tests, agentd M3 default).
+	adminDir  string
+	desiredMu sync.Mutex
+	desired   map[string]string // name → config.DesiredRunning|DesiredStopped (operator intent)
+
 	// LocalAgent surface (process_manager_agent.go)
 	events       eventHub
 	counters     *AeronCounters
@@ -129,6 +135,9 @@ type ProcessManagerOptions struct {
 	// stale-mark cleanup (cfg.ClusterDir / env MATCH_STATE_DIR). Empty falls
 	// back to the historical tmpfs path.
 	MatchStateDir string
+	// AdminDir is where desired-state.json is persisted (next to the admin
+	// binary). Empty disables desired-state tracking (tests, agentd default).
+	AdminDir string
 }
 
 // NewProcessManagerWith builds a ProcessManager from explicit options,
@@ -161,6 +170,8 @@ func NewProcessManagerWith(opts ProcessManagerOptions) *ProcessManager {
 		services:      opts.Services,
 		stopChan:      make(chan struct{}),
 		log:           logger,
+		adminDir:      opts.AdminDir,
+		desired:       config.ReadDesiredState(opts.AdminDir),
 	}
 
 	// Initialize process state for each service
@@ -195,6 +206,7 @@ func NewProcessManager(cfg *config.Config) *ProcessManager {
 		Services:      buildServiceCatalog(cfg, prof),
 		ProjectDir:    cfg.ProjectDir,
 		MatchStateDir: cfg.ClusterDir,
+		AdminDir:      cfg.AdminDir,
 	})
 }
 
@@ -624,6 +636,11 @@ func (pm *ProcessManager) Start(name string) error {
 		return fmt.Errorf("service %s has no command configured", name)
 	}
 
+	// Operator intent: this service should be running. Recorded even if the
+	// start below fails — a service that should run stays desired-running so a
+	// reboot retries it. (Crash/disarm never touches this; see setDesired.)
+	pm.setDesired(name, config.DesiredRunning)
+
 	// Check if already running
 	proc := pm.proc(name)
 	if proc == nil {
@@ -663,6 +680,9 @@ func (pm *ProcessManager) Stop(name string) error {
 	if name == "admin" {
 		return fmt.Errorf("admin gateway manages itself via rebuild-admin endpoint")
 	}
+
+	// Operator intent: this service should stay stopped across reboots.
+	pm.setDesired(name, config.DesiredStopped)
 
 	// Check if anything depends on us and is still running
 	dependents := pm.findDependents(name)
@@ -736,6 +756,7 @@ func (pm *ProcessManager) Restart(name string) error {
 
 // StartAll starts services in dependency order
 func (pm *ProcessManager) StartAll() []ActionResult {
+	pm.setDesiredAll(config.DesiredRunning) // explicit bulk intent: the stack should be up
 	results := []ActionResult{}
 	ordered := pm.bootOrder()
 
@@ -772,6 +793,7 @@ func (pm *ProcessManager) StartAll() []ActionResult {
 
 // StopAll stops services in reverse dependency order
 func (pm *ProcessManager) StopAll() []ActionResult {
+	pm.setDesiredAll(config.DesiredStopped) // explicit bulk intent: keep the stack down
 	results := []ActionResult{}
 	ordered := pm.shutdownOrder()
 
