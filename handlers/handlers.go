@@ -210,6 +210,7 @@ func (h *Handlers) profileEntry(name string, p config.Profile) map[string]interf
 		"idleMode":      p.IdleMode,
 		"driverProfile": p.DriverProfile,
 		"driverMode":    p.DriverMode,
+		"threading":     p.Threading,
 		"bookCapacity":  p.BookCapacity,
 		"logTermLength": p.LogTermLength,
 		"minMemMB":      p.MinMemMB,

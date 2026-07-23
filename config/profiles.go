@@ -33,9 +33,10 @@ type Profile struct {
 	BackupHeapMB int  `json:"backupHeapMB"`
 	PreTouch     bool `json:"preTouch"`
 
-	IdleMode      string `json:"idleMode"`      // busy_spin | backoff (TRANSPORT_IDLE_MODE)
+	IdleMode      string `json:"idleMode"`      // busy_spin | backoff | sleep (TRANSPORT_IDLE_MODE)
 	DriverProfile string `json:"driverProfile"` // dev | prod (launch-driver.sh --profile)
 	DriverMode    string `json:"driverMode"`    // embedded | external
+	Threading     string `json:"threading"`     // ""(engine default=dedicated) | dedicated | shared | shared_network (TRANSPORT_DRIVER_THREADING)
 
 	BookCapacity  int    `json:"bookCapacity"`  // MATCH_ENGINE_BOOK_CAPACITY (mem ∝)
 	LogTermLength string `json:"logTermLength"` // TRANSPORT_LOG_TERM_LENGTH ("16m".."64m")
@@ -116,13 +117,17 @@ func (p Profile) validate() error {
 	if p.SimGlobalOps < 0 {
 		return fmt.Errorf("simGlobalOps must be >= 0")
 	}
-	if err := oneOf("idleMode", p.IdleMode, "busy_spin", "backoff"); err != nil {
+	if err := oneOf("idleMode", p.IdleMode, "busy_spin", "backoff", "sleep"); err != nil {
 		return err
 	}
 	if err := oneOf("driverProfile", p.DriverProfile, "dev", "prod"); err != nil {
 		return err
 	}
 	if err := oneOf("driverMode", p.DriverMode, "embedded", "external"); err != nil {
+		return err
+	}
+	// Threading is optional: "" leaves the engine's own default (dedicated).
+	if err := oneOf("threading", p.Threading, "", "dedicated", "shared", "shared_network"); err != nil {
 		return err
 	}
 	if err := oneOf("governor", p.Governor, "performance", "schedutil", "powersave", "ondemand"); err != nil {

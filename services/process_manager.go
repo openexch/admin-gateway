@@ -305,6 +305,12 @@ func buildServiceCatalog(cfg *config.Config, prof config.Profile) []ServiceDef {
 			"TRANSPORT_LOG_TERM_LENGTH":  prof.LogTermLength,
 			"MATCH_ENGINE_BOOK_CAPACITY": strconv.Itoa(prof.BookCapacity),
 		}
+		// Media-driver / archive threading. Empty = leave the engine's own default
+		// (DEDICATED); a constrained profile sets "shared" so the embedded driver runs
+		// on a fraction of a core instead of busy-spinning 3 threads per node.
+		if prof.Threading != "" {
+			env["TRANSPORT_DRIVER_THREADING"] = prof.Threading
+		}
 		if externalDriver {
 			env["TRANSPORT_DRIVER_MODE"] = "external"
 			env["AERON_DIR"] = driverDir(nodeId)
